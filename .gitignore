@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# jonnyq (Rust) — gitignore
+#
+# สองกลุ่มใหญ่:
+#   (1) ผลผลิตจาก cargo/rust toolchain
+#   (2) ไฟล์ที่ jonnyq เขียนลง working directory ระหว่างรัน — jonnyq รันใน
+#       โฟลเดอร์ project ผู้ใช้เสมอ จึงมีสิทธิ์ตกอยู่ใน repo เดียวกันที่ git ถูก
+#       เรียก (rules ฝั่งนี้ anchor ที่ root ด้วย `/` หน้า path ทั้งหมด)
+# ---------------------------------------------------------------------------
+
+# --- 1) cargo / rust toolchain ---------------------------------------------
+
+# build artifacts ทั้งหมด (debug/, release/, .fingerprint/, incremental/,
+# .rustc_info.json, flycheck flight recorder ฯลฯ) — ลบแล้ว build ใหม่ได้เสมอ
+# และค่อนข้างใหญ่ (debug ~82 MB, release ~7 MB)
+/target/
+
+# binary ที่ compile แล้วถูกคัดลอก/ build มาวางไว้ที่ root โดยตรง (พฤติกรรมเดียวกับ
+# ที่เคยใช้ใน repo Go: `go build -o jonnyq ...`) — ไม่ชนกับ src/ แต่อย่างใด
+/jonnyq
+/jonnyq.exe
+
+# --- 2) runtime files ที่ jonnyq สร้างเอง -----------------------------------
+
+# transcript log (flag -output / JONNYQ_OUTPUT_FILE, default "output.txt") —
+# ไฟล์ append ข้อความล้วนที่ mirror ทุกอย่างที่พิมพ์ออกจอ ไม่ใช่เนื้อหา project
+# (system prompt กำชับ model ไว้แล้วให้ข้ามไฟล์นี้, /watchfile ก็ข้ามเช่นกัน)
+/output.txt
+# ถ้าเปลี่ยนชื่อ log ผ่าน -output (เช่น -output session.log) ให้เพิ่มเอง หรือ
+# uncomment บรรทัดล่างเพื่อ ignore ไฟล์ log ทุกไฟล์ที่ root
+# /*.log
+
+# state ของชุดคำสั่ง /plan /plan_for_human /coding /coding_phase /autocoding
+# (ค่าคงที่ใน src/coding/mod.rs)
+#   .progress.hash  = SHA-256 ของ requirements.md ณ ครั้งล่าสุดที่ generate/
+#                     reconcile — machine-local cache
+#   .progress.retry = ตัวนับ retry ของ /coding ข้าม invocation — machine-local
+/.progress.hash
+/.progress.retry
+# .progress คือ task checklist ซึ่ง *ควร commit* (เป็นเอกสารของงานและอ่านรู้เรื่อง
+# โดยไม่ต้องอ่านโค้ด) — ถ้าโปรเจกต์ไหนต้องการ ignore ด้วย ให้ถอด # หน้าออก
+# /.progress
+
+# cache ของ read_pdf: หน้า PDF ที่ถูก render เป็น PNG ด้วย pdftoppm เมื่อ PDF ไม่มี
+# text ให้ extract (src/tools/pdf.rs → .jonnyq/pdf_pages/<stem>/page-*.png)
+# รวมถึง cache อื่นที่ .jonnyq/ อาจถูกใช้เก็บในอนาคต
+/.jonnyq/
+
+# --- 3) secrets / local env -------------------------------------------------
+
+# Jonnyq โหลดไฟล์ .env ในโฟลเดอร์ที่รันให้อัตโนมัติ (ดู README หัวข้อ 5) —
+# จึงมักมี JONNYQ_KEY ของจริงอยู่ในไฟล์นี้ ห้าม commit เด็ดขาด
+#   .env       = ไฟล์ที่โหลดเป็นค่า default
+#   .env.*     = profile อื่นที่เลือกผ่าน -env-file / JONNYQ_ENV_FILE (เช่น .env.prod)
+#   .envrc     = ของ direnv (กัน key ที่ export ผ่าน direnv หลุดเข้า git)
+.env
+.env.*
+.envrc
+# ตัวอย่าง template ที่ควร commit ไว้กับ repo
+!.env.example
+!.env.template
+
+# --- 4) editor / OS cruft ---------------------------------------------------
+
+*~
+*.swp
+*.swo
+.\#*
+\#*\#
+.idea/
+.vscode/
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- 5) things that are deliberately NOT ignored ---------------------------
+
+# Cargo.lock — crate นี้มี binary (src/main.rs) จึงควร commit เพื่อให้ build
+# ซ้ำได้ผลตรงกัน (cargo ไม่ ignore ให้เองสำหรับ binary crate)
+# requirements.md — input ของ /plan ที่ผู้ใช้เขียน: ควร commit
+# tests/ และ fixtures — ไม่มี rule ไหนข้างบนครอบ (ทั้งหมด anchor ที่ root)
