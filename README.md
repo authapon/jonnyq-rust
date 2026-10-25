@@ -380,11 +380,12 @@ queued. A reload or a reconnect gets any still-unanswered question back from the
 greeting, so refreshing the page in the middle of a long run does not lose it.
 Several questions can be open at once (a cancelled turn leaves its question
 waiting): only the front one covers the screen, the rest are counted, and the
-popup hands itself over as each is answered. **hide** (or Escape) uncovers the
-console without discarding the question — jonnyq is still blocked on it — and the
-bar keeps a `questions waiting` badge to bring it back. In a headless session the
-popup is the only channel, so it is also what makes `-web` usable without a
-terminal at all.
+popup hands itself over as each is answered. Nothing on the page hides or
+dismisses the box — it holds the question jonnyq is blocked on, and the "hide"
+button (and Escape) that used to tuck it away only ever took the answer field
+away with it — so the server's `ask_close` is the only thing that clears it. In a
+headless session the popup is the only channel, so it is also what makes `-web`
+usable without a terminal at all.
 
 The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 `Origin`, when a browser sends one) names loopback, so it is a local interface

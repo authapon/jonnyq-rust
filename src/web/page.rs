@@ -95,15 +95,6 @@ body {
 #type .reset:hover { color: var(--accent); border-color: var(--accent); }
 #conn { font-size: 12px; color: var(--fg4); white-space: nowrap; }
 #conn.on { color: var(--green); } #conn.off { color: var(--f0); }
-/* The reminder that a question is waiting while its popup is hidden: without
-   it, hiding would be a way to forget a question jonnyq is blocked on. */
-#ask-badge {
-  display: none; background: none; border: 1px solid var(--f3); color: var(--f3);
-  border-radius: 3px; font: inherit; font-size: 11px; padding: 1px 7px; cursor: pointer;
-  white-space: nowrap;
-}
-#ask-badge.show { display: inline-block; }
-#ask-badge:hover { border-color: var(--accent); color: var(--accent); }
 #main { flex: 1 1 auto; display: flex; min-height: 0; }
 #centre { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
@@ -278,14 +269,12 @@ body {
 #ask-answer:disabled { color: var(--fg4); background: var(--bg0); cursor: progress; }
 #ask-row { display: flex; align-items: center; gap: 10px; }
 #ask-note { flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--f0); }
-#ask-send, #ask-hide {
-  flex: 0 0 auto; background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
+#ask-send {
+  flex: 0 0 auto; background: var(--bg1); color: var(--fg); border: 1px solid var(--f3);
   border-radius: 4px; padding: 4px 14px; font: inherit; font-size: 13px; cursor: pointer;
 }
-#ask-send { border-color: var(--f3); }
 #ask-send:hover:enabled { border-color: var(--accent); color: var(--accent); }
 #ask-send:disabled { color: var(--fg4); cursor: progress; border-color: var(--bg2); }
-#ask-hide:hover { border-color: var(--bg4); color: var(--fg4); }
 </style>
 </head>
 <body>
@@ -300,7 +289,6 @@ body {
     <button class="reset" id="type-reset" title="back to IBM Plex Sans Thai Looped at 14pt">reset</button>
   </span>
   <span id="conn">offline</span>
-  <button id="ask-badge" title="show the question jonnyq is waiting for"></button>
 </div>
 <div id="main">
   <div id="centre">
@@ -323,7 +311,6 @@ body {
     placeholder="Type your answer. Enter sends, Shift-Enter adds a newline."></textarea>
   <div id="ask-row">
     <span id="ask-note"></span>
-    <button id="ask-hide" title="keep the question open but see the console behind it">hide</button>
     <button id="ask-send">Send answer</button>
   </div>
 </div></div>
@@ -466,30 +453,23 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("mask").
 
    Questions queue (a cancelled turn can leave an earlier one open): only the
    front one is popped up, the rest are counted above the answer field, and the
-   popup hands itself over as each is answered. "hide" uncovers the console
-   without answering or discarding anything; the top bar then carries a badge to
-   bring the question back. */
+   popup hands itself over as each is answered. Nothing on the page hides or
+   dismisses it: the popup is the question jonnyq is blocked on, and it used to
+   have a "hide" button (Escape did the same) that took the answer field off
+   screen and left the human with no way back to it. Only the server's
+   `ask_close` takes it away. */
 const asks = [];                 /* [{id, question}] awaiting an answer, front first */
 const askDrafts = new Map();     /* question id -> text typed but not sent           */
-let askHidden = null;            /* the id the human hid, so the console stays usable */
 let askBusy = false;             /* an answer is in flight, so no double send         */
 let askedByUs = null;            /* the id this tab sent, so its close says "sent"    */
 
-const askShown = () => $("ask-mask").classList.contains("show");
-
 function renderAsk() {
   const q = asks[0] || null;
-  /* Whether the popup is on screen is decided first, because the badge above
-     it says "a question is waiting" precisely when it is *not*: computing the
-     badge from the previous state is how a page ended up showing both the
-     popup and its own reminder, or hiding both. */
-  const covering = !!q && askHidden !== q.id;
-  $("ask-mask").classList.toggle("show", covering);
-  const badge = $("ask-badge");
-  badge.textContent = asks.length === 0 ? ""
-    : asks.length === 1 ? "1 question waiting" : asks.length + " questions waiting";
-  badge.classList.toggle("show", asks.length > 0 && !covering);
-  if (!covering) return;
+  /* The popup is on screen exactly while a question is unanswered. There is no
+     "hidden" flag any more - it was the thing that stranded a question in a tab
+     whose answer field had been tucked away. */
+  $("ask-mask").classList.toggle("show", !!q);
+  if (!q) return;
   $("ask-q").textContent = q.question;
   const behind = asks.length - 1;
   $("ask-more").textContent = behind
@@ -519,10 +499,9 @@ function onAskMessage(m) {
   else asks.push({ id: m.id, question: m.question || "" });
   askNote("");
   /* Queued behind another question: it is counted, not popped up. A question
-     re-sent for this tab (a reload, or the front one having been hidden) is
-     shown again, because the human has not seen it for a while. */
+     re-sent for this tab (a reload, or the front one having just been answered)
+     is shown again, because the human has not seen it for a while. */
   if (m.open === false && asks[0].id !== m.id) { renderAsk(); return; }
-  askHidden = null;
   renderAsk();
 }
 
@@ -532,7 +511,6 @@ function onAskClose(m) {
   askedByUs = null;
   if (i >= 0) asks.splice(i, 1);
   askDrafts.delete(m.id);
-  if (askHidden === m.id) askHidden = null;
   if (i === 0) {
     /* A popup that disappears without this tab having sent anything was
        answered at the keyboard or over ntfy - say so rather than leaving a
@@ -588,16 +566,11 @@ function wireAsk() {
   });
   ta.addEventListener("input", () => { if (asks[0]) askDrafts.set(asks[0].id, ta.value); });
   $("ask-send").addEventListener("click", sendAsk);
-  $("ask-hide").addEventListener("click", () => { if (asks[0]) askHidden = asks[0].id; renderAsk(); });
-  $("ask-badge").addEventListener("click", () => { askHidden = null; renderAsk(); });
-  document.addEventListener("keydown", (e) => {
-    /* Escape uncovers the console; it never discards a question, because jonnyq
-       is still waiting for an answer to it. */
-    if (e.key === "Escape" && askShown() && !$("mask").classList.contains("show")) {
-      if (asks[0]) askHidden = asks[0].id;
-      renderAsk();
-    }
-  });
+  /* Nothing here hides or closes the box, and no key does either. It holds the
+     question jonnyq is blocked on, and every way of tucking it away was a way
+     of losing the answer field with it: the server's `ask_close` is the only
+     thing that takes the popup off screen. (Escape still dismisses the *file*
+     popup, which is handled up with that popup.) */
 }
 
 /* ------------------------------------------------------------ ANSI -> HTML
@@ -1041,7 +1014,6 @@ function connect() {
        of lingering as a popup nobody will read. */
     asks.length = 0;
     askDrafts.clear();
-    askHidden = null;
     askBusy = false;
     renderAsk();
     setTimeout(connect, 1200);
@@ -1481,11 +1453,16 @@ mod tests {
 
     /// A popup answered at the terminal or over ntfy is closed by the server;
     /// the tab says so, because a box that disappears while you are reading it
-    /// looks like a bug otherwise. Hiding it (Escape, or "hide") must uncover
-    /// the console without discarding anything — jonnyq is still waiting — and
-    /// leave a way back to it.
+    /// looks like a bug otherwise.
+    ///
+    /// And nothing on the page may hide it. There used to be a "hide" button,
+    /// and Escape did the same thing: both uncovered the console but left the
+    /// tab holding a question whose answer field they had just taken away, so a
+    /// human who used them could no longer answer at all. The popup is the thing
+    /// jonnyq is blocked on, so it stays up until the server says it has been
+    /// answered.
     #[test]
-    fn an_answered_or_hidden_question_is_explained_not_dropped() {
+    fn an_answered_question_is_explained_and_the_box_cannot_be_hidden() {
         let close = INDEX_HTML
             .split("function onAskClose(m)")
             .nth(1)
@@ -1496,27 +1473,45 @@ mod tests {
             "a popup closed by someone else must say so: {close}"
         );
 
+        // The answer field is reachable for as long as a question is open: the
+        // overlay shows from nothing but "a question is waiting".
         let render = INDEX_HTML
             .split("function renderAsk()")
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("renderAsk");
-        // Hiding is a display choice, so the question stays in `asks` and the
-        // top bar keeps a count of what is waiting.
-        assert!(render.contains("ask-badge"), "a hidden question needs a badge: {render}");
         assert!(
-            !render.contains("asks.splice"),
-            "hiding must not discard the question: {render}"
+            render.contains(r#"$("ask-mask").classList.toggle("show", !!q)"#),
+            "the popup shows while a question is open, with no other condition: {render}"
         );
-        // And the hide/Escape paths only set `askHidden`; nothing else removes
-        // a question but the server's own `ask_close`.
+        assert!(!render.contains("asks.splice"), "rendering may not drop it: {render}");
+
+        // No hide control, no hidden flag, no reminder badge to bring a hidden
+        // question back — so nothing can strand a question out of reach.
+        for gone in ["ask-hide", "askHidden", "ask-badge", "askShown"] {
+            assert!(!INDEX_HTML.contains(gone), "{gone} must be gone from the page");
+        }
         let wire = INDEX_HTML
             .split("function wireAsk()")
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("wireAsk");
-        assert!(wire.contains("askHidden = asks[0].id"), "hide only hides: {wire}");
         assert!(!wire.contains("asks.splice"), "nothing here may drop it: {wire}");
+        assert!(
+            !wire.contains("ask-mask"),
+            "no click and no key may take the popup away: {wire}"
+        );
+
+        // Escape still dismisses the *file* popup, and only that one.
+        let esc = INDEX_HTML
+            .split("if (e.key === \"Escape\")")
+            .nth(1)
+            .and_then(|s| s.split("});").next())
+            .expect("the Escape handler");
+        assert!(
+            esc.contains(r#"$("mask").classList.remove("show")"#) && !esc.contains("ask-mask"),
+            "Escape closes the file popup only: {esc}"
+        );
     }
 
     /// Several questions can be open at once (a cancelled turn leaves the
