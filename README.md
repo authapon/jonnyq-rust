@@ -259,7 +259,7 @@ Notes:
 | `read_pdf` | `path` | `pdftotext`; scanned PDFs are rendered to PNG for `read_pic` |
 | `read_pic` | `path` | Image → base64 data URI, capped at 10 MB |
 | `read_skill` | `name` | Read the full body of a skill listed in the system prompt |
-| `ask_user` | `prompt` | Ask the human a question and wait — on the terminal (blue question, bright-white answer) and, if ntfy is set, through the notification, answered with `answer: <text>` |
+| `ask_user` | `prompt` | Ask the human a question and wait — on the terminal (blue question, bright-white answer), in the browser popup (`-web`), and, if ntfy is set, through the notification answered with `answer: <text>`. First answer wins; the other channels are closed |
 
 All path tools are confined to the working directory (`../` traversal and symlink escapes are rejected).
 
@@ -336,6 +336,7 @@ the browser's own sans-serif.
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
+| **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
 | **tree** (right) | The working directory, folders first. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
 
 **Font and size.** The top bar's `font` picker offers nine Thai faces from Google
@@ -367,9 +368,29 @@ way the terminal showed it.
 keeps running as a browser-only session instead of exiting on EOF — the prompt
 echoes into the console, and `/exit` in a tab ends the session.
 
+**Answering `ask_user` from the page.** A question the model asks is shown as a
+popup: the question, an answer field, and **Send answer** (Enter sends,
+Shift-Enter adds a newline). The terminal prints the same question, so you can
+answer in either place — the browser popup, the keyboard or an ntfy reply are
+three channels raced against each other and the first answer wins. Whoever wins,
+the others are told: the popup closes the moment the answer arrives anywhere
+(and says *answered elsewhere*, so a box never vanishes without a reason), and an
+answer to a question that has already been answered is refused rather than
+queued. A reload or a reconnect gets any still-unanswered question back from the
+greeting, so refreshing the page in the middle of a long run does not lose it.
+Several questions can be open at once (a cancelled turn leaves its question
+waiting): only the front one covers the screen, the rest are counted, and the
+popup hands itself over as each is answered. **hide** (or Escape) uncovers the
+console without discarding the question — jonnyq is still blocked on it — and the
+bar keeps a `questions waiting` badge to bring it back. In a headless session the
+popup is the only channel, so it is also what makes `-web` usable without a
+terminal at all.
+
 The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 `Origin`, when a browser sends one) names loopback, so it is a local interface
-and nothing else. `GET /health` reports the session as JSON. It is *not* a
+and nothing else. `GET /health` reports the session as JSON, including `asks` —
+how many `ask_user` questions are unanswered, i.e. that jonnyq is waiting for a
+human rather than working. It is *not* a
 boundary against something already running as you: any browser tab can read the
 working directory. Changing the model, provider, proxy or ntfy topic stays under
 the keyboard — the page's pickers cover typeface and text size, nothing else.
@@ -378,7 +399,7 @@ the keyboard — the page's pickers cover typeface and text size, nothing else.
 
 Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). jonnyq pushes a message when `/plan`, `/coding`, `/coding_phase` or `/autocoding` finishes, and a high-priority `warning` message when a turn fails or stalls — the failure text includes a `Reason:` line explaining the likely cause. Summaries are computed from `.progress` directly, not by calling the model.
 
-The same topic is also an inbound channel: `ask_user` pushes the question and subscribes for the reply, so you can answer from your phone (`answer: <text>`, or plain quick reply). Whoever answers first wins — keyboard or phone.
+The same topic is also an inbound channel: `ask_user` pushes the question and subscribes for the reply, so you can answer from your phone (`answer: <text>`, or plain quick reply). Whoever answers first wins — keyboard, browser popup (`-web`) or phone; the losing channels are told, so the popup closes and the terminal prompt is not left hanging.
 
 ## Files created at runtime
 

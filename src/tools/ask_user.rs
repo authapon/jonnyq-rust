@@ -10,6 +10,13 @@
 //! phone as well as from the keyboard - which is the point of a long-running
 //! autonomous run that occasionally needs a human.
 //!
+//! A third channel exists for `-web <port>`: the browser console. It is
+//! installed with [`AskUserTool::set_web`] and shows the question as a popup
+//! with its own answer field and Send button (see [`crate::web`] and
+//! [`AskBridge`]). All three channels are raced together, and a question is
+//! withdrawn from every channel the moment one of them answers - so answering
+//! at the keyboard closes the popup in the browser, and vice versa.
+//!
 //! Unlike the other tools it is installed through [`Registry::install_always`]
 //! rather than listed among `main.rs`'s registrations, because asking instead
 //! of guessing is useful in every configuration - including a registry built
@@ -33,6 +40,8 @@ use crate::ui::Writer;
 pub const ANSWER_SOURCE_NTFY: &str = "ntfy";
 /// Marks an answer typed at the terminal.
 pub const ANSWER_SOURCE_TERMINAL: &str = "terminal";
+/// Marks an answer typed into the browser console's popup (`-web <port>`).
+pub const ANSWER_SOURCE_WEB: &str = "web";
 
 /// Title of the question notification. Also what the subscriber filters on:
 /// jonnyq's own publications carry this title, so the question it just pushed
@@ -49,6 +58,73 @@ pub const NTFY_QUESTION_LIMIT: usize = 2000;
 pub struct Answer {
     pub text: String,
     pub source: &'static str,
+}
+
+/// The browser console's half of the ask (`-web <port>`).
+///
+/// Kept as a trait so the tool does not depend on the HTTP side: `ask_user`
+/// only needs somewhere to put a question and a way to take it back. That is
+/// also what lets a test stand in for a browser without binding a port.
+pub trait WebAsk: Send + Sync {
+    /// Puts `question` up in the open tabs and returns its id together with
+    /// the stream its answer will arrive on. `None` means the console cannot
+    /// show it (the session is closing), which is the tool's cue to fall back
+    /// to the channels that can.
+    fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)>;
+
+    /// Takes a question back off the screen: someone answered at the keyboard
+    /// or over ntfy, or the turn was cancelled, and the popup must not go on
+    /// asking for an answer jonnyq has already had. An id the console does
+    /// not know (already answered there, already withdrawn) is not an error.
+    fn dismiss_web(&self, id: &str);
+
+    /// Where the popup is, for the waiting hint on the terminal: a question
+    /// nobody is looking at is only useful once the address is known.
+    fn url(&self) -> String;
+}
+
+/// A question that is (or was) on screen in the browser.
+///
+/// Dropping it withdraws the popup, on purpose: every way this ask can end —
+/// an answer from another channel, a cancellation, an error, even a panic —
+/// then leaves no stale question behind, instead of a tab still politely
+/// waiting for an answer that will never be read.
+pub struct WebAskGuard {
+    web: std::sync::Arc<dyn WebAsk>,
+    /// The console's id for this question; what an answer from the browser is
+    /// matched against, and what [`WebAsk::dismiss_web`] withdraws it by.
+    pub id: String,
+    answer: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl WebAskGuard {
+    /// Registers `question` with the console, or `None` when it declined to
+    /// show it.
+    pub(crate) fn new(web: std::sync::Arc<dyn WebAsk>, question: &str) -> Option<Self> {
+        let (id, answer) = web.ask_web(question)?;
+        Some(Self { web, id, answer })
+    }
+
+    /// The next answer, or `None` once the console has taken the question
+    /// back (answered elsewhere, withdrawn, the tab closed).
+    ///
+    /// Cancel-safe and repeatable — `select!` drops and re-creates this future
+    /// on every iteration of the wait, and an `UnboundedReceiver` keeps
+    /// whatever arrives in the meantime.
+    async fn recv(&mut self) -> Option<String> {
+        self.answer.recv().await
+    }
+
+    /// Where the popup is, for the terminal's waiting hint.
+    fn url(&self) -> String {
+        self.web.url()
+    }
+}
+
+impl Drop for WebAskGuard {
+    fn drop(&mut self) {
+        self.web.dismiss_web(&self.id);
+    }
 }
 
 impl Answer {
@@ -73,6 +149,31 @@ impl Answer {
 enum NtfyOutcome {
     Answer(Answer),
     Failed(String),
+}
+
+/// What an answer from the browser amounts to, or why there will not be one.
+#[derive(Debug, PartialEq, Eq)]
+enum WebOutcome {
+    Answer(Answer),
+    /// Nothing more can arrive from the tabs: there was no console, its
+    /// question was withdrawn (answered elsewhere), or it was answered there.
+    Closed,
+}
+
+/// The browser half of the wait. `None` (no console installed) reports itself
+/// closed at once, so the caller's `select!` arm can simply be switched off.
+async fn read_web(guard: &mut Option<WebAskGuard>) -> WebOutcome {
+    let Some(g) = guard.as_mut() else {
+        return WebOutcome::Closed;
+    };
+    match g.recv().await {
+        // Trimmed like the terminal's line and an ntfy body: a trailing newline
+        // from the textarea is not part of the answer, and a blank one is still
+        // an answer ("no further input").
+        Some(text) => WebOutcome::Answer(Answer { text: text.trim().to_string(), source: ANSWER_SOURCE_WEB }),
+        // The console took the question back — see [`WebAskGuard`].
+        None => WebOutcome::Closed,
+    }
 }
 
 /// Cuts `s` to at most `max` bytes on a character boundary, saying so when it
@@ -158,11 +259,56 @@ pub fn question_block(question: &str) -> Vec<Line> {
 /// well.
 pub const ANSWER_PROMPT: &str = "Your answer> ";
 
+/// The line that says where the question can be answered. Only the channels
+/// that are actually open are mentioned, so a session with no keyboard is not
+/// told to type and a session with no topic is not told to reply to a
+/// notification that will never arrive. `web` is the console's address when a
+/// console is showing the popup.
+pub fn waiting_hint(terminal: bool, web: Option<String>, ntfy: bool) -> String {
+    let mut how: Vec<String> = Vec::new();
+    if terminal {
+        how.push("type below and press Enter".to_string());
+    }
+    if let Some(url) = web {
+        how.push(format!("answer in the browser popup at {url}"));
+    }
+    if ntfy {
+        how.push("reply to the ntfy notification with \"answer: <text>\"".to_string());
+    }
+    match how.len() {
+        // Only reachable when no channel is open, and the wait fails in that
+        // case anyway; the line is still printed, so it has to say something.
+        0 => "[waiting for your answer - but no channel is open]".to_string(),
+        1 => format!("[waiting for your answer - {}]", how[0]),
+        _ => format!("[waiting for your answer - {}]", how.join(", or ")),
+    }
+}
+
+/// Why the browser channel cannot answer any more. The console takes a
+/// question back while it is still waiting only when it has no more use for
+/// it (the session is closing), so this is the message for a headless `-web`
+/// session left with no channel at all.
+pub fn web_dead() -> String {
+    "ask_user's question was withdrawn from the browser console (the session is closing); \
+answer at a terminal instead"
+        .to_string()
+}
+
 /// How an answer that arrived over ntfy is echoed back (the typed one is
 /// already on screen, echoed by the terminal itself).
 pub fn ntfy_answer_line(answer: &Answer) -> Line {
     Line {
         text: format!("You (via ntfy)> {}", answer.text),
+        color: crate::ui::COLOR_BRIGHT_WHITE,
+        bold: true,
+    }
+}
+
+/// How an answer typed into the browser console is echoed back: it was typed
+/// into a popup in another window, so nothing of it is on the terminal.
+pub fn web_answer_line(answer: &Answer) -> Line {
+    Line {
+        text: format!("You (via web)> {}", answer.text),
         color: crate::ui::COLOR_BRIGHT_WHITE,
         bold: true,
     }
@@ -179,6 +325,11 @@ pub struct AskUserTool {
     /// becomes the only channel. Atomic because `/env reload` and tests flip
     /// it on a shared, already-registered tool.
     terminal_ok: std::sync::atomic::AtomicBool,
+    /// The browser console, when the session was started with `-web`: a third
+    /// channel, and the only one in a headless session. Installed after the
+    /// tool is built (the console is bound later, in `main.rs`), hence the
+    /// lock rather than a constructor argument.
+    web: std::sync::Mutex<Option<std::sync::Arc<dyn WebAsk>>>,
 }
 
 impl AskUserTool {
@@ -187,7 +338,20 @@ impl AskUserTool {
             ui,
             ntfy_url: std::sync::Arc::new(std::sync::RwLock::new(ntfy_url.to_string())),
             terminal_ok: std::sync::atomic::AtomicBool::new(input::stdin_is_interactive()),
+            web: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Puts the browser console's popup at the tool's disposal
+    /// (`-web <port>`; called by `main.rs` next to [`crate::repl::Repl::set_web`]).
+    pub fn set_web(&self, web: std::sync::Arc<dyn WebAsk>) {
+        *self.web.lock().unwrap() = Some(web);
+    }
+
+    /// The console, when there is one — held as a clone so a question can be
+    /// registered and still be withdrawn after the lock is gone.
+    fn web_ask(&self) -> Option<std::sync::Arc<dyn WebAsk>> {
+        self.web.lock().unwrap().clone()
     }
 
     /// `/env reload` pushes a changed `JONNYQ_NTFY_URL` through here.
@@ -254,8 +418,14 @@ impl AskUserTool {
     fn show_answer(&self, answer: &Answer) {
         self.ui.reset_color();
         match answer.source {
-            ANSWER_SOURCE_NTFY => {
-                let line = ntfy_answer_line(answer);
+            ANSWER_SOURCE_NTFY | ANSWER_SOURCE_WEB => {
+                // Neither was typed here, so nothing of it is on the terminal:
+                // it is echoed in the same bright white the typed answer shows
+                // up in.
+                let line = match answer.source {
+                    ANSWER_SOURCE_NTFY => ntfy_answer_line(answer),
+                    _ => web_answer_line(answer),
+                };
                 self.ui.blank_line();
                 self.ui.coloredln(&line.text, line.color, line.bold);
             }
@@ -267,10 +437,10 @@ impl AskUserTool {
         self.ui.blank_line();
     }
 
-    /// Asks and waits. When both channels are live the first answer to arrive
-    /// wins: an impatient user typing should not wait for a network round
-    /// trip, and a phone reply should not wait for someone to walk back to the
-    /// keyboard.
+    /// Asks and waits. Every open channel is raced and the first answer to
+    /// arrive wins: an impatient user typing should not wait for a network
+    /// round trip, a phone reply should not wait for someone to walk back to
+    /// the keyboard, and a browser popup should not be held open by either.
     pub async fn ask(&self, cancel: &CancellationToken, question: &str) -> R<Answer> {
         if question.trim().is_empty() {
             return Err(AgentError::new("prompt is required"));
@@ -282,85 +452,109 @@ impl AskUserTool {
         let asked_at = chrono::Utc::now().timestamp();
 
         self.show_question(question);
-        let hint = if n.enabled() {
-            if let Err(e) = n.send_alert(NTFY_QUESTION_TITLE, &build_ntfy_message(question)).await {
-                // Losing the remote notification must not break the ask: the
-                // subscription below still gets tried, and the terminal still
-                // works if it is there.
-                self.ui.plainln(&format!("warning: ntfy notification failed: {}", e.message));
-            }
-            if self.terminal_ok() {
-                "[waiting for your answer - type below, or reply to the ntfy notification with \"answer: <text>\"]"
-            } else {
-                "[waiting for your answer - reply to the ntfy notification with \"answer: <text>\"]"
-            }
-        } else {
-            "[waiting for your answer - type below and press Enter]"
-        };
-        self.show_prompt(Some(hint));
+        // The console shows the question as a popup with its own answer field;
+        // dropping the guard below (on any path out of this function) takes it
+        // back off the screen.
+        let mut web = self.web_ask().and_then(|w| WebAskGuard::new(w, question));
+        if let Err(e) = n.send_alert(NTFY_QUESTION_TITLE, &build_ntfy_message(question)).await {
+            // Losing the remote notification must not break the ask: the
+            // subscription below still gets tried, and the terminal still
+            // works if it is there.
+            self.ui.plainln(&format!("warning: ntfy notification failed: {}", e.message));
+        }
+        let hint = waiting_hint(
+            self.terminal_ok(),
+            web.as_ref().map(|g| g.url()),
+            n.enabled(),
+        );
+        self.show_prompt(Some(&hint));
 
-        let answer = match (self.terminal_ok(), n.enabled()) {
-            (true, true) => {
-                // Both channels live: the first answer wins. The terminal
-                // future is created once and pinned - re-creating it after
-                // the remote arm resolves would drop a read that is already
-                // in flight and lose whatever the user had typed towards it.
-                let terminal = self.read_terminal(cancel);
-                tokio::pin!(terminal);
-                // If the remote one goes down (bad topic, server unreachable,
-                // connection dropped mid-wait) the question stays on screen
-                // and the wait continues on the keyboard alone: losing ntfy
-                // must not end the ask, and must not resubscribe in a loop.
-                let mut remote = true;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break None,
-                        a = &mut terminal => break a,
-                        o = self.read_ntfy(&n, cancel, asked_at, question), if remote => match o {
-                            NtfyOutcome::Answer(a) => break Some(a),
-                            NtfyOutcome::Failed(why) => {
-                                remote = false;
+        // Which channels can still produce an answer. Each is switched off as
+        // it dies, so the wait never keeps a dead arm polling (a closed
+        // channel would otherwise make `select!` spin) and never hangs on a
+        // question nobody can answer any more.
+        let terminal_live = self.terminal_ok();
+        let mut web_live = web.is_some();
+        let mut ntfy_live = n.enabled();
+        // Why nothing can arrive any more, when no answer did: `None` at the
+        // end of the wait means Ctrl-D at the terminal — "no answer" rather
+        // than "no way to answer".
+        let mut dead: Option<String> = None;
+        let mut answer: Option<Answer> = None;
+        if !terminal_live && !web_live && !ntfy_live {
+            dead = Some(
+                "ask_user has no way to reach the user: stdin is not a terminal, no browser console \
+is open (-web), and no ntfy topic is set (configure one with /ntfy <topic url>)"
+                    .to_string(),
+            );
+        } else {
+            // The terminal future is created once and pinned - re-creating it
+            // after another arm resolves would drop a read that is already in
+            // flight and lose whatever the user had typed towards it.
+            let terminal = self.read_terminal(cancel);
+            tokio::pin!(terminal);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    a = &mut terminal, if terminal_live => {
+                        // `None` is Ctrl-D: the user has no answer.
+                        answer = a;
+                        break;
+                    }
+                    o = read_web(&mut web), if web_live => match o {
+                        WebOutcome::Answer(a) => { answer = Some(a); break; }
+                        // The console withdrew the question - it was answered
+                        // in a tab that has since gone, or the session is
+                        // closing. Nothing more can arrive that way.
+                        WebOutcome::Closed => {
+                            web_live = false;
+                            if !terminal_live && !ntfy_live {
+                                dead = Some(web_dead());
+                                break;
+                            }
+                        }
+                    },
+                    o = self.read_ntfy(&n, cancel, asked_at, question), if ntfy_live => match o {
+                        NtfyOutcome::Answer(a) => { answer = Some(a); break; }
+                        NtfyOutcome::Failed(why) => {
+                            // A dead topic must not end the ask when another
+                            // channel is still open, and must not resubscribe
+                            // in a loop.
+                            ntfy_live = false;
+                            if terminal_live || web_live {
+                                // Where the human still can answer, spelled
+                                // out: the prompt on screen is about to be
+                                // redrawn after this note.
+                                let here = if terminal_live {
+                                    "you to type an answer below"
+                                } else {
+                                    "you to answer in the browser console"
+                                };
                                 self.note_while_waiting(&format!(
                                     "warning: ntfy answer channel unavailable ({why}) - still waiting for \
-you to type an answer below"
+{here}"
                                 ));
+                            } else {
+                                dead = Some(format!(
+                                    "ask_user could not reach the user over ntfy ({why}); answer at a \
+terminal instead (or clear the topic with /ntfy off)"
+                                ));
+                                break;
                             }
-                        },
-                    }
+                        }
+                    },
                 }
             }
-            (true, false) => self.read_terminal(cancel).await,
-            (false, true) => match self.read_ntfy(&n, cancel, asked_at, question).await {
-                NtfyOutcome::Answer(a) => Some(a),
-                // The keyboard is not an option here, so a dead topic is the
-                // end of the conversation rather than a warning - unless the
-                // turn was simply cancelled, which is not a failure to reach
-                // anyone.
-                NtfyOutcome::Failed(_) if cancel.is_cancelled() => {
-                    return Err(AgentError::new("context canceled"));
-                }
-                NtfyOutcome::Failed(why) => {
-                    self.ui.reset_color();
-                    return Err(AgentError::new(format!(
-                        "ask_user could not reach the user over ntfy ({why}); answer at a terminal instead \
-(or clear the topic with /ntfy off)"
-                    )));
-                }
-            },
-            (false, false) => {
-                self.ui.reset_color();
-                return Err(AgentError::new(
-                    "ask_user has no way to reach the user: stdin is not a terminal and no ntfy topic is \
-set (configure one with /ntfy <topic url>)",
-                ));
-            }
-        };
+        }
 
         self.ui.reset_color();
         let Some(answer) = answer else {
             if cancel.is_cancelled() {
                 return Err(AgentError::new("context canceled"));
+            }
+            if let Some(why) = dead {
+                return Err(AgentError::new(why));
             }
             // Ctrl-D: the user has no answer rather than no jonnyq, so the
             // model is told that and can move on.
@@ -425,10 +619,11 @@ impl Tool for AskUserTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ask_user".into(),
-            description: "Ask the user a question on the terminal and wait for their reply before continuing. \
-The question is shown in blue and the answer in bright white; when an ntfy topic is configured the question is \
-also pushed there and the user can answer by replying to the notification with \"answer: <text>\" - whichever \
-answer arrives first is used. Use it when a decision genuinely needs a human \
+            description: "Ask the user a question and wait for their reply before continuing. \
+The question is shown on the terminal (blue question, bright-white answer), as a popup with its own \
+answer field in the browser console when the session runs with -web, and as an ntfy notification when \
+a topic is set (answered by replying to it with \"answer: <text>\"); whichever channel answers first \
+wins and the others are closed. Use it when a decision genuinely needs a human \
 (a choice between plausible designs, missing credentials or secrets, a destructive action to \
 confirm, a requirement that cannot be settled from the files); do not use it for anything you can \
 find out yourself with a tool call.".into(),
@@ -461,6 +656,7 @@ List the options explicitly when asking them to choose.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn tool(ntfy_url: &str) -> (AskUserTool, crate::testsupport::TestLog) {
         let log = crate::testsupport::TestLog::new("ask-user");
@@ -469,6 +665,66 @@ mod tests {
         // No TTY in a test runner: without this the tool would wait on stdin.
         t.set_terminal_ok(false);
         (t, log)
+    }
+
+    /// A stand-in for the browser console: it records the questions it was
+    /// shown, hands back the answers a "tab" sends, and notes which ones the
+    /// tool took back. The real one is `WebConsole`; what the tool cares about
+    /// is only this much, so a test needs no socket.
+    #[derive(Default)]
+    struct FakeWeb {
+        /// (id, question) of every question shown, in order.
+        shown: std::sync::Mutex<Vec<(String, String)>>,
+        /// Ids taken back off the screen — i.e. every popup the tool closed.
+        dismissed: std::sync::Mutex<Vec<String>>,
+        /// id -> the pipe a tab answers over.
+        tabs: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
+        next: std::sync::atomic::AtomicUsize,
+        /// When false, the console refuses to show anything (a closing session).
+        willing: bool,
+        url: String,
+    }
+
+    impl FakeWeb {
+        fn open() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(FakeWeb { willing: true, url: "http://127.0.0.1:8080".into(), ..Default::default() })
+        }
+        /// The answer a human types into the popup.
+        fn answer(&self, id: &str, text: &str) {
+            let tabs = self.tabs.lock().unwrap();
+            tabs.get(id).unwrap().send(text.to_string()).unwrap();
+        }
+        /// The answer to the question shown first, whatever its id is.
+        fn answer_first(&self, text: &str) {
+            let id = self.shown.lock().unwrap()[0].0.clone();
+            self.answer(&id, text);
+        }
+        fn shown(&self) -> Vec<(String, String)> {
+            self.shown.lock().unwrap().clone()
+        }
+        fn dismissed(&self) -> Vec<String> {
+            self.dismissed.lock().unwrap().clone()
+        }
+    }
+
+    impl WebAsk for FakeWeb {
+        fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+            if !self.willing {
+                return None;
+            }
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let id = format!("q{}", self.next.fetch_add(1, Ordering::SeqCst) + 1);
+            self.shown.lock().unwrap().push((id.clone(), question.to_string()));
+            self.tabs.lock().unwrap().insert(id.clone(), tx);
+            Some((id, rx))
+        }
+        fn dismiss_web(&self, id: &str) {
+            self.dismissed.lock().unwrap().push(id.to_string());
+            self.tabs.lock().unwrap().remove(id);
+        }
+        fn url(&self) -> String {
+            self.url.clone()
+        }
     }
 
     #[test]
@@ -862,6 +1118,162 @@ mod tests {
         assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
         assert!(answer.for_model().contains("empty reply from terminal"));
         assert!(std::fs::read_to_string(&log.file).unwrap().contains("[no answer]"));
+    }
+
+    // --- the browser channel (-web) --------------------------------------
+
+    /// The bug this feature is for: a `-web` session with no keyboard has to
+    /// be able to answer from the page. The question reaches the console, the
+    /// answer comes back attributed to the browser, and the terminal is told
+    /// where it was typed.
+    #[tokio::test]
+    async fn a_question_is_answered_from_the_browser_console() {
+        let (t, log) = tool("");
+        let web = FakeWeb::open();
+        t.set_web(web.clone());
+
+        let ask = tokio::spawn(async move { t.ask(&CancellationToken::new(), "Which DB?").await });
+        // The popup is opened by the console before the wait starts.
+        for _ in 0..50 {
+            if !web.shown().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(web.shown(), vec![("q1".to_string(), "Which DB?".to_string())]);
+        web.answer_first("postgres");
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+            .await
+            .expect("the browser answer never arrived")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.text, "postgres");
+        assert_eq!(answer.source, ANSWER_SOURCE_WEB);
+        assert_eq!(answer.for_model(), "Answer from web:\npostgres");
+
+        let log = std::fs::read_to_string(&log.file).unwrap();
+        // The question, the console's address in the hint, and the echo of an
+        // answer that was never typed on this screen.
+        assert!(log.contains("Which DB?"), "got: {log}");
+        assert!(log.contains("answer in the browser popup at http://127.0.0.1:8080"), "got: {log}");
+        assert!(log.contains("You (via web)> postgres"), "got: {log}");
+        // And the popup is closed: an answered question must not sit there.
+        assert_eq!(web.dismissed(), vec!["q1".to_string()]);
+    }
+
+    /// A browser popup alone: no keyboard, no topic. If the console stops
+    /// being able to answer (the session closing), the ask must say so rather
+    /// than hang.
+    #[tokio::test]
+    async fn a_closed_console_ends_the_wait_when_it_is_the_only_channel() {
+        let (t, _log) = tool("");
+        let web = FakeWeb::open();
+        t.set_web(web.clone());
+        let ask = tokio::spawn(async move { t.ask(&CancellationToken::new(), "Which DB?").await });
+        for _ in 0..50 {
+            if !web.shown().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The tab's pipe closing = the console withdrawing the question.
+        web.dismissed.lock().unwrap().push("q1".to_string());
+        web.tabs.lock().unwrap().remove("q1");
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+            .await
+            .expect("the wait must end once the console is gone")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.message.contains("withdrawn from the browser console"), "got: {}", err.message);
+    }
+
+    /// The console can refuse a question (a session that is closing). The tool
+    /// then reports no channel rather than waiting on a popup nobody showed.
+    #[tokio::test]
+    async fn a_console_that_will_not_show_a_question_is_not_a_channel() {
+        let (t, _log) = tool("");
+        let web = std::sync::Arc::new(FakeWeb { willing: false, ..Default::default() });
+        t.set_web(web.clone());
+        let err = t
+            .call(CallCtx { cancel: CancellationToken::new() }, &json!({"prompt": "which one?"}))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("no way to reach the user"), "got: {}", err.message);
+        assert!(web.shown().is_empty(), "nothing was popped up");
+    }
+
+    /// Answering at the keyboard closes the browser's popup — the point of
+    /// racing the channels rather than reading them one after another.
+    #[tokio::test]
+    async fn an_answer_typed_elsewhere_withdraws_the_popup() {
+        // Held across the awaits below on purpose: it serialises the tests that
+        // swap the process-wide stdin stream.
+        let _input = crate::testsupport::input_lock().await;
+        let (t, _log) = tool("");
+        t.set_terminal_ok(true);
+        let web = FakeWeb::open();
+        t.set_web(web.clone());
+        let old = input::set_source(Box::new(input::ScriptedLines::new("sqlite\n"))).await;
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            t.ask(&CancellationToken::new(), "Which DB?"),
+        )
+        .await
+        .expect("the typed answer should have won")
+        .unwrap();
+        input::set_source(old).await;
+
+        assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
+        assert_eq!(web.shown().len(), 1, "the question was shown to the browser too");
+        assert_eq!(web.dismissed(), vec!["q1".to_string()], "the popup is taken back");
+    }
+
+    /// Cancelling the turn takes the popup back as well: a question nobody is
+    /// waiting for any more must not stay on screen asking to be answered.
+    #[tokio::test]
+    async fn a_cancelled_ask_withdraws_the_popup() {
+        let (t, _log) = tool("");
+        let web = FakeWeb::open();
+        t.set_web(web.clone());
+        let cancel = CancellationToken::new();
+        let here = cancel.clone();
+        let ask = tokio::spawn(async move { t.ask(&here, "Which DB?").await });
+        for _ in 0..50 {
+            if !web.shown().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+            .await
+            .expect("the cancelled wait must return")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.message, "context canceled");
+        assert_eq!(web.dismissed(), vec!["q1".to_string()]);
+    }
+
+    /// The browser is one of three channels, so the waiting hint names exactly
+    /// the ones that are open.
+    #[test]
+    fn the_waiting_hint_lists_only_the_channels_that_are_open() {
+        assert_eq!(
+            waiting_hint(true, None, false),
+            "[waiting for your answer - type below and press Enter]"
+        );
+        assert_eq!(
+            waiting_hint(false, Some("http://127.0.0.1:8080".into()), false),
+            "[waiting for your answer - answer in the browser popup at http://127.0.0.1:8080]"
+        );
+        let all = waiting_hint(true, Some("http://x".into()), true);
+        assert!(all.contains("type below and press Enter"), "{all}");
+        assert!(all.contains("answer in the browser popup at http://x"), "{all}");
+        assert!(all.contains("reply to the ntfy notification"), "{all}");
+        assert_eq!(all.matches(", or ").count(), 2, "three channels, two joins: {all}");
+        assert!(waiting_hint(false, None, false).contains("no channel is open"));
     }
 
     #[test]

@@ -16,6 +16,11 @@
 //!   `/watchfile` trigger are serialised exactly like each other — nothing can
 //!   run two turns at once, which is the invariant the whole REPL is built on
 //!   (see [`crate::repl`]'s module docs).
+//! * **ask popup** — an `ask_user` question is put up over the page with its
+//!   own answer field and Send button, which makes a headless `-web` session
+//!   conversable at all. The console is one of that tool's three channels
+//!   (terminal, ntfy, browser), raced against each other: see
+//!   [`crate::tools::ask_user`] and [`WebConsole::show_question`].
 //! * **status line** — the `model | ctx … | mode` string `main` builds from the
 //!   agent ([`StatusFn`]). It tracks a moving value, so it is re-asked on a
 //!   ticker ([`STATUS_INTERVAL`]) as well as at every readiness flip and turn
@@ -51,6 +56,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{AgentError, R};
+use crate::tools::ask_user::WebAsk;
 use crate::ui::{ConsoleSink, Writer, COLOR_RESET};
 
 /// The only address the console binds to: never reachable from another machine
@@ -181,6 +187,14 @@ impl Replay {
     }
 }
 
+/// A question `ask_user` has put up in the browser, and the pipe its answer
+/// comes back on.
+struct WebQuestion {
+    id: String,
+    text: String,
+    answer: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
 /// The web console of one jonnyq session.
 pub struct WebConsole {
     ui: Arc<Writer>,
@@ -217,6 +231,14 @@ pub struct WebConsole {
     /// The coloured tail of everything mirrored to the browser, replayed to a
     /// tab that connects later (see [`Replay`]).
     replay: Mutex<Replay>,
+    /// `ask_user` questions currently on screen, oldest first: the browser
+    /// shows them as popups with their own answer field, one at a time. A
+    /// stack because a turn can be cancelled while an earlier question is
+    /// still open, and both must stay answerable.
+    questions: Mutex<Vec<WebQuestion>>,
+    /// Ids handed out, so the browser's answer can be matched to its question
+    /// (and a reply to a withdrawn one ignored).
+    question_seq: std::sync::atomic::AtomicUsize,
     /// How many times the session line has been recomputed — the number the
     /// tests watch to prove the status closure is re-asked rather than cached.
     status_calls: std::sync::atomic::AtomicUsize,
@@ -282,6 +304,8 @@ impl WebConsole {
             note: RwLock::new(String::from("jonnyq is starting")),
             last_status: RwLock::new(String::new()),
             replay: Mutex::new(replay),
+            questions: Mutex::new(Vec::new()),
+            question_seq: std::sync::atomic::AtomicUsize::new(0),
             status_calls: std::sync::atomic::AtomicUsize::new(0),
         });
         ui.add_console_sink(web.clone());
@@ -478,6 +502,15 @@ impl WebConsole {
         // already queued still runs - a prompt typed a second before /exit was
         // meant to run, and dropping it silently would be worse.
         self.pending.store(0, Ordering::SeqCst);
+        // An `ask_user` popup still on screen would be a box asking for an
+        // answer that nothing will ever read, so it goes with the session.
+        let left: Vec<String> = {
+            let mut qs = self.questions.lock().unwrap();
+            qs.drain(..).map(|q| q.id).collect()
+        };
+        for id in left {
+            self.send_all(&json!({"type": "ask_close", "id": id}).to_string());
+        }
         self.publish_ready();
         self.send_all(&json!({"type": "notice", "title": "jonnyq has exited", "body": "Close this tab, or reload it to reconnect if jonnyq is started again."}).to_string());
     }
@@ -510,6 +543,107 @@ impl WebConsole {
     pub fn refresh(&self) {
         self.publish_ready();
         self.publish_status();
+    }
+
+    // -- ask_user questions ------------------------------------------------
+
+    /// Puts an `ask_user` question up in the open tabs and opens the pipe its
+    /// answer will arrive on — the browser half of [`crate::tools::ask_user`].
+    ///
+    /// Questions queue rather than overlap: the popup shows one at a time
+    /// (oldest first), which is what a human can answer, and every one of them
+    /// stays answerable because each has its own id and its own pipe.
+    ///
+    /// `None` means the console will not show it: the session is on its way
+    /// out, and a question nobody is going to read should not be queued. The
+    /// tool then falls back to the channels that still work.
+    fn show_question(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+        if self.closing.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let n = self.question_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = format!("q{n}");
+        self.questions.lock().unwrap().push(WebQuestion {
+            id: id.clone(),
+            text: question.to_string(),
+            answer: tx,
+        });
+        // `open` is the flag the page shows the popup under; a tab that is
+        // already showing one is told to wait its turn rather than have its
+        // screen covered (see `renderAsks` in the page).
+        self.send_all(
+            &json!({"type": "ask", "id": id, "question": question, "open": true}).to_string(),
+        );
+        Some((id, rx))
+    }
+
+    /// Takes a question back off the screen. Called when the tool stops
+    /// waiting for it — answered at the keyboard or over ntfy, or the turn was
+    /// cancelled — so no tab is left holding a popup whose answer goes nowhere.
+    /// The next question in line, if any, then gets the popup.
+    fn hide_question(&self, id: &str) {
+        let mut qs = self.questions.lock().unwrap();
+        let had = remove_question(&mut qs, id).is_some();
+        let next = qs.first().map(|q| (q.id.clone(), q.text.clone()));
+        drop(qs);
+        self.publish_asks(had.then_some(id), next);
+    }
+
+    /// A browser's answer to one of its questions. Returns whether it was the
+    /// question's first answer: an id that is no longer on the stack was
+    /// already answered (in another tab, or at the terminal between the popup
+    /// opening and the click), and the late click is reported rather than
+    /// silently dropped, so the page can say so.
+    fn take_answer(&self, id: &str, text: String) -> bool {
+        let mut qs = self.questions.lock().unwrap();
+        match remove_question(&mut qs, id) {
+            Some(q) => {
+                // The receiver lives only as long as the tool's wait, so a
+                // question whose ask has already ended is simply dropped.
+                let sent = q.answer.send(text).is_ok();
+                let next = qs.first().map(|q| (q.id.clone(), q.text.clone()));
+                drop(qs);
+                // Every other tab is showing the same popup; all of them have
+                // to be told it is answered, and the next question needs the
+                // screen.
+                self.publish_asks(Some(id), next);
+                sent
+            }
+            None => false,
+        }
+    }
+
+    /// Closes one popup and (re)opens the question that took its place. One
+    /// message pair, in that order, so a tab never briefly shows the new
+    /// question behind the close of the old one.
+    fn publish_asks(&self, closed: Option<&str>, next: Option<(String, String)>) {
+        if let Some(id) = closed {
+            self.send_all(&json!({"type": "ask_close", "id": id}).to_string());
+        }
+        if let Some((id, text)) = next {
+            self.send_all(&json!({"type": "ask", "id": id, "question": text, "open": true}).to_string());
+        }
+    }
+
+    /// The questions a tab that connects (or reloads) mid-ask has to be shown
+    /// — otherwise a browser refresh in the middle of a long run would quietly
+    /// lose the question the model is waiting on.
+    fn pending_asks(&self) -> Vec<Value> {
+        self.questions
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                json!({
+                    "type": "ask", "id": q.id, "question": q.text,
+                    // Only the first is popped up; the rest are listed as
+                    // waiting, in the order they will appear in.
+                    "open": i == 0,
+                })
+            })
+            .collect()
     }
 
     // -- the console mirror ------------------------------------------------
@@ -652,6 +786,10 @@ impl WebConsole {
                     "work_dir": self.work_dir,
                     "clients": self.clients(),
                     "ready": self.ready_now(),
+                    // How many `ask_user` questions are on screen unanswered:
+                    // a session blocked on one is the first thing a script or
+                    // a human checking in wants to know.
+                    "asks": self.questions.lock().unwrap().len(),
                     "url": self.url(),
                 })
                 .to_string();
@@ -692,6 +830,12 @@ impl WebConsole {
         let _ = conn.send(
             &json!({"type": "ready", "ready": self.ready_now(), "note": json!(note)}).to_string(),
         );
+        // A tab opened or reloaded while a question is on screen gets it back —
+        // otherwise a refresh during a long run would silently lose the
+        // question the model is sitting and waiting on.
+        for ask in self.pending_asks() {
+            let _ = conn.send(&ask.to_string());
+        }
     }
 
     /// The coloured tail of the mirror, for a tab that connects later.
@@ -763,6 +907,18 @@ impl WebConsole {
                 }
             }
             "prompt" => self.enqueue_prompt(&msg, &id),
+            "answer" => {
+                let qid = string_field(&msg, "ask");
+                let text = string_field(&msg, "text");
+                if self.take_answer(&qid, text) {
+                    json!({"type": "answer", "id": id, "ask": qid, "ok": true})
+                } else {
+                    json!({
+                        "type": "answer", "id": id, "ask": qid, "ok": false,
+                        "error": "that question was already answered, or is no longer waiting",
+                    })
+                }
+            }
             other => err_value(Some(&id), &format!("unknown message type {other:?}")),
         };
         let _ = conn.send(&reply.to_string());
@@ -870,6 +1026,30 @@ fn string_field(msg: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Takes one question off the stack by id, answering `None` when it is not on
+/// it any more (answered elsewhere, or withdrawn while the tab was thinking).
+fn remove_question(qs: &mut Vec<WebQuestion>, id: &str) -> Option<WebQuestion> {
+    qs.iter().position(|q| q.id == id).map(|i| qs.remove(i))
+}
+
+/// The console's other job: being the human on the other end of `ask_user`
+/// when the session is a browser's ([`crate::tools::ask_user`]'s web channel).
+impl WebAsk for WebConsole {
+    fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+        self.show_question(question)
+    }
+
+    fn dismiss_web(&self, id: &str) {
+        self.hide_question(id);
+    }
+
+    fn url(&self) -> String {
+        // The inherent method, not this trait's — spelled out so the call
+        // cannot be mistaken for recursion.
+        WebConsole::url(self)
+    }
 }
 
 fn err_value(id: Option<&str>, why: &str) -> Value {
@@ -1186,6 +1366,7 @@ pub fn header_is_local(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ask_user::WebAskGuard;
 
     /// A working directory no other test can disturb.
     fn dir_with(files: &[(&str, &str)]) -> crate::testsupport::TempDir {
@@ -1568,6 +1749,32 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         let v: Value = serde_json::from_str(json).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert!(v["work_dir"].as_str().unwrap().len() > 1);
+        assert_eq!(v["asks"], json!(0), "nothing is being asked yet");
+    }
+
+    /// A session blocked on an `ask_user` question says so on `/health`, which
+    /// is how a human walking up to a `-web` session (or a script watching it)
+    /// learns that jonnyq is waiting for them rather than busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_counts_the_questions_being_asked() {
+        let web = console(".");
+        let (_id, _rx) = WebAsk::ask_web(&*web, "Which DB?").unwrap();
+        web.start().unwrap();
+        let port = web.port();
+        let body = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::{Read, Write};
+            s.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut all = Vec::new();
+            s.read_to_end(&mut all).unwrap();
+            String::from_utf8_lossy(&all).into_owned()
+        })
+        .await
+        .unwrap();
+        let json = body.split("\r\n\r\n").nth(1).unwrap();
+        let v: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["asks"], json!(1), "one question is on screen: {v}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2301,6 +2508,236 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
             err.message
         );
         assert!(err.message.contains(&taken.to_string()));
+    }
+
+    // -- ask_user questions -----------------------------------------------
+
+    /// The console is `ask_user`'s browser channel: a question asked there can
+    /// be answered there, and the same question reaches a tab that connects
+    /// (or reloads) while it is still waiting — otherwise a refresh in the
+    /// middle of a long run would quietly lose the question the model is
+    /// blocked on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ask_user_question_is_answered_from_a_tab() {
+        let web = console(".");
+        let (id, mut answer) = WebAsk::ask_web(&*web, "Which DB?").expect("the console shows the question");
+        assert_eq!(id, "q1");
+        web.start().unwrap();
+        let port = web.port();
+        let accepted = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::Write;
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            // The greeting must carry the question that was already waiting.
+            s.write_all(&client_frame(r#"{"type":"answer","id":"a1","ask":"q1","text":"postgres"}"#))
+                .unwrap();
+            let (mut saw_ask, mut ack) = (None, None);
+            for _ in 0..16 {
+                let f = read_server_frame(&mut s).unwrap();
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("ask") && v["question"] == json!("Which DB?") {
+                    saw_ask = Some(v.clone());
+                }
+                if v["id"] == json!("a1") {
+                    ack = Some(v.clone());
+                    break;
+                }
+            }
+            (saw_ask, ack)
+        })
+        .await
+        .unwrap();
+        let ask = accepted.0.expect("the greeting replayed the pending question");
+        assert_eq!(ask["open"], json!(true), "a lone question is popped up");
+        assert_eq!(accepted.1.unwrap()["ok"], json!(true));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), answer.recv())
+                .await
+                .expect("no answer arrived from the browser")
+                .unwrap(),
+            "postgres"
+        );
+    }
+
+    /// Answering is one-shot: a second click on the same popup (a second tab,
+    /// or an impatient double click) is refused rather than queued behind the
+    /// first, because jonnyq has stopped listening after the first answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_answer_to_the_same_question_is_refused() {
+        let web = console(".");
+        let (id, mut answer) = WebAsk::ask_web(&*web, "Which DB?").unwrap();
+        assert!(web.take_answer(&id, "postgres".into()));
+        assert_eq!(answer.recv().await.as_deref(), Some("postgres"));
+        assert!(!web.take_answer(&id, "sqlite".into()), "the question is gone");
+        assert!(web.pending_asks().is_empty());
+        // And an answer to a question that never existed is refused too, so a
+        // stale tab gets a reason instead of silence.
+        assert!(!web.take_answer("q99", "anything".into()));
+    }
+
+    /// A withdrawn question (the tool stopped waiting — answered at the
+    /// keyboard, or the turn was cancelled) must be taken back off every tab,
+    /// and the queue has to move on to the next question.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_withdrawn_question_closes_its_popup_and_frees_the_next() {
+        let web = console(".");
+        web.start().unwrap();
+        let port = web.port();
+        let (id1, _rx1) = WebAsk::ask_web(&*web, "first?").unwrap();
+        let (id2, _rx2) = WebAsk::ask_web(&*web, "second?").unwrap();
+
+        let frames = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            let mut got: Vec<(String, String, Value)> = Vec::new();
+            loop {
+                let f = read_server_frame(&mut s).expect("the console kept the socket open");
+                let v: Value = serde_json::from_str(&f).unwrap();
+                let kind = v["type"].as_str().unwrap_or("").to_string();
+                if kind != "ask" && kind != "ask_close" {
+                    continue;
+                }
+                let id = v["id"].as_str().unwrap_or("").to_string();
+                let open = v["open"].clone();
+                got.push((kind, id, open));
+                // Handover seen: the first question closed and the second took
+                // the screen.
+                let closed = got.iter().any(|(k, i, _)| k == "ask_close" && i == "q1");
+                let handed = got.iter().any(|(k, i, o)| k == "ask" && i == "q2" && o == &json!(true));
+                if closed && handed {
+                    return got;
+                }
+            }
+        });
+        // The tab has to be connected and greeted before the withdrawal, or the
+        // greeting alone would explain the frames.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        web.hide_question(&id1);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(25), frames)
+            .await
+            .expect("the popup was never taken back")
+            .unwrap();
+
+        // The greeting showed the front question and only listed the second.
+        assert_eq!(got[0], ("ask".to_string(), id1.clone(), json!(true)), "{got:?}");
+        assert_eq!(got[1], ("ask".to_string(), id2.clone(), json!(false)), "{got:?}");
+        // ...and losing the first closed it and handed the popup over.
+        assert!(got.contains(&("ask_close".to_string(), id1.clone(), Value::Null)), "{got:?}");
+        assert!(got.contains(&("ask".to_string(), id2.clone(), json!(true))), "{got:?}");
+
+        let pending = web.pending_asks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["id"], json!(id2));
+        assert_eq!(pending[0]["open"], json!(true), "the next question is the one to show");
+    }
+
+    /// Dropping the tool's guard is what withdraws a question on every path out
+    /// of the wait (answer elsewhere, cancellation, even a panic), so it has to
+    /// take the popup with it.
+    #[test]
+    fn a_dropped_guard_takes_its_question_back() {
+        let web = console(".");
+        let guard = WebAskGuard::new(web.clone(), "Which DB?").unwrap();
+        let id = guard.id.clone();
+        assert_eq!(web.pending_asks().len(), 1);
+        drop(guard);
+        assert!(web.pending_asks().is_empty());
+        // And a second drop of the same id is harmless (the tool never does
+        // this, but a withdraw must not be able to close someone else's box).
+        web.hide_question(&id);
+        assert!(web.pending_asks().is_empty());
+    }
+
+    /// An exiting session leaves no popup behind: a box that keeps asking for
+    /// an answer nothing will ever read is worse than no box at all.
+    /// The whole loop, with the real tool on one side and a real tab on the
+    /// other: a `-web` session with no keyboard and no ntfy topic asks, the page
+    /// is given the question, the human answers into the popup, and the model
+    /// gets the answer. This is the case that had no channel at all before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ask_user_call_is_answered_through_a_real_browser_tab() {
+        use crate::tools::ask_user::{AskUserTool, ANSWER_SOURCE_WEB};
+
+        let log = crate::testsupport::TestLog::new("web-ask-e2e");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let web = WebConsole::bind(free_port(), ".", ui.clone(), Arc::new(String::new)).unwrap();
+        web.start().unwrap();
+        let port = web.port();
+
+        let ask_tool = Arc::new(AskUserTool::new(ui.clone(), ""));
+        ask_tool.set_terminal_ok(false); // a headless session: the popup is all there is
+        ask_tool.set_web(web.clone());
+
+        let asking = {
+            let tool = ask_tool.clone();
+            tokio::spawn(async move { tool.ask(&tokio_util::sync::CancellationToken::new(), "Which DB?").await })
+        };
+
+        let reply = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::Write;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            // Wait for the popup frame, then answer into it.
+            let mut question = None;
+            for _ in 0..32 {
+                let f = read_server_frame(&mut s).expect("the console kept the socket open");
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("ask") {
+                    question = Some(v.clone());
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    s.write_all(&client_frame(&json!({
+                        "type": "answer", "id": "a1", "ask": id, "text": "postgres"
+                    })
+                    .to_string()))
+                    .unwrap();
+                    break;
+                }
+            }
+            // ...and the close of its own popup arrives like any other tab's.
+            let mut closed = false;
+            for _ in 0..16 {
+                let f = read_server_frame(&mut s).expect("the console kept the socket open");
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("ask_close") {
+                    closed = true;
+                    break;
+                }
+            }
+            (question, closed)
+        })
+        .await
+        .unwrap();
+
+        let question = reply.0.expect("the popup frame never arrived");
+        assert_eq!(question["question"], json!("Which DB?"));
+        assert_eq!(question["open"], json!(true));
+        assert!(reply.1, "the tab was told the question is answered");
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), asking)
+            .await
+            .expect("the ask never finished")
+            .expect("the ask task panicked")
+            .expect("the ask failed");
+        assert_eq!(answer.source, ANSWER_SOURCE_WEB);
+        assert_eq!(answer.for_model(), "Answer from web:\npostgres");
+
+        let transcript = std::fs::read_to_string(&log.file).unwrap();
+        assert!(transcript.contains("Which DB?"), "got: {transcript}");
+        assert!(transcript.contains("You (via web)> postgres"), "got: {transcript}");
+        assert!(web.pending_asks().is_empty(), "nothing is left on screen");
+    }
+
+    #[test]
+    fn an_exiting_session_withdraws_its_questions() {
+        let web = console(".");
+        let (_id, _rx) = WebAsk::ask_web(&*web, "Which DB?").unwrap();
+        assert_eq!(web.pending_asks().len(), 1);
+        web.begin_shutdown();
+        assert!(web.pending_asks().is_empty(), "the popup is gone with the session");
+        // And a question asked after that is refused rather than queued.
+        assert!(WebAsk::ask_web(&*web, "still there?").is_none());
     }
 
     #[test]

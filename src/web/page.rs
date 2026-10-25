@@ -95,6 +95,15 @@ body {
 #type .reset:hover { color: var(--accent); border-color: var(--accent); }
 #conn { font-size: 12px; color: var(--fg4); white-space: nowrap; }
 #conn.on { color: var(--green); } #conn.off { color: var(--f0); }
+/* The reminder that a question is waiting while its popup is hidden: without
+   it, hiding would be a way to forget a question jonnyq is blocked on. */
+#ask-badge {
+  display: none; background: none; border: 1px solid var(--f3); color: var(--f3);
+  border-radius: 3px; font: inherit; font-size: 11px; padding: 1px 7px; cursor: pointer;
+  white-space: nowrap;
+}
+#ask-badge.show { display: inline-block; }
+#ask-badge:hover { border-color: var(--accent); color: var(--accent); }
 #main { flex: 1 1 auto; display: flex; min-height: 0; }
 #centre { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
@@ -231,6 +240,52 @@ body {
   border-radius: 4px; padding: 4px 16px; font: inherit; cursor: pointer;
 }
 #popup .ok:hover { border-color: var(--accent); color: var(--accent); }
+
+/* --- the ask_user popup: the browser's answer field ---
+   The question the model is blocked on, the text to answer it with, and a
+   Send button. It sits above the file popup (a higher z-index) because it is
+   the one thing on this page that a running session is waiting for, and it is
+   dismissed by the *server* the moment the terminal or ntfy answers first, so
+   a tab never sits on a question jonnyq has already had. */
+#ask-mask {
+  position: fixed; inset: 0; background: rgba(29,32,33,.8);
+  display: none; align-items: center; justify-content: center; z-index: 25;
+  padding: 3vh 3vw;
+}
+#ask-mask.show { display: flex; }
+#ask {
+  background: var(--bg0); border: 1px solid var(--f3); border-radius: 6px;
+  padding: 14px 16px 16px 16px; width: 100%; max-width: 44em;
+  box-shadow: 0 6px 30px rgba(0,0,0,.6);
+  display: flex; flex-direction: column; gap: 8px;
+}
+#ask h3 { margin: 0; font-size: 13px; color: var(--f3); letter-spacing: .02em; }
+#ask-q {
+  margin: 0; padding: 8px 10px; background: var(--bg0h); border: 1px solid var(--bg2);
+  border-radius: 4px; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: var(--ui-font); font-size: var(--ui-size); line-height: 1.5;
+  max-height: 40vh; overflow: auto; scrollbar-width: thin;
+}
+#ask-more { font-size: 12px; color: var(--f12); }
+#ask-answer {
+  width: 100%; min-height: 3em; height: 4.5em; max-height: 40vh; resize: vertical;
+  background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
+  border-radius: 4px; padding: 6px 8px; outline: none;
+  font-family: var(--ui-font); font-size: var(--ui-size); line-height: 1.5;
+  scrollbar-width: thin; scrollbar-color: var(--bg3) var(--bg1);
+}
+#ask-answer:focus { border-color: var(--bg4); }
+#ask-answer:disabled { color: var(--fg4); background: var(--bg0); cursor: progress; }
+#ask-row { display: flex; align-items: center; gap: 10px; }
+#ask-note { flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--f0); }
+#ask-send, #ask-hide {
+  flex: 0 0 auto; background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
+  border-radius: 4px; padding: 4px 14px; font: inherit; font-size: 13px; cursor: pointer;
+}
+#ask-send { border-color: var(--f3); }
+#ask-send:hover:enabled { border-color: var(--accent); color: var(--accent); }
+#ask-send:disabled { color: var(--fg4); cursor: progress; border-color: var(--bg2); }
+#ask-hide:hover { border-color: var(--bg4); color: var(--fg4); }
 </style>
 </head>
 <body>
@@ -245,6 +300,7 @@ body {
     <button class="reset" id="type-reset" title="back to IBM Plex Sans Thai Looped at 14pt">reset</button>
   </span>
   <span id="conn">offline</span>
+  <button id="ask-badge" title="show the question jonnyq is waiting for"></button>
 </div>
 <div id="main">
   <div id="centre">
@@ -258,6 +314,18 @@ body {
 </div>
 <div id="mask"><div id="popup">
   <h3 id="popup-title"></h3><pre id="popup-body"></pre><button class="ok" id="popup-ok">OK</button>
+</div></div>
+<div id="ask-mask"><div id="ask" role="dialog" aria-modal="true" aria-labelledby="ask-title">
+  <h3 id="ask-title">Question from the model</h3>
+  <pre id="ask-q"></pre>
+  <div id="ask-more"></div>
+  <textarea id="ask-answer" spellcheck="false" wrap="soft"
+    placeholder="Type your answer. Enter sends, Shift-Enter adds a newline."></textarea>
+  <div id="ask-row">
+    <span id="ask-note"></span>
+    <button id="ask-hide" title="keep the question open but see the console behind it">hide</button>
+    <button id="ask-send">Send answer</button>
+  </div>
 </div></div>
 <script>
 "use strict";
@@ -387,6 +455,150 @@ function popup(title, body) {
 $("popup-ok").onclick = () => $("mask").classList.remove("show");
 $("mask").onclick = (e) => { if (e.target === $("mask")) $("mask").classList.remove("show"); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("mask").classList.remove("show"); });
+
+/* ------------------------------------------------------- ask_user popup
+   The browser's half of `ask_user`: the question the model is blocked on, an
+   answer field, and a Send button. The server owns the lifecycle: it opens the
+   popup (`ask`) and closes it (`ask_close`) the moment the question is answered
+   in a tab, at the terminal, or over ntfy, or when the turn that asked it is
+   cancelled. So a tab can never sit on a question jonnyq has already had, and a
+   reload gets the question back from the greeting instead of losing it.
+
+   Questions queue (a cancelled turn can leave an earlier one open): only the
+   front one is popped up, the rest are counted above the answer field, and the
+   popup hands itself over as each is answered. "hide" uncovers the console
+   without answering or discarding anything; the top bar then carries a badge to
+   bring the question back. */
+const asks = [];                 /* [{id, question}] awaiting an answer, front first */
+const askDrafts = new Map();     /* question id -> text typed but not sent           */
+let askHidden = null;            /* the id the human hid, so the console stays usable */
+let askBusy = false;             /* an answer is in flight, so no double send         */
+let askedByUs = null;            /* the id this tab sent, so its close says "sent"    */
+
+const askShown = () => $("ask-mask").classList.contains("show");
+
+function renderAsk() {
+  const q = asks[0] || null;
+  /* Whether the popup is on screen is decided first, because the badge above
+     it says "a question is waiting" precisely when it is *not*: computing the
+     badge from the previous state is how a page ended up showing both the
+     popup and its own reminder, or hiding both. */
+  const covering = !!q && askHidden !== q.id;
+  $("ask-mask").classList.toggle("show", covering);
+  const badge = $("ask-badge");
+  badge.textContent = asks.length === 0 ? ""
+    : asks.length === 1 ? "1 question waiting" : asks.length + " questions waiting";
+  badge.classList.toggle("show", asks.length > 0 && !covering);
+  if (!covering) return;
+  $("ask-q").textContent = q.question;
+  const behind = asks.length - 1;
+  $("ask-more").textContent = behind
+    ? behind + (behind === 1 ? " more question behind this one" : " more questions behind this one")
+    : "";
+  const ta = $("ask-answer");
+  ta.value = askDrafts.get(q.id) || "";
+  ta.disabled = askBusy;
+  $("ask-send").disabled = askBusy;
+  if (document.activeElement !== ta) ta.focus();
+}
+
+/* The line beside Send: the answer goes over the socket and jonnyq may be
+   mid-turn, so the popup reports what happened instead of guessing. */
+function askNote(text, color) {
+  const n = $("ask-note");
+  n.textContent = text || "";
+  n.style.color = color || "var(--f0)";
+}
+
+/* Every `ask` message: a question nobody has answered yet, or the same one
+   re-sent to a tab that reloaded (the greeting replays what is pending). */
+function onAskMessage(m) {
+  if (!m.id) return;
+  const known = asks.find((a) => a.id === m.id);
+  if (known) known.question = m.question || "";
+  else asks.push({ id: m.id, question: m.question || "" });
+  askNote("");
+  /* Queued behind another question: it is counted, not popped up. A question
+     re-sent for this tab (a reload, or the front one having been hidden) is
+     shown again, because the human has not seen it for a while. */
+  if (m.open === false && asks[0].id !== m.id) { renderAsk(); return; }
+  askHidden = null;
+  renderAsk();
+}
+
+function onAskClose(m) {
+  const i = asks.findIndex((a) => a.id === m.id);
+  const ours = askedByUs === m.id;
+  askedByUs = null;
+  if (i >= 0) asks.splice(i, 1);
+  askDrafts.delete(m.id);
+  if (askHidden === m.id) askHidden = null;
+  if (i === 0) {
+    /* A popup that disappears without this tab having sent anything was
+       answered at the keyboard or over ntfy - say so rather than leaving a
+       human staring at a box that vanished for no visible reason. Our own
+       answer already left "sent" in that spot, so leave that alone. */
+    if (!ours) askNote(asks.length ? "" : "answered elsewhere", "var(--f12)");
+  }
+  renderAsk();
+}
+
+function sendAsk() {
+  const q = asks[0];
+  if (!q || askBusy) return;
+  const ta = $("ask-answer");
+  askedByUs = q.id;
+  askBusy = true;
+  ta.disabled = true;
+  $("ask-send").disabled = true;
+  askNote("sending\u2026", "var(--fg4)");
+  rpc({ type: "answer", ask: q.id, text: ta.value }).then((m) => {
+    askBusy = false;
+    if (m.ok) {
+      /* jonnyq takes the answer on the socket and then broadcasts `ask_close`,
+         which is what takes the popup away. */
+      askDrafts.delete(q.id);
+      askNote("sent", "var(--green)");
+      return;
+    }
+    askedByUs = null;
+    askNote(m.error || "jonnyq did not accept the answer");
+    ta.disabled = false;
+    $("ask-send").disabled = false;
+  }, (e) => {
+    askedByUs = null;
+    askBusy = false;
+    askNote("the answer was not sent: " + why(e));
+    ta.disabled = false;
+    $("ask-send").disabled = false;
+    ta.focus();
+  });
+}
+
+function wireAsk() {
+  const ta = $("ask-answer");
+  ta.addEventListener("keydown", (e) => {
+    /* Enter sends, Shift/Ctrl-Enter is a newline (the textarea edits itself),
+       and the IME guard matters for Thai input, where Enter commits a
+       composition. */
+    if (e.key !== "Enter" || e.isComposing) return;
+    if (e.shiftKey || e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    sendAsk();
+  });
+  ta.addEventListener("input", () => { if (asks[0]) askDrafts.set(asks[0].id, ta.value); });
+  $("ask-send").addEventListener("click", sendAsk);
+  $("ask-hide").addEventListener("click", () => { if (asks[0]) askHidden = asks[0].id; renderAsk(); });
+  $("ask-badge").addEventListener("click", () => { askHidden = null; renderAsk(); });
+  document.addEventListener("keydown", (e) => {
+    /* Escape uncovers the console; it never discards a question, because jonnyq
+       is still waiting for an answer to it. */
+    if (e.key === "Escape" && askShown() && !$("mask").classList.contains("show")) {
+      if (asks[0]) askHidden = asks[0].id;
+      renderAsk();
+    }
+  });
+}
 
 /* ------------------------------------------------------------ ANSI -> HTML
    The console mirror carries the same escape sequences the terminal got, so
@@ -796,6 +1008,8 @@ function onMessage(ev) {
       $("wd").title = m.work_dir || "";
       break;
     case "notice": popup(m.title || "jonnyq", m.body || ""); break;
+    case "ask": onAskMessage(m); break;
+    case "ask_close": onAskClose(m); break;
     case "reset":
       /* the server asked for a reload: the transcript it holds is gone — and so
          is the colour state that went with it, or the first line after the
@@ -821,6 +1035,15 @@ function connect() {
     $("conn").textContent = "offline - reconnecting";
     $("conn").className = "off";
     setReady(false, "connection to jonnyq lost");
+    /* Drop the questions this tab will not hear the endings of: the greeting
+       of the next connection replays whatever jonnyq is still waiting for, so
+       anything answered or withdrawn while we were offline disappears instead
+       of lingering as a popup nobody will read. */
+    asks.length = 0;
+    askDrafts.clear();
+    askHidden = null;
+    askBusy = false;
+    renderAsk();
     setTimeout(connect, 1200);
   };
   ws.onerror = () => { try { ws.close(); } catch {} };
@@ -828,6 +1051,7 @@ function connect() {
 
 /* ---------------------------------------------------------------- boot */
 buildTypeControls();
+wireAsk();
 consoleTab = makeTab("console", "console", null);
 select(consoleTab.id);
 setReady(false, "connecting");
@@ -1222,6 +1446,115 @@ mod tests {
             refresh.contains("treeRefresh"),
             "refreshTree must collapse concurrent calls: {refresh}"
         );
+    }
+
+    /// The browser's answer box for `ask_user` (`-web <port>`): the question, a
+    /// field to answer it with, and a Send button — plus the two messages the
+    /// server uses to open and take back the popup. Without this an `ask_user`
+    /// call in a headless session had no way to be answered at all.
+    #[test]
+    fn the_ask_user_popup_can_be_answered() {
+        for needle in [
+            "id=\"ask-mask\"",         /* the overlay                        */
+            "id=\"ask-q\"",            /* the question itself                */
+            "id=\"ask-answer\"",       /* the answer field                   */
+            "id=\"ask-send\"",         /* and the button that sends it       */
+            "type: \"answer\"",        /* the message the answer goes over   */
+            "case \"ask\":",           /* the server opening a question      */
+            "case \"ask_close\":",     /* and taking it back                 */
+            "sendAsk",
+            "onAskMessage",
+            "onAskClose",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+        // The answer has to name the question it belongs to, or a reply to a
+        // withdrawn question would be taken for the one currently on screen.
+        let send = INDEX_HTML
+            .split("function sendAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("sendAsk");
+        assert!(send.contains("ask: q.id"), "the answer must carry its id: {send}");
+        assert!(send.contains("rpc("), "and go over the socket: {send}");
+    }
+
+    /// A popup answered at the terminal or over ntfy is closed by the server;
+    /// the tab says so, because a box that disappears while you are reading it
+    /// looks like a bug otherwise. Hiding it (Escape, or "hide") must uncover
+    /// the console without discarding anything — jonnyq is still waiting — and
+    /// leave a way back to it.
+    #[test]
+    fn an_answered_or_hidden_question_is_explained_not_dropped() {
+        let close = INDEX_HTML
+            .split("function onAskClose(m)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("onAskClose");
+        assert!(
+            close.contains("answered elsewhere"),
+            "a popup closed by someone else must say so: {close}"
+        );
+
+        let render = INDEX_HTML
+            .split("function renderAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("renderAsk");
+        // Hiding is a display choice, so the question stays in `asks` and the
+        // top bar keeps a count of what is waiting.
+        assert!(render.contains("ask-badge"), "a hidden question needs a badge: {render}");
+        assert!(
+            !render.contains("asks.splice"),
+            "hiding must not discard the question: {render}"
+        );
+        // And the hide/Escape paths only set `askHidden`; nothing else removes
+        // a question but the server's own `ask_close`.
+        let wire = INDEX_HTML
+            .split("function wireAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("wireAsk");
+        assert!(wire.contains("askHidden = asks[0].id"), "hide only hides: {wire}");
+        assert!(!wire.contains("asks.splice"), "nothing here may drop it: {wire}");
+    }
+
+    /// Several questions can be open at once (a cancelled turn leaves the
+    /// earlier one waiting), and only the front one is worth covering the
+    /// screen with — the rest are counted, and the popup hands itself over as
+    /// each is answered.
+    #[test]
+    fn queued_questions_wait_their_turn() {
+        let msg = INDEX_HTML
+            .split("function onAskMessage(m)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("onAskMessage");
+        assert!(msg.contains("asks.push"), "questions queue: {msg}");
+        assert!(
+            msg.contains("m.open === false"),
+            "a question behind another is not popped up: {msg}"
+        );
+        let render = INDEX_HTML
+            .split("function renderAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("renderAsk");
+        assert!(render.contains("asks.length - 1"), "the count of those behind: {render}");
+    }
+
+    /// A reconnect must not leave the page holding questions that were answered
+    /// while it was offline: the next greeting replays only what jonnyq is
+    /// still waiting for, so the stale list is cleared when the link drops.
+    #[test]
+    fn a_reconnect_does_not_keep_stale_questions() {
+        let onclose = INDEX_HTML
+            .split("ws.onclose = () => {")
+            .nth(1)
+            .and_then(|s| s.split("\n  };").next())
+            .expect("the socket's close handler");
+        assert!(onclose.contains("asks.length = 0"), "stale questions are dropped: {onclose}");
+        assert!(onclose.contains("renderAsk()"), "and the popup is redrawn: {onclose}");
     }
 
     /// The script keeps its block comments balanced: `*/` inside one would

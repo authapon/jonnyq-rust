@@ -95,7 +95,10 @@ async fn main() {
     reg.register(run_command.clone());
     reg.register(Arc::new(tools::skill_tool::SkillTool::new(cfg.skill_paths.clone())));
     // Always available, in every configuration - see Registry::install_always.
-    reg.install_always(Arc::new(tools::ask_user::AskUserTool::new(w.clone(), &cfg.ntfy_url)));
+    // The handle is kept because the web console is bolted onto it further
+    // down: a session started with `-web` answers `ask_user` from a popup.
+    let ask_user = Arc::new(tools::ask_user::AskUserTool::new(w.clone(), &cfg.ntfy_url));
+    reg.install_always(ask_user.clone());
 
     let agent = Agent::new(
         provider,
@@ -126,6 +129,10 @@ async fn main() {
                 if let Err(e) = web.start() {
                     eprintln!("web console: {e}");
                 } else {
+                    // The console is `ask_user`'s third channel: the question
+                    // pops up in the browser with its own answer field, so a
+                    // headless `-web` session can be talked to at all.
+                    ask_user.set_web(web.clone());
                     r.set_web(web.clone()).await;
                     w.plainln(&format!("[web] console at {}", web.url()));
                 }

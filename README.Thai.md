@@ -258,7 +258,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `read_pdf` | `path` | ใช้ `pdftotext`; PDF ที่ไม่มี text จะ render เป็น PNG ให้ `read_pic` ต่อ |
 | `read_pic` | `path` | อ่าน image → base64 data URI cap 10 MB |
 | `read_skill` | `name` | อ่านเนื้อหาเต็มของ skill ที่อยู่ใน system prompt |
-| `ask_user` | `prompt` | ถามมนุษย์แล้วรอคำตอบ — บน terminal (คำถามสีฟ้า คำตอบขาวสว่าง) และผ่าน notification ถ้าตั้ง ntfy โดยตอบด้วย `answer: <ข้อความ>` |
+| `ask_user` | `prompt` | ถามมนุษย์แล้วรอคำตอบ — บน terminal (คำถามสีฟ้า คำตอบขาวสว่าง), ใน popup บนเวบ (`-web`) และผ่าน notification ถ้าตั้ง ntfy โดยตอบด้วย `answer: <ข้อความ>` ใครตอบก่อนได้ก่อน และ channel ที่แพ้จะถูกปิดให้ |
 
 ทุก path tool ถูก confine ให้อยู่ใน working directory (กันทั้ง `../` traversal และ symlink escape)
 
@@ -334,6 +334,7 @@ browser แทน
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ |
 | **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
+| **popup ของ `ask_user`** | เมื่อ model เรียก `ask_user` คำถามจะเด้งขึ้นมาทับหน้าเวบ พร้อมช่องพิมพ์คำตอบและปุ่ม **Send answer** — ดูด้านล่าง |
 | **tree** (ขวา) | รายการ working directory (folder ก่อนไฟล์) ขยาย folder เพื่อดูรายการข้างใน คลิกไฟล์ text เพื่อเปิดในแท็บใหม่ ส่วน PDF/image/binary จะขึ้น popup บอกว่าเปิดดูไม่ได้เพราะอะไร |
 
 **font และ size** font picker บนแถบบนมี font ไทยจาก Google Fonts ให้เลือก 9 แบบ —
@@ -363,6 +364,20 @@ prompt ที่พิมพ์บนเวบจะถูกเข้าคิ�
 แบบมีแต่เวบแทนที่จะ exit ด้วย EOF — prompt ที่ส่งมาจะถูก echo กลับเข้า console และ
 `/exit` ในแท็บจะปิด session
 
+**ตอบ `ask_user` บนเวบ** คำถามที่ model ถามจะถูกแสดงเป็น popup ทับหน้าเวบ: ตัว
+คำถาม, ช่องพิมพ์คำตอบ และปุ่ม **Send answer** (Enter ส่ง, Shift-Enter ขึ้นบรรทัด
+ใหม่) terminal ก็พิมพ์คำถามเดียวกันไว้ด้วย จึงตอบที่ไหนก็ได้ — popup บนเวบ, keyboard
+หรือ ntfy เป็นสาม channel ที่แข่งกันตอบ และคำตอบที่มาก่อนชนะเสมอ เมื่อมีคำตอบแล้ว
+channel อื่นถูกรวบให้ทันที: popup จะปิดตัวเองพร้อมเขียนว่า *answered elsewhere*
+(จึงไม่มีกล่องหายไปเฉย ๆ โดยไม่มีเหตุผล) และคำตอบที่ส่งไปถึงคำถามที่ถูกตอบไปแล้วจะถูก
+ปฏิเสธแทนที่จะเข้าคิวรอ การ reload หรือ reconnect จะได้คำถามที่ยังไม่มีใครตอบกลับ
+มาจาก greeting จึง refresh กลางรันยาว ๆ แล้วไม่เสียคำถามไป คำถามค้างพร้อมกันหลายข้อ
+ได้ (turn ที่ถูก cancel จะทิ้งคำถามเดิมไว้): popup จะแสดงเฉพาะข้อแรก ข้างหลังนับ
+จำนวนไว้ให้ และจะเลื่อนไปถามข้อถัดไปเมื่อแต่ละข้อถูกตอบ ปุ่ม **hide** (หรือ Escape)
+เปิดดู console โดยทิ้งคำถามไว้ (jonnyq ยังรออยู่) และบนแถบบนจะมี badge `questions
+waiting` ให้กดกลับมา ใน session แบบไม่มี terminal popup นี้คือ channel เดียว จึงเป็น
+สิ่งที่ทำให้ `-web` ใช้งานได้ตามลำพัง
+
 listener ผูกกับ `127.0.0.1` และตอบเฉพาะ request ที่ `Host` (และ `Origin` เมื่อ
 browser ส่งมา) เป็น loopback จึงเป็น interface ในเครื่องเท่านั้น `GET /health` ตอบ
 สถานะ session เป็น JSON ส่วนนี้**ไม่ใช่** wall กันผู้ที่รันเป็น user เดียวกัน: แท็บ
@@ -374,7 +389,7 @@ ntfy topic ยังต้องพิมพ์ที่ keyboard เท่า�
 
 ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจากไฟล์ `.progress` โดยตรง (ไม่เรียก model เพิ่ม)
 
-topic เดียวกันใช้เป็นขากลับได้ด้วย: `ask_user` จะ push คำถามออกไปแล้ว subscribe รอคำตอบ จึงตอบจากมือถือได้ (`answer: <ข้อความ>` หรือ quick reply) — ใครตอบก่อนได้ก่อน سواءพิมพ์ที่ keyboard หรือจากมือถือ
+topic เดียวกันใช้เป็นขากลับได้ด้วย: `ask_user` จะ push คำถามออกไปแล้ว subscribe รอคำตอบ จึงตอบจากมือถือได้ (`answer: <ข้อความ>` หรือ quick reply) — ใครตอบก่อนได้ก่อน ไม่ว่าจะเป็น keyboard, popup บนเวบ (`-web`) หรือมือถือ และ channel ที่ตอบแพ้จะถูกปิดให้ (popup ปิด, prompt ที่ terminal ไม่ค้างอยู่)
 
 ## ไฟล์ที่โปรแกรมสร้างระหว่างรัน
 
