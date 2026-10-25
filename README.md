@@ -337,7 +337,7 @@ the browser's own sans-serif.
 | **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
-| **tree** (right) | The working directory, folders first. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
+| **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
 
 **Font and size.** The top bar's `font` picker offers nine Thai faces from Google
 Fonts — IBM Plex Sans Thai Looped (the default), Playpen Sans Thai, K2D,
@@ -354,6 +354,23 @@ locally installed copy of it, or to the generic fallback.
 context use, not a snapshot of connect time: it is re-read on a two-second
 ticker, at the start and end of every turn, and whenever a slash command changes
 the model or the window, and a frame is only sent when the line actually changed.
+
+**The tree stays current by itself.** There is no refresh button: the panel
+re-lists the working directory, plus every folder you have expanded, on a
+two-and-a-half-second tick, and again the moment the tab becomes visible after
+being hidden. Only the folders *on screen* are re-listed — a folded-up folder has
+nothing to keep current, and is listed when you open it. A listing that is
+unchanged draws nothing, so the panel is not rebuilt every few seconds: your
+scroll position and your expanded folders survive a poll, and a redraw happens
+only when a folder gained, lost or renamed an entry (size alone is not a visible
+change, since no row shows one). A folder that disappears from disk folds itself
+up instead of leaving dead rows behind. A folder that cannot be read says so
+inside itself — *cannot list: …* where its rows would be — rather than in a
+popup, because the panel keeps trying and a box per tick is not information; the
+working directory failing outright is the one case that does pop up, and it says
+it once per distinct reason rather than once per tick. A hidden tab is not polled,
+and neither is an offline one, so closing the laptop lid costs nothing and a
+reconnect picks the listing back up.
 
 A prompt typed in the browser goes onto a queue that the REPL's own loop reads,
 which is why the answer appears in *both* windows, and why a browser prompt, a

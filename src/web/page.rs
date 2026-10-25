@@ -196,11 +196,6 @@ body {
   border-bottom: 1px solid var(--bg2); display: flex; align-items: center; gap: 8px;
 }
 #side-head .wd { color: var(--fg1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#side-head button {
-  margin-left: auto; background: none; border: 1px solid var(--bg2); color: var(--fg4);
-  border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px; padding: 1px 6px;
-}
-#side-head button:hover { color: var(--accent); border-color: var(--accent); }
 #tree { flex: 1 1 auto; overflow: auto; padding: 6px 4px 20px 4px; scrollbar-width: thin; }
 .row { display: flex; align-items: center; gap: 4px; padding: 1px 4px; border-radius: 3px; cursor: pointer; white-space: nowrap; }
 .row:hover { background: var(--bg1); }
@@ -296,7 +291,7 @@ body {
     <div id="panels"></div>
   </div>
   <div id="side">
-    <div id="side-head"><span class="wd" id="wd">&hellip;</span><button id="refresh" title="reload the tree">refresh</button></div>
+    <div id="side-head"><span class="wd" id="wd">&hellip;</span></div>
     <div id="tree"></div>
   </div>
 </div>
@@ -814,7 +809,40 @@ function makeResizable(panel) {
   window.addEventListener("mouseup", () => { dragging = false; });
 }
 
-/* -------------------------------------------------------------- the tree */
+/* -------------------------------------------------------------- the tree
+   The listing keeps itself current — there is no refresh button, and the panel
+   is meant to read like the folder rather than like a snapshot of it taken at
+   page load. The state it is redrawn from, rather than from a request:
+
+     treeOpen    the folders the reader has expanded. A redraw that forgot these
+                 would fold the tree back to one line every few seconds, which
+                 is worse than the button it replaced.
+     treeNodes   the listing each folder on screen was drawn from. Comparing a
+                 folder's fresh listing with the one already drawn is what lets
+                 an unchanged poll cost nothing — and a rebuild is not free: it
+                 loses the panel's scroll position and yanks rows out from under
+                 a click in progress. So a redraw happens only when some folder
+                 actually gained, lost or renamed an entry.
+     treeFails   why a folder on screen could not be listed, shown in its place.
+     treeDrawn   whether anything is on screen, so the first listing always
+                 draws even when it happens to equal the empty cache.
+     treeGen     retired by `resetTree`, to tell a late answer from a current one. */
+const TREE_POLL_MS = 2500;     /* how often the folder is re-listed        */
+const treeOpen = new Set();    /* folder paths shown expanded              */
+const treeNodes = new Map();   /* path -> the listing it was drawn from    */
+const treeFails = new Map();   /* path -> why that listing could not be had */
+const treeLoading = new Set(); /* listings asked for and not yet answered  */
+let treeErr = "";              /* the failure already explained in a popup */
+let treeDrawn = false;         /* is this tree on screen at all?           */
+/* Bumped whenever the tree is thrown away, so an answer that arrives *after*
+   that — a listing asked for just before the session moved to another working
+   directory — is discarded instead of redrawing the old folder's rows. */
+let treeGen = 0;
+/* The working directory the rows on screen belong to, as last heard from the
+   server. Null until the first `info`, which is what tells a greeting apart
+   from a session that has actually moved elsewhere. */
+let treeWd = null;
+
 function treeSelection() {
   const t = byId(active);
   document.querySelectorAll("#tree .row").forEach((r) => {
@@ -822,15 +850,92 @@ function treeSelection() {
   });
 }
 
-function renderTree(node, parent) {
+/* What a listing looks like: each entry's name and whether it is a folder, in
+   the order the server sent them. Size is deliberately left out — no row shows
+   one, so a file being written to is not a visible change, and rebuilding the
+   panel for it would throw away the scroll position for nothing. */
+function treeSig(node) {
+  return (node.entries || []).map((e) => (e.dir ? "d" : "f") + e.name).join("\n");
+}
+
+/* Caches a listing and reports whether the screen would change. A folder seen
+   for the first time counts as a change: drawing it is the whole point. */
+function setTree(path, node) {
+  const was = treeNodes.get(path);
+  treeNodes.set(path, node);
+  return !was || treeSig(was) !== treeSig(node);
+}
+
+const parentOf = (p) => {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? "" : p.slice(0, i);
+};
+
+/* Forgets expanded folders that no longer exist, and listings of folders that
+   have been folded up again, so a folder deleted mid-session does not stay
+   expanded forever and a long session does not accumulate listings. Returns
+   whether what is on screen is now wrong. */
+function pruneTree() {
+  let dropped = false;
+  for (const p of [...treeOpen]) {
+    const here = treeNodes.get(parentOf(p));
+    if (!here) continue;                       /* its parent is not listed yet */
+    const name = p.slice(p.lastIndexOf("/") + 1);
+    const still = (here.entries || []).some((e) => e.dir && e.name === name);
+    if (!still) { treeOpen.delete(p); treeNodes.delete(p); treeFails.delete(p); dropped = true; }
+  }
+  for (const p of [...treeNodes.keys()]) {
+    if (p !== "" && !treeOpen.has(p)) { treeNodes.delete(p); treeFails.delete(p); }
+  }
+  return dropped;
+}
+
+/* Redraws the panel from the cache, keeping its scroll position: a poll that
+   refreshed a folder half-way down the list must not send the reader back to
+   the top of it. */
+function drawTree() {
+  const tree = $("tree");
+  const top = tree.scrollTop;
+  const box = treeNodeEl("");
+  box.classList.remove("kids");
+  box.style.marginLeft = "0";
+  tree.textContent = "";
+  tree.appendChild(box);
+  tree.scrollTop = top;
+  treeDrawn = true;
+  treeSelection();
+}
+
+/* One folder's rows, from the cache. An open folder with no listing cached yet
+   draws nothing and asks for one — the answer redraws (see `askTree`), which
+   is why this is synchronous rather than returning a promise: patching one
+   subtree in place cannot say where its parent's rows went. */
+function treeNodeEl(path) {
   const box = document.createElement("div");
   box.className = "kids";
+  const node = treeNodes.get(path);
+  if (!node) {
+    /* A folder asked for but not answered with a listing: say why in the tree
+       rather than leaving an empty gap that looks like an empty folder. The
+       next tick asks again (the poll lists every visible folder), so a folder
+       that was briefly unreadable fills itself in by itself. */
+    askTree(path);
+    const failure = treeFails.get(path);
+    if (failure) {
+      const e = document.createElement("div");
+      e.className = "row err";
+      e.textContent = failure;
+      box.appendChild(e);
+    }
+    return box;
+  }
   for (const item of node.entries || []) {
     const row = document.createElement("div");
     row.className = "row " + (item.dir ? "dir" : "file");
     row.dataset.p = item.path;
+    const open = item.dir && treeOpen.has(item.path);
     const tw = document.createElement("span"); tw.className = "tw";
-    tw.textContent = item.dir ? "\u25B8" : "";           /* ▸ */
+    tw.textContent = item.dir ? (open ? "\u25BE" : "\u25B8") : "";  /* ▾ ▸ */
     const ic = document.createElement("span"); ic.className = "ic";
     ic.textContent = item.dir ? "\uD83D\uDCC1" : "\uD83D\uDCC4";   /* 📁 📄 */
     const nm = document.createElement("span"); nm.className = "nm";
@@ -842,22 +947,12 @@ function renderTree(node, parent) {
       row.addEventListener("click", () => openFile(item.path, item.name));
       continue;
     }
-    const kids = document.createElement("div");
-    kids.className = "kids";
-    kids.style.display = "none";
-    box.appendChild(kids);
-    let loaded = !!item.children;
-    if (loaded) kids.appendChild(nodeEl(item.children));
     row.addEventListener("click", () => {
-      const open = kids.style.display !== "none";
-      if (open) { kids.style.display = "none"; tw.textContent = "\u25B8"; return; }
-      kids.style.display = "";
-      tw.textContent = "\u25BE";                                            /* ▾ */
-      if (loaded) return;
-      loaded = true;
-      requestTree(item.path).then((n) => { kids.textContent = ""; kids.appendChild(nodeEl(n)); })
-        .catch((e) => { kids.style.display = "none"; tw.textContent = "\u25B8"; loaded = false; popup("Cannot list " + item.path, why(e)); });
+      if (treeOpen.has(item.path)) treeOpen.delete(item.path);
+      else treeOpen.add(item.path);
+      drawTree();
     });
+    if (open) box.appendChild(treeNodeEl(item.path));
   }
   if (!node.entries || !node.entries.length) {
     const e = document.createElement("div");
@@ -865,35 +960,138 @@ function renderTree(node, parent) {
     e.textContent = "(empty)";
     box.appendChild(e);
   }
-  if (parent) parent.appendChild(box);
   return box;
 }
-const nodeEl = (n) => renderTree(n, null);
+
+/* Why a folder could not be listed, remembered against it so `treeNodeEl` can
+   say so inside the folder. Reports whether that is news — only news is worth
+   a redraw, or a permanently unreadable folder would rebuild the panel (and
+   lose the scroll position) on every tick. */
+function noteTreeFail(path, why_) {
+  const note = "cannot list: " + (why_ || "no listing");
+  const was = treeFails.get(path);
+  treeFails.set(path, note);
+  return was !== note;
+}
+
+/* One folder's listing into the cache, then a redraw if it differs. A failure
+   is drawn inside that folder (see `treeNodeEl`) rather than popped up: the
+   panel is polled, and a box per tick about a folder nobody can read is not
+   information, it is a shut-up. The rows that were there stay either way. */
+function askTree(path) {
+  if (treeLoading.has(path)) return;
+  treeLoading.add(path);
+  const gen = treeGen;
+  const still = () => gen === treeGen;
+  requestTree(path).then(
+    (n) => { if (!still()) return; treeFails.delete(path); if (setTree(path, n)) drawTree(); },
+    /* `drawTree` runs inside this handler, while `path` is still registered as
+       loading, so the redraw's own `askTree` cannot start a second request. */
+    (e) => { if (still() && noteTreeFail(path, why(e))) drawTree(); },
+  ).finally(() => { if (still()) treeLoading.delete(path); });
+}
 
 async function refreshTree() {
-  /* One refresh at a time: boot, the greeting's `reset` and the refresh button
-     all ask for the same thing, and two parallel listings of the same folder
-     only make the second answer's renderer win at random. */
+  /* One listing at a time: boot, the greeting's `reset`, the poll and a click
+     on a folder all ask for the same thing, and two parallel listings of one
+     folder only make the later answer's renderer win at random. */
   if (treeRefresh) return treeRefresh;
   treeRefresh = (async () => {
+    /* The root, plus every folder the reader can currently see: a folded-up
+       folder has nothing on screen to keep current, and its listing is dropped
+       by pruneTree until it is opened again. */
+    const want = [...new Set(["", ...treeOpen])];
+    /* All of them are marked as in flight before the first request goes out —
+       and stay marked until after the redraw below — so neither a folder
+       clicked open mid-poll nor the redraw of a folder that *failed* can ask
+       for a listing that is being had, or was just refused. The next tick asks
+       again, which is the retry. */
+    for (const p of want) treeLoading.add(p);
+    const gen = treeGen;
     try {
-      const root = await requestTree("");
-      const tree = $("tree");
-      tree.textContent = "";
-      const box = renderTree(root, null);
-      box.classList.remove("kids");
-      box.style.marginLeft = "0";
-      tree.appendChild(box);
-      treeSelection();
+      const got = await Promise.all(want.map(async (p) => {
+        try { return [p, await requestTree(p), null]; }
+        catch (e) { return [p, null, e]; }
+      }));
+      /* Answers that arrive after the tree was thrown away are dropped whole —
+         not just left undrawn: caching them would let the next redraw of the
+         new working directory paint rows out of the old one's listing. */
+      if (gen !== treeGen) return;
+      let changed = false, failed = null;
+      for (const [p, node, err] of got) {
+        if (!node) {
+          /* The working directory itself being unreadable is the one failure
+             worth a popup: there is nothing to draw in its place, so the rows
+             already on screen are kept and the reason is said out loud. */
+          if (p === "") { failed = err; continue; }
+          treeNodes.delete(p);
+          if (noteTreeFail(p, why(err))) changed = true;
+          continue;
+        }
+        treeFails.delete(p);
+        if (setTree(p, node)) changed = true;
+      }
+      if (pruneTree()) changed = true;
+      if (changed || !treeDrawn) drawTree();
+      /* Drawn first, then reported: the rows that were already up stay up, and
+         the folder that could not be read says so inside itself. Only the
+         working directory failing outright gets a popup, since there is
+         nothing on screen to put the reason into — and `treeErr` is left
+         holding the note so the next tick does not repeat the box. */
+      if (failed) throw failed;
+      treeErr = "";
     } catch (e) {
-      popup("Cannot list the working directory", why(e));
+      treeError(why(e));
     } finally {
+      /* The in-flight marks go with this poll's own generation: a newer one has
+         set its own, and clearing those would let a folder clicked open right
+         now ask for a listing that is already on its way. */
+      if (gen === treeGen) for (const p of want) treeLoading.delete(p);
       treeRefresh = null;
     }
   })();
   return treeRefresh;
 }
-$("refresh").addEventListener("click", refreshTree);
+
+/* Throws the tree away, to be drawn again by the next listing. Used when the
+   session's working directory changes, so a new project is never drawn mixed in
+   with the old one's expanded folders and cached rows. The caller follows it
+   with a `refreshTree`, which is what fills the panel back in. */
+function resetTree() {
+  treeGen++;
+  treeOpen.clear();
+  treeNodes.clear();
+  treeFails.clear();
+  /* Nothing is in flight *for this tree* any more — an answer still on its way
+     belongs to the generation just retired, and the generation check drops it.
+     Leaving the marks set would block that path from ever being asked again. */
+  treeLoading.clear();
+  treeDrawn = false;
+  $("tree").textContent = "";
+}
+
+/* One popup per distinct failure, because a poll that keeps failing would
+   otherwise stack a box per tick about something no popup can fix. The note
+   is cleared by the next listing that works. */
+function treeError(note) {
+  const msg = note || "cannot list this folder";
+  if (treeErr === msg) return;
+  treeErr = msg;
+  popup("Cannot list the working directory", msg);
+}
+
+/* The tick. Skipped while offline — every request would wait out its connect
+   deadline and then say so, and `onclose`'s reconnect plus the boot listing
+   already cover the way back — and in a hidden tab, which nobody is reading
+   and which browsers throttle into a stall anyway. */
+function treeTick() {
+  if (!OPEN() || document.hidden) return;
+  refreshTree();
+}
+setInterval(treeTick, TREE_POLL_MS);
+/* Coming back to the tab should show the folder as it is now rather than as it
+   was when you left, so the wait for the next tick is skipped. */
+document.addEventListener("visibilitychange", () => { if (!document.hidden) treeTick(); });
 
 /* Opening a file: one request; the server decides whether it is text. A
    binary/image/PDF answer comes back as an error and is shown in the popup,
@@ -975,11 +1173,20 @@ function onMessage(ev) {
   switch (m.type) {
     case "console": appendConsole(m.data || ""); break;
     case "ready": setReady(m.ready, m.note || ""); break;
-    case "info":
+    case "info": {
       $("status").textContent = m.status || "";
-      $("wd").textContent = m.work_dir || "";
-      $("wd").title = m.work_dir || "";
+      const wd = m.work_dir || "";
+      const wdEl = $("wd");
+      /* A different working directory is a different tree — the cached
+         listings and the expanded paths belong to the one being replaced. Only
+         a *change* counts: `treeWd` starts as null, so the greeting's first
+         info does not throw away the listing boot already asked for. */
+      if (treeWd !== null && treeWd !== wd) { resetTree(); refreshTree(); }
+      treeWd = wd;
+      wdEl.textContent = wd;
+      wdEl.title = wd;
       break;
+    }
     case "notice": popup(m.title || "jonnyq", m.body || ""); break;
     case "ask": onAskMessage(m); break;
     case "ask_close": onAskClose(m); break;
@@ -1399,9 +1606,10 @@ mod tests {
         );
     }
 
-    /// Two listings of the same folder racing each other (boot plus the
-    /// greeting's `reset`) would both render, so the second clears what the
-    /// first drew. A refresh in flight must be reused, not duplicated.
+    /// Two listings of the same folder racing each other (boot, the greeting's
+    /// `reset`, the poll and a click on a folder) would both render, so the
+    /// second clears what the first drew. A listing in flight must be reused,
+    /// not duplicated.
     #[test]
     fn the_tree_is_listed_once_at_a_time() {
         let script = INDEX_HTML
@@ -1418,8 +1626,304 @@ mod tests {
             refresh.contains("treeRefresh"),
             "refreshTree must collapse concurrent calls: {refresh}"
         );
+        // The poll marks every folder it is about to ask for as in flight up
+        // front, so neither a folder clicked open mid-poll nor the redraw of a
+        // folder that just failed can start a second request for it.
+        assert!(
+            refresh.contains("treeLoading.add(p)"),
+            "the listed folders must be registered before the requests go out: {refresh}"
+        );
     }
 
+    /// The tree has no refresh button any more — it keeps itself current. So the
+    /// page must actually ask again on its own: on a timer, and immediately when
+    /// the tab comes back from being hidden. A timer-less panel would be a
+    /// strictly worse replacement for the button that was removed.
+    #[test]
+    fn the_tree_relists_itself_without_a_button() {
+        assert!(
+            !INDEX_HTML.contains("id=\"refresh\""),
+            "the tree must not grow a refresh button back"
+        );
+        let head = INDEX_HTML
+            .split("<div id=\"side-head\">")
+            .nth(1)
+            .and_then(|s| s.split("</div>").next())
+            .expect("the tree header");
+        assert!(
+            !head.contains("<button"),
+            "the tree header is the working directory only: {head}"
+        );
+
+        let tick = INDEX_HTML
+            .split("function treeTick()")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("treeTick");
+        assert!(tick.contains("refreshTree()"), "the tick does the listing: {tick}");
+        // Offline: every request would wait out its connect deadline first.
+        // Hidden: nobody is reading it, and browsers throttle it anyway.
+        assert!(
+            tick.contains("OPEN()") && tick.contains("document.hidden"),
+            "the tick stays quiet while offline or hidden: {tick}"
+        );
+        assert!(
+            INDEX_HTML.contains("setInterval(treeTick, TREE_POLL_MS)"),
+            "the tick has to run on a timer"
+        );
+        assert!(
+            INDEX_HTML.contains("\"visibilitychange\"") && INDEX_HTML.contains("treeTick()"),
+            "coming back to the tab has to list it again at once"
+        );
+        // And the interval is a sane one: a request per folder per tick, so
+        // something sub-second would machine-gun the disk, while minutes is not
+        // "automatic".
+        let ms: u32 = INDEX_HTML
+            .split("const TREE_POLL_MS = ")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("TREE_POLL_MS");
+        assert!((1000..=10_000).contains(&ms), "poll every {ms}ms is not a sane cadence");
+    }
+
+    /// Polling only pays for itself if an unchanged listing costs nothing: a
+    /// rebuild throws away the panel's scroll position and yanks rows out from
+    /// under a click in progress. So the fresh listing is compared against the
+    /// one drawn, and only a difference redraws. Size is deliberately *not*
+    /// part of the comparison — no row shows a size, so a file being written to
+    /// is not a visible change.
+    #[test]
+    fn an_unchanged_poll_does_not_rebuild_the_tree() {
+        let sig = INDEX_HTML
+            .split("function treeSig(node)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("treeSig");
+        assert!(
+            sig.contains("e.name") && sig.contains("e.dir"),
+            "the shape of a listing is its entries' names and kinds: {sig}"
+        );
+        assert!(
+            !sig.contains("size"),
+            "a file's size is not something a row shows, so it must not force a redraw: {sig}"
+        );
+
+        let set = INDEX_HTML
+            .split("function setTree(path, node)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("setTree");
+        assert!(
+            set.contains("treeSig(was) !== treeSig(node)"),
+            "setTree must report whether the listing changed: {set}"
+        );
+
+        let draw = INDEX_HTML
+            .split("function drawTree()")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("drawTree");
+        assert!(
+            draw.contains("scrollTop"),
+            "a redraw keeps the panel's scroll position: {draw}"
+        );
+
+        // Every redraw path goes through that comparison.
+        for (name, body) in [
+            ("askTree", INDEX_HTML.split("function askTree(path)").nth(1)),
+            ("refreshTree", INDEX_HTML.split("async function refreshTree()").nth(1)),
+        ] {
+            let body = body.and_then(|s| s.split("\n}\n").next()).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                body.contains("setTree(") && body.contains("drawTree()"),
+                "{name} may only redraw through setTree: {body}"
+            );
+        }
+    }
+
+    /// What makes automatic listing tolerable instead of maddening: the folders
+    /// the reader expanded are state of their own, so a redraw re-expands them,
+    /// an open folder is polled (a folded one is not), and one that vanishes
+    /// from disk folds itself up instead of leaving rows for a folder that is
+    /// gone. Without this, an update every few seconds would fold the whole tree
+    /// back to one line — worse than the button it replaced.
+    #[test]
+    fn a_redraw_keeps_the_readers_own_folders_open() {
+        assert!(
+            INDEX_HTML.contains("const treeOpen = new Set()"),
+            "expanded folders have to be remembered"
+        );
+        let draw = INDEX_HTML
+            .split("function treeNodeEl(path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("treeNodeEl");
+        assert!(
+            draw.contains("treeOpen.has(item.path)"),
+            "a redraw draws the children of an open folder: {draw}"
+        );
+        assert!(
+            draw.contains("treeOpen.add(item.path)") && draw.contains("treeOpen.delete(item.path)"),
+            "a click is what decides whether a folder is open: {draw}"
+        );
+
+        let prune = INDEX_HTML
+            .split("function pruneTree()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("pruneTree");
+        assert!(
+            prune.contains("treeOpen.delete(p)"),
+            "a folder that is gone stops being expanded: {prune}"
+        );
+        assert!(
+            prune.contains("treeOpen.has(p)"),
+            "listings of folded-up folders are dropped, so the poll stays cheap: {prune}"
+        );
+
+        let refresh = INDEX_HTML
+            .split("async function refreshTree()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("refreshTree");
+        assert!(
+            refresh.contains("...treeOpen"),
+            "every visible folder is re-listed, not only the root: {refresh}"
+        );
+    }
+
+    /// A folder that cannot be read is the one thing polling could turn into a
+    /// popup per tick, which is noise rather than information. So it explains
+    /// itself inside the tree where its rows would have been, and only the
+    /// working directory failing outright earns a popup — said once per distinct
+    /// reason, not once per tick.
+    #[test]
+    fn a_folder_that_cannot_be_read_says_so_once() {
+        let ask = INDEX_HTML
+            .split("function askTree(path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("askTree");
+        assert!(
+            ask.contains("noteTreeFail(path"),
+            "a failed folder is remembered, not swallowed: {ask}"
+        );
+        assert!(
+            !ask.contains("popup("),
+            "a folder's own failure must not pop up while the panel polls: {ask}"
+        );
+
+        let draw = INDEX_HTML
+            .split("function treeNodeEl(path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("treeNodeEl");
+        assert!(
+            draw.contains("treeFails.get(path)"),
+            "the reason is drawn inside the folder: {draw}"
+        );
+
+        let err = INDEX_HTML
+            .split("function treeError(note)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("treeError");
+        assert!(
+            err.contains("treeErr === msg"),
+            "the same failure may not stack a popup per tick: {err}"
+        );
+        let note = INDEX_HTML
+            .split("function noteTreeFail(path, why_)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("noteTreeFail");
+        assert!(
+            note.contains("was !== note"),
+            "only news is worth a redraw, or an unreadable folder would rebuild the panel every tick: {note}"
+        );
+    }
+
+    /// Automatic listing means answers arrive at times nobody chose: a folder's
+    /// listing can come back after the session has moved to another working
+    /// directory, and drawing it would put the old folder's rows back over the
+    /// new one's. So every answer carries the generation it was asked under.
+    /// And the greeting's first `info` must *not* count as a move, or the very
+    /// first load throws away the listing boot just asked for.
+    #[test]
+    fn a_late_listing_cannot_redraw_a_discarded_tree() {
+        assert!(
+            INDEX_HTML.contains("let treeGen = 0"),
+            "the tree needs a generation counter"
+        );
+        let ask = INDEX_HTML
+            .split("function askTree(path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("askTree");
+        assert!(
+            ask.contains("const gen = treeGen") && ask.contains("still()"),
+            "a listing must know whether the tree it belongs to still exists: {ask}"
+        );
+        let refresh = INDEX_HTML
+            .split("async function refreshTree()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("refreshTree");
+        assert!(
+            refresh.contains("gen !== treeGen"),
+            "a poll answered after a reset must be dropped: {refresh}"
+        );
+
+        let info = INDEX_HTML
+            .split("case \"info\": {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the info handler");
+        assert!(
+            info.contains("treeWd !== null"),
+            "the greeting's first info is not a change of working directory: {info}"
+        );
+        assert!(
+            info.contains("resetTree()") && info.contains("refreshTree()"),
+            "a real change clears the tree and lists the new folder: {info}"
+        );
+    }
+
+    /// The page must be executable JavaScript, not merely well-balanced tags: it
+    /// is served inline, and a syntax error there is a console whose tree simply
+    /// stops updating. Checked by V8 rather than eyeballed.
+    #[test]
+    fn the_pages_script_is_valid_javascript() {
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.as_mut().expect("stdin").write_all(script.as_bytes())?;
+                child.wait_with_output()
+            });
+        // Skipped where node is not installed (a checkout without a JS
+        // toolchain still builds and runs jonnyq); asserted wherever it is.
+        let Ok(out) = status else {
+            eprintln!("node is not installed, skipping the syntax check");
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "the page's script does not parse:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     /// The browser's answer box for `ask_user` (`-web <port>`): the question, a
     /// field to answer it with, and a Send button — plus the two messages the
     /// server uses to open and take back the popup. Without this an `ask_user`
