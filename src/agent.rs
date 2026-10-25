@@ -83,6 +83,19 @@ const COMPACT_MAX_FAILURES: i64 = 2;
 /// overhead would compact on every single round and get nowhere.
 const COMPACT_REGROW_FRACTION: f64 = 1.25;
 
+/// How far back a compaction may reach to keep a tool result together with
+/// the `assistant` message that requested it ([`tail_start`]).
+const TAIL_REALIGN_MAX: usize = 12;
+
+/// What the user's own task is allowed to cost when it is carried through a
+/// compaction as the conversation's `user` turn ([`ensure_user_turn`]).
+const USER_ANCHOR_TOKENS: i64 = 200;
+
+/// The stand-in `user` turn for a request that has none at all and no real
+/// task to carry (see [`ensure_user_turn`]).
+const USER_TURN_STAND_IN: &str = "[the earlier conversation was summarized to fit the context window; \
+continue from where it left off]";
+
 /// A provider-reported prompt size at or below this, while our own estimate
 /// is much higher, means the server is almost certainly trimming the prompt
 /// from the front instead of using the window we asked for.
@@ -950,6 +963,93 @@ contains about {} tokens of text - the server is likely dropping the front of th
         self.ui.state.read().unwrap().context_status()
     }
 
+    /// Where the kept tail starts: the last `keep` messages, moved back so the
+    /// tail never begins in the middle of a tool round.
+    ///
+    /// A `tool` result is only meaningful next to the `assistant` message that
+    /// requested it - a request whose first tool-related message is an answer
+    /// to a call that lives in the summary is one an OpenAI-compatible server
+    /// rejects outright (`tool_call_id` matches nothing). Walking back over the
+    /// results lands on their `assistant` parent, which brings the whole round
+    /// along with it.
+    fn tail_start(history: &[Message], keep: usize) -> usize {
+        let len = history.len();
+        let mut start = len.saturating_sub(keep.min(len));
+        for _ in 0..TAIL_REALIGN_MAX {
+            if start == 0 || start >= len || history[start].role != Role::Tool {
+                break;
+            }
+            start -= 1;
+        }
+        // Walking back to the very front would leave nothing to summarize at
+        // all. Take the original boundary and drop the orphaned results
+        // instead - the calls they answer are in the summary either way.
+        if start == 0 && keep < len {
+            start = len - keep;
+            while start < len && history[start].role == Role::Tool {
+                start += 1;
+            }
+        }
+        start
+    }
+
+    /// Drops `tool` results that no longer have the `assistant` message which
+    /// requested them, from the front of a compacted history.
+    ///
+    /// [`Agent::tail_start`] keeps the tail from starting mid-round, but the
+    /// shrink-to-actually-save loop in [`Agent::compact`] can then remove that
+    /// round's `assistant` message and leave its results pointing at a call
+    /// that only exists inside the summary - which an OpenAI-compatible server
+    /// answers with a 400.
+    fn strip_leading_orphans(mut msgs: Vec<Message>) -> Vec<Message> {
+        loop {
+            let at = msgs.iter().take_while(|m| m.role == Role::System).count();
+            if at >= msgs.len() || msgs[at].role != Role::Tool {
+                return msgs;
+            }
+            msgs.remove(at);
+        }
+    }
+
+    /// Guarantees a compacted conversation still contains a plain `user` turn.
+    ///
+    /// Not cosmetic: a chat template can *require* one. The Qwen3 family
+    /// (vllm-project/vllm#36432, and the same template shipped in
+    /// llama.cpp/Ollama builds) raises `No user query found in messages.` as a
+    /// 400 for a message list holding only system/assistant/tool turns - which
+    /// is exactly what a compaction of an agent conversation produces: the
+    /// user's own message is folded into the summary and every message the tail
+    /// keeps is a tool call or a tool result. The session died right after the
+    /// compaction that was supposed to keep it alive.
+    ///
+    /// Carries the user's actual task across when the summarized part had one
+    /// (the thing a compaction must not lose), and falls back to a stand-in
+    /// when there was none to carry.
+    fn ensure_user_turn(msgs: Vec<Message>, summarized: &[Message]) -> Vec<Message> {
+        if msgs.iter().any(|m| m.role == Role::User) {
+            return msgs;
+        }
+        let anchor = summarized
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.content.trim().is_empty())
+            .map(|m| {
+                format!(
+                    "[the task you are working on, carried across the context compaction]\n{}",
+                    clamp_head_tail_tokens(&m.content, USER_ANCHOR_TOKENS)
+                )
+            })
+            .unwrap_or_else(|| USER_TURN_STAND_IN.to_string());
+        // Right after the leading summary, before the kept tail: the shape the
+        // template expects (a user turn that the kept assistant turns answer).
+        let at = msgs.iter().take_while(|m| m.role == Role::System).count();
+        let mut out = Vec::with_capacity(msgs.len() + 1);
+        out.extend(msgs[..at].iter().cloned());
+        out.push(Message { role: Role::User, content: anchor, ..Default::default() });
+        out.extend(msgs[at..].iter().cloned());
+        out
+    }
+
     /// The most recent messages survive a compaction, with oversized tool
     /// results inside them shrunk: the agent needs the paths, errors and
     /// output it is working with *right now*, and re-reading them is exactly
@@ -959,8 +1059,10 @@ contains about {} tokens of text - the server is likely dropping the front of th
     /// summary gets), so on a small window the kept messages cannot quietly
     /// be the reason the next request overflows again; a megabyte of the
     /// latest `run_command` output comes through as its head and tail.
-    fn kept_tail(&self, history: &[Message], keep: usize) -> Vec<Message> {
-        let keep = keep.min(history.len());
+    ///
+    /// Takes the already-selected tail (see [`Agent::tail_start`]).
+    fn kept_tail(&self, history: &[Message]) -> Vec<Message> {
+        let keep = history.len();
         if keep == 0 {
             return Vec::new();
         }
@@ -969,7 +1071,7 @@ contains about {} tokens of text - the server is likely dropping the front of th
         // carry a path and an error, and a ceiling so one bloated result
         // cannot spend the whole tail's budget.
         let share = (self.summary_target_tokens() / keep.max(1) as i64).clamp(60, KEPT_TOOL_RESULT_TOKENS);
-        history[history.len() - keep..]
+        history
             .iter()
             .map(|m| Message {
                 content: if m.role == Role::Tool {
@@ -991,18 +1093,21 @@ contains about {} tokens of text - the server is likely dropping the front of th
     /// only, too short to be worth its salt) - dropping stale middle history
     /// buys back most of the room, and it works even when the provider is
     /// failing, which is precisely when compaction is needed most.
-    fn prune_history(&self, prefix_count: usize, kept: &[Message], dropped: bool) -> Vec<Message> {
+    fn prune_history(&self, summarized: &[Message], kept: &[Message], dropped: bool) -> Vec<Message> {
         let note = format!(
             "[{} earlier messages were pruned from history to fit the context window, without a summary \
 (ask the user or re-read files if you need what they contained)]",
-            prefix_count
+            summarized.len()
         );
         let mut out = Vec::with_capacity(kept.len() + 1);
         if dropped {
             out.push(Message { role: Role::System, content: note, ..Default::default() });
         }
         out.extend(kept.iter().cloned());
-        out
+        // Pruning drops the oldest messages, which is where the user's turn
+        // usually was - see [`Agent::ensure_user_turn`] for why the result
+        // still has to contain one.
+        Self::ensure_user_turn(out, summarized)
     }
 
     /// Summarizes history into a single message and replaces everything
@@ -1024,17 +1129,18 @@ contains about {} tokens of text - the server is likely dropping the front of th
         let tun = self.compact_tunables();
         // The messages to keep verbatim, but never so many that nothing is
         // left to summarize (which would replace history with a summary of
-        // itself and free nothing at all).
-        let keep = (tun.keep_recent as usize).min(history.len() - 1);
-        let (old, _) = history.split_at(history.len() - keep);
-        let tail = self.kept_tail(&history, keep);
+        // itself and free nothing at all). The boundary then moves back to the
+        // start of a tool round so the tail carries whole rounds only.
+        let start = Self::tail_start(&history, (tun.keep_recent as usize).min(history.len() - 1));
+        let (old, rest) = history.split_at(start);
+        let tail = self.kept_tail(rest);
 
         // The summarizer has repeatedly failed: stop paying for full-size
         // requests it cannot answer, and buy back room by dropping the oldest
         // messages instead. Better a gap in memory than an oversize request on
         // every round.
         if failures >= COMPACT_MAX_FAILURES {
-            let pruned = self.prune_history(old.len(), &tail, !old.is_empty());
+            let pruned = self.prune_history(old, &tail, !old.is_empty());
             let before = tokens_of(&history);
             let after = tokens_of(&pruned);
             self.replace_history(pruned);
@@ -1076,7 +1182,7 @@ Reply with only the summary.",
             // request a server would trim to nonsense - which is exactly how
             // history ended up replaced by a garbage summary, with nothing
             // ever erroring to say so - free the room directly.
-            let pruned = self.prune_history(old.len(), &tail, !old.is_empty());
+            let pruned = self.prune_history(old, &tail, !old.is_empty());
             if tokens_of(&pruned) < tokens_of(&history) {
                 self.replace_history(pruned);
             }
@@ -1206,6 +1312,8 @@ history kept]",
         let mut next = Vec::with_capacity(tail.len() + 1);
         next.push(Message { role: Role::System, content, ..Default::default() });
         next.extend(tail.iter().cloned());
+        // Belt and braces for the tail boundary (see [`Agent::strip_leading_orphans`]).
+        let mut next = Self::strip_leading_orphans(next);
         let before = tokens_of(&history);
         // A conversation of mostly short messages can leave summary + kept
         // tail *bigger* than what they replaced, which is the opposite of the
@@ -1213,6 +1321,9 @@ history kept]",
         // newest ones are the ones worth their space).
         while next.len() > 2 && tokens_of(&next) >= before {
             next.remove(1);
+            // Dropping the oldest kept message can orphan the tool results of
+            // the round it belonged to.
+            next = Self::strip_leading_orphans(next);
         }
         if tokens_of(&next) >= before {
             // Even [summary, newest] is no smaller: there is nothing here
@@ -1221,8 +1332,24 @@ history kept]",
             self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
             return;
         }
+        // The summary is a system turn and the kept tail of an agent
+        // conversation is usually all tool calls and tool results, so this is
+        // the moment the request loses its `user` turn - see
+        // [`Agent::ensure_user_turn`].
+        let pre_inject = next.len();
+        let next = Self::ensure_user_turn(next, old);
+        let injected = next.len() - pre_inject;
+        if tokens_of(&next) >= before {
+            // Even [summary, carried task, newest] is no smaller: there is
+            // nothing here worth compacting. Require real regrowth before
+            // trying again, so this cannot turn into a summarize request every
+            // single round.
+            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            return;
+        }
         let after = tokens_of(&next);
-        let kept = next.len() - 1;
+        // The injected user turn is not one of the kept messages.
+        let kept = next.iter().filter(|m| m.role != Role::System).count() - injected;
         self.replace_history(next);
         self.compact_failures.store(0, Ordering::SeqCst);
         self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
@@ -2151,6 +2278,299 @@ mod tests {
         assert!(last.contains("message number 9"), "recent message not kept verbatim: {last}");
         let keep = agent.compact_tunables().keep_recent as usize;
         assert!(h.len() > keep, "expected the recent tail to survive: {} messages", h.len());
+    }
+
+    /// An agent conversation is mostly tool calls and tool results, so the
+    /// messages a compaction keeps verbatim - plus the summary, which is a
+    /// system turn - can leave a request with **no `user` turn at all**. The
+    /// Qwen3 chat template (vllm-project/vllm#36432, same template in
+    /// llama.cpp/Ollama builds) treats that as an error:
+    /// `No user query found in messages.` as a 400 on the first request after
+    /// a compaction that had just reported success - the session died at the
+    /// moment compaction was supposed to keep it going.
+    #[tokio::test]
+    async fn compacted_history_still_carries_a_user_turn() {
+        let summary = "decided to route the proxy through a process-wide transport slot; \
+updated config, dotenv and the repl; tests pass; open task is the README wording. ".repeat(4);
+        let responses = vec![vec![content(&summary), done(1, 1)]];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent.set_context_size(2048);
+        // A realistic agent history: the user's task, then rounds of calls and
+        // results. The kept tail lands entirely inside the tool rounds.
+        agent.push_history(Message {
+            role: Role::User,
+            content: "add SOCKS proxy support via argument, .env, environment variable and slash command".into(),
+            ..Default::default()
+        });
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{i}"),
+                    name: "run_command".into(),
+                    arguments: format!(r#"{{"command":"cargo test step {i} and read the output carefully enough to fill some tokens"}}"#),
+                }],
+                ..Default::default()
+            });
+            agent.push_history(Message {
+                role: Role::Tool,
+                content: format!("test result of step {i}: 284 passed; 0 failed; some more output text here"),
+                tool_call_id: format!("call_{i}"),
+                name: "run_command".into(),
+                ..Default::default()
+            });
+        }
+        agent.compact(CancellationToken::new()).await;
+
+        let h = agent.history.lock().unwrap();
+        assert!(
+            h[0].content.starts_with("Summary of earlier conversation"),
+            "history was not summarized, so the assertions below prove nothing: {:?}",
+            h.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        assert!(
+            h.iter().any(|m| m.role == Role::User),
+            "a request without a user turn is a 400 for a Qwen3 template: {:?}",
+            h.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        let task = h.iter().find(|m| m.role == Role::User).unwrap();
+        assert!(
+            task.content.contains("SOCKS proxy"),
+            "the user's own task must be carried across, got: {}",
+            task.content
+        );
+        assert!(
+            h.windows(2).all(|w| w[0].role != Role::System || w[1].role != Role::System),
+            "the carried task belongs after the summary, not stacked with another system turn"
+        );
+    }
+
+    /// The same failure end-to-end: the request *after* a compaction is the
+    /// one the server rejects. Checks the shape a strict OpenAI-compatible
+    /// server needs - a user turn, and no `tool` result whose call was never
+    /// requested in this request.
+    #[tokio::test]
+    async fn the_request_after_a_compaction_is_acceptable_to_a_strict_server() {
+        let summary = "compacted everything: the proxy lives in a process-wide slot, config and dotenv both feed it. ".repeat(4);
+        let responses = vec![
+            vec![content(&summary), done(1, 1)], // the summarize request
+            vec![content("done"), done(1, 1)], // the turn's real request
+        ];
+        let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
+        agent.set_context_size(512); // trigger at ~307 tokens
+        agent.push_history(Message {
+            role: Role::User,
+            content: "carry on with the proxy feature and finish the docs".into(),
+            ..Default::default()
+        });
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{i}"),
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"src/agent/part{i}.rs"}}"#),
+                }],
+                ..Default::default()
+            });
+            agent.push_history(Message {
+                role: Role::Tool,
+                content: format!("contents of part{i}: a body of text long enough to be worth summarizing here"),
+                tool_call_id: format!("call_{i}"),
+                name: "read_file".into(),
+                ..Default::default()
+            });
+        }
+        agent.run_turn(CancellationToken::new(), "rerun the tests and summarize").await.unwrap();
+
+        let reqs = provider.sent_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "expected a summarize request then the turn");
+        let sent = &reqs[1].messages;
+        assert!(
+            sent.iter().any(|m| m.role == Role::User),
+            "no user turn: {:?}",
+            sent.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        // Every tool result must be answering a call present in the request.
+        for (i, m) in sent.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            assert!(
+                sent[..i].iter().any(|a| a.role == Role::Assistant
+                    && a.tool_calls.iter().any(|tc| tc.id == m.tool_call_id)),
+                "orphan tool result at #{i} ({}) - a strict server rejects it: {:?}",
+                m.tool_call_id,
+                sent.iter().map(|m| m.role).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A tool result is meaningless without the assistant message that
+    /// requested it, so the kept tail must never start mid-round.
+    #[test]
+    fn tail_start_never_splits_a_tool_round() {
+        // [user, assistant+call, tool, assistant+call, tool, tool]
+        let mut msgs = vec![Message { role: Role::User, content: "task".into(), ..Default::default() }];
+        for i in 0..2 {
+            msgs.push(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall { id: format!("c{i}"), name: "t".into(), arguments: "{}".into() }],
+                ..Default::default()
+            });
+            msgs.push(Message { role: Role::Tool, content: "r".into(), tool_call_id: format!("c{i}"), name: "t".into(), ..Default::default() });
+        }
+        msgs.push(Message { role: Role::Tool, content: "r2".into(), tool_call_id: "c1".into(), name: "t".into(), ..Default::default() });
+        // The last message is a tool result: keeping 1 or 2 would start the
+        // tail on a result whose call lives behind it.
+        for keep in 1..4 {
+            let start = Agent::tail_start(&msgs, keep);
+            assert_ne!(msgs[start].role, Role::Tool, "tail starts on an orphan result at keep={keep}");
+        }
+        // A window holding nothing but tool results cannot be realigned (it
+        // would leave nothing to summarize), so the orphans are dropped
+        // instead of being kept unpairable.
+        let only_tools: Vec<Message> = (0..6)
+            .map(|i| Message { role: Role::Tool, content: "r".into(), tool_call_id: format!("c{i}"), name: "t".into(), ..Default::default() })
+            .collect();
+        let start = Agent::tail_start(&only_tools, 4);
+        assert!(start >= only_tools.len() || only_tools[start].role != Role::Tool, "keep={start}");
+    }
+
+    /// The shrink loop removes the oldest kept message until summary + tail is
+    /// really smaller than what it replaces. When that message is an
+    /// `assistant` turn, the results of the calls it made are left answering a
+    /// call that now only exists inside the summary - a strict server's 400 -
+    /// so they go with it.
+    #[tokio::test]
+    async fn shrinking_to_really_save_drops_orphaned_tool_results() {
+        let summary = "the proxy lives in one process-wide slot that every client looks up".repeat(2);
+        let responses = vec![vec![content(summary.as_str()), done(1, 1)]];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent.set_context_size(512); // summary target = 128 tokens
+        // The summarized part is nearly free next to the tail, so summary +
+        // tail is not yet a shrink and the loop has to remove something.
+        agent.push_history(Message { role: Role::User, content: "ok".into(), ..Default::default() });
+        // The oldest kept round: a call with a long argument (kept verbatim -
+        // only message *content* is clamped) and a result.
+        agent.push_history(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "run_command".into(),
+                arguments: format!(r#"{{"command":"{}"}}"#, "cargo test --all-features ".repeat(30)),
+            }],
+            ..Default::default()
+        });
+        agent.push_history(Message {
+            role: Role::Tool,
+            content: "the result of that long command, with enough text in it to cost a few tokens".into(),
+            tool_call_id: "c1".into(),
+            name: "run_command".into(),
+            ..Default::default()
+        });
+        for i in 2..4 {
+            agent.push_history(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "run_command".into(),
+                    arguments: format!(r#"{{"command":"cargo test step {i}"}}"#),
+                }],
+                ..Default::default()
+            });
+            agent.push_history(Message {
+                role: Role::Tool,
+                content: format!("result {i}"),
+                tool_call_id: format!("c{i}"),
+                name: "run_command".into(),
+                ..Default::default()
+            });
+        }
+        agent.compact(CancellationToken::new()).await;
+        let h = agent.history.lock().unwrap();
+        assert!(
+            h[0].content.starts_with("Summary of earlier conversation"),
+            "history was not summarized, so the assertions below prove nothing: {:?}",
+            h.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        // The shrink loop really did run - otherwise the orphan check below is
+        // vacuous.
+        assert!(
+            h.iter().all(|m| m.tool_calls.iter().all(|tc| tc.id != "c1")),
+            "the oldest kept round was not dropped, so nothing was orphaned: {:?}",
+            h.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        for (i, m) in h.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            assert!(
+                h[..i].iter().any(|a| a.role == Role::Assistant
+                    && a.tool_calls.iter().any(|tc| tc.id == m.tool_call_id)),
+                "orphan tool result at #{i} ({}) after shrinking: {:?}",
+                m.tool_call_id,
+                h.iter().map(|m| m.role).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The prune paths (summarizing disabled after repeated failures, or a
+    /// window too small to summarize) drop the oldest messages - which is
+    /// where the user's turn usually is - so they must carry one over too.
+    #[tokio::test]
+    async fn a_pruned_history_still_carries_a_user_turn() {
+        // No scripted responses: every summarize attempt errors, and after
+        // COMPACT_MAX_FAILURES compaction prunes instead.
+        let (agent, _e, _log) = new_test_agent(Vec::new());
+        agent.set_context_size(512);
+        agent.push_history(Message {
+            role: Role::User,
+            content: "the task the user actually asked for".into(),
+            ..Default::default()
+        });
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall { id: format!("c{i}"), name: "t".into(), arguments: "{}".into() }],
+                ..Default::default()
+            });
+            agent.push_history(Message {
+                role: Role::Tool,
+                content: format!("result {i} with a body of text worth summarizing"),
+                tool_call_id: format!("c{i}"),
+                name: "t".into(),
+                ..Default::default()
+            });
+        }
+        for _ in 0..3 {
+            agent.compact(CancellationToken::new()).await;
+        }
+        let h = agent.history.lock().unwrap();
+        assert!(
+            h.iter().any(|m| m.role == Role::User),
+            "pruned history lost its user turn: {:?}",
+            h.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        // And no kept result points at a call that is no longer there.
+        for (i, m) in h.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            assert!(
+                h[..i].iter().any(|a| a.role == Role::Assistant
+                    && a.tool_calls.iter().any(|tc| tc.id == m.tool_call_id)),
+                "orphan tool result at #{i} ({}) in pruned history: {:?}",
+                m.tool_call_id,
+                h.iter().map(|m| m.role).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// A window too small to hold the summarize request's own instruction must
