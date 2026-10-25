@@ -28,18 +28,66 @@ use crate::ui::{RequestStats, Writer};
 /// only to decide when history has grown large enough to compact - it
 /// doesn't need to be exact, just good enough to keep the prompt well clear
 /// of context_size before growth actually slows things down.
+///
+/// Kept only as the char<->token conversion for places that already speak
+/// characters; anything measuring text uses [`estimate_tokens`], which is
+/// script-aware.
 const APPROX_CHARS_PER_TOKEN: i64 = 4;
 
-/// How much of context_size (converted to an estimated character budget)
-/// history is allowed to reach before compaction kicks in, leaving room for
-/// the system message, tool specs, and the model's own reply.
-const COMPACT_HEADROOM_FRACTION: f64 = 0.6;
+/// Absolute ceiling on the summary's length, in tokens. The budget fraction
+/// alone is far too generous at large window sizes (a 32k window would ask a
+/// local model for a 32,000-character summary it cannot produce inside its
+/// own max-tokens default), and a summary that long defeats the point of
+/// compacting. ~1k tokens is what the old 4,000-character ceiling meant for
+/// English; keeping the ceiling in tokens is what stops it from quietly
+/// becoming 2.5k tokens of Thai text.
+const MAX_SUMMARY_TOKENS: i64 = 1_000;
 
-/// Bounds how big the summary `compact` produces is allowed to be, as a
-/// fraction of the same character budget. Without a cap, a verbose summary
-/// can land close to (or even above) the trigger threshold, so the very next
-/// tool round re-triggers compaction again.
-const COMPACT_TARGET_FRACTION: f64 = 0.25;
+/// A summary shorter than this (in tokens, never more than the target
+/// itself) is not worth the history it replaced - it says less than the
+/// messages it dropped. When that happens the transcript is pruned instead
+/// of summarized (see [`Agent::compact`]).
+const MIN_SUMMARY_TOKENS: i64 = 100;
+
+/// Tokens kept free in the summarize request for the model's reply, the
+/// server's chat template, and a model that rounds its summary up. Also the
+/// request's `max_output_tokens`.
+const SUMMARY_REPLY_SLACK: i64 = 128;
+
+/// Below this the transcript would only hold the tail of a sentence, so a
+/// summarize request is not worth sending at all - the history is pruned
+/// instead (see [`Agent::compact`]).
+const MIN_TRANSCRIPT_TOKENS: i64 = 64;
+
+/// Tool results older than the tail are only there to give the summarizer
+/// the gist of what happened; their full text is neither summarized (the
+/// prompt asks for it to be omitted) nor needed again.
+///
+/// In tokens, and therefore script-independent: the older
+/// 2,000-character figure was ~500 tokens of English but ~1,250 of Thai.
+const SUMMARY_TOOL_RESULT_TOKENS: i64 = 500;
+
+/// The cap on tool results in the tail kept verbatim after compaction, in
+/// tokens. The most recent results matter (paths, errors), their megabytes
+/// do not.
+const KEPT_TOOL_RESULT_TOKENS: i64 = 1_000;
+
+/// Consecutive failed (or useless) compactions before compaction stops being
+/// attempted, so a provider that rejects or ignores the summarize request
+/// cannot turn every tool round into a fresh full-size LLM call.
+const COMPACT_MAX_FAILURES: i64 = 2;
+
+/// After a successful compaction, history must grow this much (as a
+/// fraction of the size it had just after that compaction) before another
+/// one is attempted - otherwise a window too small to hold the fixed
+/// overhead would compact on every single round and get nowhere.
+const COMPACT_REGROW_FRACTION: f64 = 1.25;
+
+/// A provider-reported prompt size at or below this, while our own estimate
+/// is much higher, means the server is almost certainly trimming the prompt
+/// from the front instead of using the window we asked for.
+const SUSPICIOUS_SMALL_WINDOW_TOKENS: i64 = 4_200;
+
 
 /// The character-budget basis used when context_size is left unset (<= 0),
 /// so proactive compaction still has something to measure against.
@@ -110,6 +158,62 @@ You are working through a task checklist with no human reviewing each step befor
 8. ask_user BLOCKS this run until a human replies, which defeats the point of working unattended: decide the most reasonable option yourself, do the work, and record the decision and the assumption you made in your reply (and in .progress) so it can be reviewed afterwards. Ask only when continuing would be destructive or the work cannot proceed at all without the answer.
 ";
 
+/// Compaction tunables (see the `JONNYQ_COMPACT_*` settings). Every field
+/// has a sane default, so a zeroed/unset config still compacts correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactTunables {
+    /// How many of the most recent messages survive a compaction verbatim,
+    /// so the agent still sees the file paths, errors and command output it
+    /// was working with instead of re-reading everything (which is what made
+    /// history fill right back up after compacting).
+    pub keep_recent: i64,
+    /// Percent of context_size the *whole request* - system message, tool
+    /// specs and history together - may reach before compaction kicks in,
+    /// leaving room for the model's own reply.
+    pub headroom_percent: i64,
+    /// Percent of the window the summary may occupy. Uncapped, a verbose
+    /// summary lands close to the trigger threshold again and the very next
+    /// tool round re-compacts.
+    pub target_percent: i64,
+    /// Character ceiling on the transcript sent to be summarized. The request
+    /// asking for a summary must itself fit in the window - otherwise Ollama
+    /// silently drops its front (where the instructions are) and an
+    /// OpenAI-compatible server answers 400. Still halved for small windows.
+    pub transcript_cap: i64,
+}
+
+impl Default for CompactTunables {
+    /// The `JONNYQ_COMPACT_*` / `-compact-*` defaults, so there is exactly
+    /// one place that says what they are.
+    fn default() -> Self {
+        use crate::config as c;
+        Self {
+            keep_recent: c::DEFAULT_COMPACT_KEEP_RECENT,
+            headroom_percent: c::DEFAULT_COMPACT_HEADROOM_PERCENT,
+            target_percent: c::DEFAULT_COMPACT_TARGET_PERCENT,
+            transcript_cap: c::DEFAULT_SUMMARY_TRANSCRIPT_CAP,
+        }
+    }
+}
+
+impl CompactTunables {
+    /// Clamped so a mistyped `.env` value cannot disable compaction entirely
+    /// (headroom 0 = compact every round) or make a summary as large as the
+    /// window it is meant to free.
+    pub fn normalized(self) -> Self {
+        Self {
+            keep_recent: self.keep_recent.clamp(0, 64),
+            headroom_percent: self.headroom_percent.clamp(10, 95),
+            target_percent: self.target_percent.clamp(1, 50),
+            transcript_cap: if self.transcript_cap <= 0 {
+                Self::default().transcript_cap
+            } else {
+                self.transcript_cap
+            },
+        }
+    }
+}
+
 /// Aggregated provider usage / timing, exposed so callers (e.g. /plan and
 /// /coding's ntfy notifications) can report the same figures the terminal's
 /// metrics line shows.
@@ -149,6 +253,36 @@ pub struct Agent {
     pub coding_mode: std::sync::atomic::AtomicBool,
 
     pub history: std::sync::Mutex<Vec<Message>>,
+
+    /// Consecutive compaction failures (a provider error, an empty summary,
+    /// a summary too short to be worth its salt). Once
+    /// [`COMPACT_MAX_FAILURES`] is reached compaction stops being attempted,
+    /// so a provider that rejects the request cannot turn every tool round
+    /// into a fresh, full-size LLM call. Cleared by a success or by
+    /// [`Agent::reset_history`] / a `/context` change.
+    pub compact_failures: AtomicI64,
+
+    /// Estimated tokens of history right after the last compaction. History
+    /// has to at least [`COMPACT_REGROW_FRACTION`] this large before another
+    /// compaction is attempted: if the fixed overhead (system message + tool
+    /// specs + the summary itself) already fills the window, compacting
+    /// again on every round would remove nothing and loop forever.
+    compact_floor_tokens: AtomicI64,
+
+    /// Usage of the compaction requests made during the current turn, folded
+    /// into the turn's metrics line once it ends: a summarize call spends
+    /// real tokens, and the footer used to report as if it had spent none.
+    pending_compaction_usage: std::sync::Mutex<Usage>,
+
+    /// Whether the "the server is trimming my prompt" warning has been shown
+    /// since the last `/context` change. It is a property of the server's
+    /// window, not of one request, so repeating it on every tool round would
+    /// only bury the output it is trying to protect.
+    trim_warned: std::sync::atomic::AtomicBool,
+
+    /// Compaction tunables, hot-changeable so `/env reload` can retune a
+    /// running session (see [`Agent::configure`]).
+    compact: std::sync::Mutex<CompactTunables>,
 
     /// The most recently completed run_turn call's aggregated LLM usage and
     /// wall-clock duration. Stale (left over from an earlier turn) if
@@ -196,6 +330,11 @@ impl Agent {
             coding_mode: std::sync::atomic::AtomicBool::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             last_usage: std::sync::Mutex::new(UsageTotals::default()),
+            compact_failures: AtomicI64::new(0),
+            compact_floor_tokens: AtomicI64::new(0),
+            pending_compaction_usage: std::sync::Mutex::new(Usage::default()),
+            trim_warned: std::sync::atomic::AtomicBool::new(false),
+            compact: std::sync::Mutex::new(CompactTunables::default()),
         }
     }
 
@@ -210,6 +349,14 @@ impl Agent {
     pub fn set_context_size(&self, n: i64) {
         self.context_size.store(n, Ordering::SeqCst);
         self.ui.state.write().unwrap().context_total = Self::context_total_for(n);
+        // A different window changes both the trigger and the failure
+        // budget: a smaller window may need to compact right away, and a
+        // larger one may no longer need the backoff that was applied
+        // against the old one.
+        self.compact_failures.store(0, Ordering::SeqCst);
+        self.compact_floor_tokens.store(0, Ordering::SeqCst);
+        // A new window is a new verdict on whether the server trims.
+        self.trim_warned.store(false, Ordering::SeqCst);
     }
 
     pub fn set_model(&self, m: &str) {
@@ -283,28 +430,85 @@ impl Agent {
         self.coding_mode.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn history_chars(&self) -> i64 {
+    /// The compaction tunables currently in effect.
+    pub fn compact_tunables(&self) -> CompactTunables {
+        *self.compact.lock().unwrap()
+    }
+
+    /// Applies a (possibly re-read) config's compaction settings - `/env
+    /// reload` pushes changed `JONNYQ_COMPACT_*` values through here, the
+    /// same way it reaches the tools' own `configure`.
+    pub fn configure(&self, cfg: &crate::config::Config) {
+        *self.compact.lock().unwrap() = CompactTunables {
+            keep_recent: cfg.compact_keep_recent,
+            headroom_percent: cfg.compact_headroom_percent,
+            target_percent: cfg.compact_target_percent,
+            transcript_cap: cfg.summary_transcript_cap,
+        }
+        .normalized();
+        crate::tools::set_max_tool_result_chars(cfg.max_tool_result_chars.max(0) as usize);
+    }
+
+    /// Estimated tokens of everything currently in history (message bodies
+    /// plus the tool calls the assistant asked for, which are sent back to
+    /// the provider on every subsequent request).
+    ///
+    /// Also refreshes the shared snapshot so section headers can render live
+    /// context usage without owning the history - note this takes the state
+    /// *write* lock, so never call it while holding a read lock on it.
+    fn history_tokens(&self) -> i64 {
         let n: i64 = {
             let h = self.history.lock().unwrap();
             h.iter()
                 .map(|m| {
-                    m.content.chars().count() as i64
+                    estimate_tokens(&m.content)
                         + m.tool_calls
                             .iter()
-                            .map(|tc| tc.name.chars().count() as i64 + tc.arguments.chars().count() as i64)
+                            .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
                             .sum::<i64>()
                 })
                 .sum()
         };
-        // Keep the shared snapshot in sync so section headers render live
-        // context usage without owning the history.
-        self.ui.state.write().unwrap().history_chars = n;
+        self.ui.state.write().unwrap().history_tokens = n;
         n
     }
 
     fn push_history(&self, m: Message) {
-        self.history.lock().unwrap().push(m);
-        self.history_chars(); // refresh the shared snapshot
+        let content = Self::history_content_for(m.role, m.content);
+        self.history.lock().unwrap().push(Message { content, ..m });
+        self.history_tokens(); // refresh the shared snapshot
+    }
+
+    /// History replacement plus snapshot refresh, used by compaction.
+    fn replace_history(&self, msgs: Vec<Message>) {
+        *self.history.lock().unwrap() = msgs;
+        self.history_tokens();
+        // The old prompt size no longer describes history.
+        let mut s = self.ui.state.write().unwrap();
+        s.real_prompt_tokens = 0;
+        s.real_base_tokens = 0;
+    }
+
+    /// Tool results that are opaque and enormous (a base64 `data:` URI from
+    /// `read_pic`, say) are replaced by a placeholder before they enter
+    /// history. The provider's message body is plain text here, so the
+    /// payload can never be *rendered* by the model - it only ever costs
+    /// context, and a single image used to be able to push the conversation
+    /// hundreds of times past the window. The placeholder says what was
+    /// there and how to get it back.
+    ///
+    /// Tool results already went through [`crate::tools::cap_tool_result`],
+    /// which does the same for what a tool returned; this also covers text
+    /// that reaches history without passing through a tool (a large data URI
+    /// pasted at the prompt or read in by `/prompt <file>`).
+    fn history_content_for(role: Role, content: String) -> String {
+        // Short enough that no oversized payload can be hiding in it, and
+        // the model may genuinely still want the (small) bytes.
+        if role == Role::System || role == Role::Assistant || content.len() <= crate::tools::KEPT_DATA_URI_BYTES
+        {
+            return content;
+        }
+        crate::tools::elide_data_uris(&content).unwrap_or(content)
     }
 
     /// Discards all conversation history, so the next run_turn starts from a
@@ -316,7 +520,11 @@ impl Agent {
         self.history.lock().unwrap().clear();
         let mut s = self.ui.state.write().unwrap();
         s.real_prompt_tokens = 0;
-        s.history_chars = 0;
+        s.real_base_tokens = 0;
+        s.history_tokens = 0;
+        drop(s);
+        self.compact_failures.store(0, Ordering::SeqCst);
+        self.compact_floor_tokens.store(0, Ordering::SeqCst);
     }
 
     fn build_system_message(&self) -> Message {
@@ -360,11 +568,34 @@ it, inspect it, or take its contents into account for any task.\n",
         let start = Instant::now();
         self.ui.new_turn();
         let system_msg = self.build_system_message();
+        // In prompt mode, deliberately omit tools: sending a native tool spec
+        // while also prompting the model to emit text-based calls tends to
+        // trigger a backend's own function-calling grammar constraints - the
+        // very thing this mode exists to route around.
+        let tool_specs = if self.tool_call_mode() != ToolCallMode::Prompt {
+            self.tools.specs()
+        } else {
+            Vec::new()
+        };
+        // The specs ride along on every request but live outside history, so
+        // their size has to be counted or the trigger permanently under-reports
+        // by ~1k tokens. Measured once: they cannot change mid-turn.
+        let spec_tokens = estimate_tokens(&specs_for_estimate(&tool_specs));
         {
             let mut s = self.ui.state.write().unwrap();
-            s.sys_chars = system_msg.content.chars().count() as i64;
+            s.sys_tokens = estimate_tokens(&system_msg.content);
+            s.spec_tokens = spec_tokens;
             s.turn_start = Some(start);
             s.last_req = None;
+        }
+        // Compaction guard for the *start* of a turn: the previous turn may
+        // have ended with a failed compaction, `/prompt <file>` may have
+        // dropped a large file straight into history, or `/context` may have
+        // shrunk the window since - without this the first request of the
+        // turn is sent oversize. (The user's new message is not in history
+        // yet, so this deliberately runs before pushing it.)
+        if self.should_compact() {
+            self.compact(cancel.clone()).await;
         }
         self.push_history(Message { role: Role::User, content: user_input.to_string(), ..Default::default() });
 
@@ -379,11 +610,16 @@ it, inspect it, or take its contents into account for any task.\n",
                 let h = self.history.lock().unwrap();
                 std::iter::once(system_msg.clone()).chain(h.iter().cloned()).collect::<Vec<_>>()
             };
-            // Note: history_chars() takes the state *write* lock to refresh
-            // the shared snapshot, so the read lock must be released first
+            // history_tokens() takes the state *write* lock to refresh the
+            // shared snapshot, so the read lock must be released first
             // (std RwLock read-then-write on one thread deadlocks).
-            let sys_chars = self.ui.state.read().unwrap().sys_chars;
-            let round_base_chars = sys_chars + self.history_chars();
+            let round_base_tokens = {
+                let fixed = {
+                    let s = self.ui.state.read().unwrap();
+                    s.sys_tokens + spec_tokens
+                };
+                fixed + self.history_tokens()
+            };
             let round_start = Instant::now();
 
             // Each chat call gets its own cancellation token so a detected
@@ -395,24 +631,16 @@ it, inspect it, or take its contents into account for any task.\n",
             // provider and `http.NewRequestWithContext` aborting the stream
             // when the parent is cancelled.
             let chat_cancel = cancel.child_token();
-            // In prompt mode, deliberately omit tools: sending a native tool
-            // spec while also prompting the model to emit text-based calls
-            // tends to trigger a backend's own function-calling grammar
-            // constraints - the very thing this mode exists to route around.
-            let tool_specs = if self.tool_call_mode() != ToolCallMode::Prompt {
-                self.tools.specs()
-            } else {
-                Vec::new()
-            };
 
             let (mut events, provider_cancel) = self
                 .provider()
                 .chat(chat_cancel.clone(), &ChatRequest {
                     model: self.model(),
                     messages,
-                    tools: tool_specs,
+                    tools: tool_specs.clone(),
                     thinking: self.thinking(),
                     context_size: self.context_size.load(Ordering::SeqCst),
+                    max_output_tokens: None,
                 })
                 .await?;
 
@@ -471,7 +699,36 @@ it, inspect it, or take its contents into account for any task.\n",
                             s.last_req = Some(request_stats(usage, round_start.elapsed()));
                             if usage.prompt_tokens > 0 {
                                 s.real_prompt_tokens = usage.prompt_tokens;
-                                s.real_base_chars = round_base_chars;
+                                s.real_base_tokens = round_base_tokens;
+                            }
+                        }
+                        // If the provider reports a much smaller prompt than
+                        // the text we sent, the server is trimming the request
+                        // from the front (Ollama does this silently and still
+                        // answers 200) - the instructions at the head of the
+                        // prompt are being dropped, so say so instead of
+                        // letting the agent quietly lose its memory.
+                        // (>=512: a provider reporting a couple of tokens is a
+                        // stub, not a server with a small default window.)
+                        if usage.prompt_tokens >= 512 && usage.prompt_tokens <= SUSPICIOUS_SMALL_WINDOW_TOKENS {
+                            let est = round_base_tokens as f64;
+                            let real = usage.prompt_tokens as f64;
+                            // Once per window: a server that trims does it on
+                            // every round, and the warning would otherwise
+                            // bury the very output it warns about.
+                            if est > real * 1.5
+                                && !self.trim_warned.swap(true, Ordering::SeqCst)
+                            {
+                                self.ui.meta_colored(
+                                    crate::ui::COLOR_RED,
+                                    &format!(
+                                        "[warning: the provider reports {} prompt tokens but this request \
+contains about {} tokens of text - the server is likely dropping the front of the prompt. Raise num_ctx \
+(e.g. OLLAMA_CONTEXT_LENGTH / OLLAMA_NUM_CTX) or lower the context size with /context.]",
+                                        crate::ui::group_digits(usage.prompt_tokens),
+                                        crate::ui::group_digits(round_base_tokens)
+                                    ),
+                                );
                             }
                         }
                     }
@@ -566,6 +823,12 @@ it, inspect it, or take its contents into account for any task.\n",
                         self.ui.tool_call(&format!("{}: error: {}", tc.name, e.message));
                     }
                 }
+                // Bound what a single result can add to history, whatever
+                // tool produced it: an unbounded `cargo build -vv` or a
+                // multi-megabyte file read would otherwise push the
+                // conversation several times past the window in one step and
+                // make the next compaction request itself too big to send.
+                let result = crate::tools::cap_tool_result(result);
                 if self.tool_call_mode() == ToolCallMode::Prompt {
                     // A plain user-role message, not Role::Tool: the "tool"
                     // role/tool_call_id pairing is an OpenAI-style
@@ -600,6 +863,9 @@ it, inspect it, or take its contents into account for any task.\n",
             // Loop again so the model can see the tool results.
         };
 
+        // A compaction that ran during this turn spent real tokens; the
+        // metrics line and /plan//coding's notification must report them.
+        total_usage = sum_usage(total_usage, self.take_compaction_usage());
         let elapsed = start.elapsed();
         let cs = self.final_context_status(last_round_usage);
         let msg = format!("[{} wall={} | {}]", format_usage(total_usage), go_wall(elapsed), cs);
@@ -612,23 +878,62 @@ it, inspect it, or take its contents into account for any task.\n",
 
         if self.should_compact() {
             self.compact(cancel).await;
+            let extra = self.take_compaction_usage();
+            if extra.total_tokens > 0 {
+                let mut lu = self.last_usage.lock().unwrap();
+                lu.usage = sum_usage(lu.usage, extra);
+            }
         }
         Ok(())
+    }
+
+    /// Estimated tokens of the request that would be sent right now: the
+    /// system message + the tool specs that accompany it + history. When the
+    /// provider has reported a real prompt size for a request that was
+    /// otherwise the same, that figure (plus what was added since) wins over
+    /// the estimate - it is the only measurement available of what the server
+    /// actually charges for the fixed overhead.
+    ///
+    /// Everything the request contains is counted here, which the old
+    /// history-only trigger left out (~1k tokens of system message and tool
+    /// specs, i.e. ~6% of a default window).
+    fn request_tokens(&self) -> i64 {
+        let history = self.history_tokens(); // refreshes the shared snapshot
+        let s = self.ui.state.read().unwrap();
+        let est = s.sys_tokens + s.spec_tokens + history;
+        if s.real_prompt_tokens > 0 {
+            return est.max(s.real_prompt_tokens + (est - s.real_base_tokens).max(0));
+        }
+        est
+    }
+
+    /// The context window in effect, in tokens.
+    fn token_budget(&self) -> i64 {
+        let budget = self.context_size.load(Ordering::SeqCst);
+        if budget <= 0 {
+            FALLBACK_CONTEXT_SIZE
+        } else {
+            budget
+        }
     }
 
     /// Estimates history's size relative to context_size and reports whether
     /// it has grown large enough that it should be summarized and replaced
     /// before the next prompt is sent.
+    ///
+    /// Measured against the *whole* request (see [`Agent::request_tokens`])
+    /// rather than history alone, and compared against a floor of what the
+    /// last compaction left behind: if the system message, tool specs and the
+    /// summary itself already fill the trigger level, compacting again would
+    /// remove nothing and would otherwise repeat on every tool round.
     fn should_compact(&self) -> bool {
-        (self.history_chars() as f64) > (self.char_budget() as f64) * COMPACT_HEADROOM_FRACTION
-    }
-
-    /// Estimates how many characters of history correspond to the full
-    /// context_size, as a stand-in for tokens.
-    fn char_budget(&self) -> i64 {
-        let budget = self.context_size.load(Ordering::SeqCst);
-        let budget = if budget <= 0 { FALLBACK_CONTEXT_SIZE } else { budget };
-        (budget as f64 * APPROX_CHARS_PER_TOKEN as f64) as i64
+        let used = self.request_tokens();
+        let headroom = self.compact_tunables().headroom_percent as f64 / 100.0;
+        if (used as f64) <= (self.token_budget() as f64) * headroom {
+            return false;
+        }
+        let floor = self.compact_floor_tokens.load(Ordering::SeqCst);
+        floor == 0 || (used as f64) >= (floor as f64) * COMPACT_REGROW_FRACTION
     }
 
     /// The context size after a turn: the last request's real prompt tokens
@@ -645,73 +950,616 @@ it, inspect it, or take its contents into account for any task.\n",
         self.ui.state.read().unwrap().context_status()
     }
 
-    /// Summarizes history into a single message, bounded to roughly
-    /// COMPACT_TARGET_FRACTION of the character budget, and resets history
-    /// to just that message.
-    async fn compact(&self, cancel: CancellationToken) {
-        let transcript: String = {
-            let h = self.history.lock().unwrap();
-            h.iter().map(|m| format!("{}: {}\n", m.role, m.content)).collect()
-        };
+    /// The most recent messages survive a compaction, with oversized tool
+    /// results inside them shrunk: the agent needs the paths, errors and
+    /// output it is working with *right now*, and re-reading them is exactly
+    /// what made history fill back up after the last compaction.
+    ///
+    /// The tail is bounded by a share of the window (the same share the
+    /// summary gets), so on a small window the kept messages cannot quietly
+    /// be the reason the next request overflows again; a megabyte of the
+    /// latest `run_command` output comes through as its head and tail.
+    fn kept_tail(&self, history: &[Message], keep: usize) -> Vec<Message> {
+        let keep = keep.min(history.len());
+        if keep == 0 {
+            return Vec::new();
+        }
+        // Per-message allowance, in tokens: the summary's share divided
+        // across the kept messages, with a floor so a kept message can still
+        // carry a path and an error, and a ceiling so one bloated result
+        // cannot spend the whole tail's budget.
+        let share = (self.summary_target_tokens() / keep.max(1) as i64).clamp(60, KEPT_TOOL_RESULT_TOKENS);
+        history[history.len() - keep..]
+            .iter()
+            .map(|m| Message {
+                content: if m.role == Role::Tool {
+                    clamp_head_tail_tokens(&m.content, share)
+                } else {
+                    // A user or assistant message is what the agent actually
+                    // asked/said, so it gets the whole share on top of a
+                    // floor of its own.
+                    clamp_head_tail_tokens(&m.content, share + share / 2)
+                },
+                ..m.clone()
+            })
+            .collect()
+    }
 
-        let target = (self.char_budget() as f64 * COMPACT_TARGET_FRACTION) as i64;
+    /// Compacts history without asking the model for a summary: keeps the
+    /// recent messages verbatim and replaces the rest by a one-line note of
+    /// what was dropped. Used when the summary is unusable (empty, thinking
+    /// only, too short to be worth its salt) - dropping stale middle history
+    /// buys back most of the room, and it works even when the provider is
+    /// failing, which is precisely when compaction is needed most.
+    fn prune_history(&self, prefix_count: usize, kept: &[Message], dropped: bool) -> Vec<Message> {
+        let note = format!(
+            "[{} earlier messages were pruned from history to fit the context window, without a summary \
+(ask the user or re-read files if you need what they contained)]",
+            prefix_count
+        );
+        let mut out = Vec::with_capacity(kept.len() + 1);
+        if dropped {
+            out.push(Message { role: Role::System, content: note, ..Default::default() });
+        }
+        out.extend(kept.iter().cloned());
+        out
+    }
+
+    /// Summarizes history into a single message and replaces everything
+    /// before the kept tail with it, so the conversation can go on within the
+    /// window.
+    ///
+    /// The rules that keep this from being the thing that breaks the session:
+    /// the transcript sent to the model is capped well inside the window (and
+    /// `num_ctx` is declared, so the server cannot quietly trim it), the
+    /// response is length-capped, an unusable summary never replaces history,
+    /// repeated failures stop re-sending a doomed request every round, and the
+    /// most recent messages always survive verbatim.
+    async fn compact(&self, cancel: CancellationToken) {
+        let failures = self.compact_failures.load(Ordering::SeqCst);
+        let history = self.history.lock().unwrap().clone();
+        if history.is_empty() {
+            return;
+        }
+        let tun = self.compact_tunables();
+        // The messages to keep verbatim, but never so many that nothing is
+        // left to summarize (which would replace history with a summary of
+        // itself and free nothing at all).
+        let keep = (tun.keep_recent as usize).min(history.len() - 1);
+        let (old, _) = history.split_at(history.len() - keep);
+        let tail = self.kept_tail(&history, keep);
+
+        // The summarizer has repeatedly failed: stop paying for full-size
+        // requests it cannot answer, and buy back room by dropping the oldest
+        // messages instead. Better a gap in memory than an oversize request on
+        // every round.
+        if failures >= COMPACT_MAX_FAILURES {
+            let pruned = self.prune_history(old.len(), &tail, !old.is_empty());
+            let before = tokens_of(&history);
+            let after = tokens_of(&pruned);
+            self.replace_history(pruned);
+            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.ui.meta(&format!(
+                "[context] summarizing disabled after {} failed attempts - pruned {} older message(s) instead \
+({} -> {} tokens); /context <smaller> or a new session will help]",
+                failures,
+                old.len(),
+                crate::ui::group_digits(before),
+                crate::ui::group_digits(after)
+            ));
+            return;
+        }
+
+        let target = self.summary_target_tokens();
+        // The request that asks for a summary has to fit in the window it is
+        // trying to fix: the instruction's own cost is taken out of the
+        // transcript's allowance rather than added on top of it, and the
+        // total is checked before sending. Ollama does not error on an
+        // oversized prompt - it drops tokens from the *front* (where this
+        // instruction sits) and answers 200 anyway - so a request that is too
+        // big here is one that silently summarizes the wrong text.
+        let window = self.token_budget();
+        let instruction = format!(
+            "Summarize the conversation below concisely, preserving important facts, decisions, and \
+open tasks. Keep the summary under about {} tokens - omit exact file contents, long command output, or \
+other verbatim detail; the agent can re-read a file or re-run a command later if it needs that detail again. \
+Reply with only the summary.",
+            target
+        );
+        // What the transcript may cost, so that the instruction, the
+        // transcript and a reply still fit inside the window together.
+        let instruction_tokens = estimate_tokens(&instruction);
+        let room = (window - instruction_tokens - SUMMARY_REPLY_SLACK).max(0);
+        if room < MIN_TRANSCRIPT_TOKENS {
+            // The window cannot hold the instruction, a transcript with
+            // anything useful in it, and an answer at once. Rather than send a
+            // request a server would trim to nonsense - which is exactly how
+            // history ended up replaced by a garbage summary, with nothing
+            // ever erroring to say so - free the room directly.
+            let pruned = self.prune_history(old.len(), &tail, !old.is_empty());
+            if tokens_of(&pruned) < tokens_of(&history) {
+                self.replace_history(pruned);
+            }
+            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.ui.meta(&format!(
+                "[context] window of {} tokens is too small to summarize ({} tokens are left for the \
+transcript after its instruction, {} needed), so the {} oldest message(s) were dropped instead - \
+/context <bigger> would help]",
+                crate::ui::group_digits(window),
+                crate::ui::group_digits(room),
+                MIN_TRANSCRIPT_TOKENS,
+                old.len()
+            ));
+            return;
+        }
+        let (transcript, sent_raw_tokens) =
+            transcript_for_summary(old, self.transcript_cap_tokens().min(room));
         let req = ChatRequest {
             model: self.model(),
             messages: vec![
-                Message {
-                    role: Role::System,
-                    content: format!(
-                        "Summarize the conversation below concisely, preserving important facts, decisions, and \
-open tasks. Keep the summary under about {} characters - omit exact file contents, long command output, or \
-other verbatim detail; the agent can re-read a file or re-run a command later if it needs that detail again. \
-Reply with only the summary.",
-                        target
-                    ),
-                    ..Default::default()
-                },
-                Message { role: Role::User, content: transcript, ..Default::default() },
+                Message { role: Role::System, content: instruction, ..Default::default() },
+                Message { role: Role::User, content: transcript.clone(), ..Default::default() },
             ],
-            ..Default::default()
+            tools: Vec::new(),
+            thinking: false,
+            context_size: window,
+            // target is already a token allowance; the slack covers the
+            // chat template and a model that rounds its summary up.
+            max_output_tokens: Some(target + 128),
         };
-        let (mut events, provider_cancel) =
-            match self.provider().chat(cancel.clone(), &req).await {
+        let (mut events, provider_cancel) = match self.provider().chat(cancel.clone(), &req).await {
             Ok(v) => v,
             Err(e) => {
-                self.ui.meta(&format!("[context compaction failed: {}]", e.message));
+                self.note_compaction_failure(&format!("[context compaction failed: {}; history kept]", e.message));
                 return;
             }
         };
         let mut summary = String::new();
         let mut failed: Option<String> = None;
+        let mut got_done = false;
+        let mut repeat = RepeatDetector::default();
+        let mut loop_detected = false;
+        let mut summary_usage = Usage::default();
         while let Some(ev) = events.recv().await {
             match ev {
-                ChatEvent::Content { delta } => summary.push_str(&delta),
+                ChatEvent::Content { delta } => {
+                    if loop_detected {
+                        continue;
+                    }
+                    if repeat.add(&delta) {
+                        loop_detected = true;
+                        provider_cancel.cancel();
+                        continue;
+                    }
+                    summary.push_str(&delta);
+                }
+                ChatEvent::Done { usage } => {
+                    summary_usage = usage;
+                    got_done = true;
+                }
                 ChatEvent::Error { error } => {
                     failed = Some(error.message);
                     break;
                 }
-                _ => {}
+                // ChatEvent::Thinking is deliberately *not* folded into the
+                // summary, but it must not be mistaken for a usable answer:
+                // a reasoning model that writes everything into the thinking
+                // channel used to leave `summary` empty here, and the empty
+                // summary then replaced the whole conversation.
+                ChatEvent::Thinking { .. } => {}
+                ChatEvent::ToolCalls { .. } => {}
             }
         }
         provider_cancel.cancel();
         drop(events);
+        self.record_compaction_usage(summary_usage);
         if let Some(msg) = failed {
-            self.ui.meta(&format!("[context compaction failed: {}]", msg));
+            self.note_compaction_failure(&format!("[context compaction failed: {}; history kept]", msg));
             return;
         }
+        if !got_done {
+            // The stream closed without a completion event: whatever partial
+            // text arrived is not a finished summary. (run_turn treats this
+            // as an error; compact used to accept it silently.)
+            self.note_compaction_failure(
+                "[context compaction failed: the provider stream ended without a completion event; history kept]",
+            );
+            return;
+        }
+        if loop_detected {
+            self.note_compaction_failure("[context compaction stopped: the summary started repeating itself; history kept]");
+            return;
+        }
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            self.note_compaction_failure(
+                "[context compaction skipped: the model returned no summary (thinking-only or empty reply); \
+history kept]",
+            );
+            return;
+        }
+        // A summary is only worth its price when it preserves something: a
+        // stub that is short in absolute terms *and* a rounding error next to
+        // what it would replace means the agent loses more than it keeps.
+        let summary_tokens = estimate_tokens(&summary);
+        let dropped_tokens = tokens_of(old);
+        if summary_tokens < self.min_summary_tokens() && summary_tokens.saturating_mul(20) < dropped_tokens {
+            self.note_compaction_failure(&format!(
+                "[context compaction skipped: an ~{}-token summary would say less than the {} messages \
+(~{} tokens) it replaces; history kept]",
+                summary_tokens,
+                old.len(),
+                crate::ui::group_digits(dropped_tokens)
+            ));
+            return;
+        }
+
         // Enforce the target regardless of how well the model followed the
-        // length instruction - a verbose summary must not be allowed to
-        // leave history close to the trigger threshold again immediately.
-        let content = truncate_chars(
+        // length instruction - measured in tokens (the unit the window is
+        // billed in, so a Thai summary is no longer given 2-4x the room it
+        // was promised) and keeping both ends, since the open tasks the
+        // prompt asks to preserve reliably land at the end.
+        let content = clamp_head_tail_tokens(
             &format!("Summary of earlier conversation:\n{}", summary),
-            target as usize,
+            target,
         );
-        *self.history.lock().unwrap() = vec![Message { role: Role::System, content, ..Default::default() }];
-        // The old prompt size no longer describes history.
-        self.history_chars(); // refresh history_chars snapshot
-        self.ui.state.write().unwrap().real_prompt_tokens = 0;
-        self.ui.meta("[context compacted]");
+        let mut next = Vec::with_capacity(tail.len() + 1);
+        next.push(Message { role: Role::System, content, ..Default::default() });
+        next.extend(tail.iter().cloned());
+        let before = tokens_of(&history);
+        // A conversation of mostly short messages can leave summary + kept
+        // tail *bigger* than what they replaced, which is the opposite of the
+        // point: drop the oldest kept messages until it really shrinks (the
+        // newest ones are the ones worth their space).
+        while next.len() > 2 && tokens_of(&next) >= before {
+            next.remove(1);
+        }
+        if tokens_of(&next) >= before {
+            // Even [summary, newest] is no smaller: there is nothing here
+            // worth compacting. Require real regrowth before trying again, so
+            // this cannot turn into a summarize request every single round.
+            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            return;
+        }
+        let after = tokens_of(&next);
+        let kept = next.len() - 1;
+        self.replace_history(next);
+        self.compact_failures.store(0, Ordering::SeqCst);
+        self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+        self.ui.meta(&format!(
+            "[context compacted: {} messages summarized, ~{} -> ~{} tokens (transcript sent ~{} of ~{} tokens, \
+summary ~{} tokens, {} recent messages kept)]",
+            old.len(),
+            crate::ui::group_digits(before),
+            crate::ui::group_digits(after),
+            crate::ui::group_digits(estimate_tokens(&transcript)),
+            crate::ui::group_digits(sent_raw_tokens),
+            summary_tokens,
+            kept
+        ));
     }
+
+    /// Tokens a summary is allowed to occupy. [`MAX_SUMMARY_TOKENS`] keeps
+    /// this honest at large window sizes, and the floor keeps it usable at
+    /// small ones (below ~100 tokens a summary cannot carry facts, decisions
+    /// and open tasks at once) - never at the cost of asking for more than
+    /// the window itself, which absurdly small `-context` values would
+    /// otherwise do.
+    fn summary_target_tokens(&self) -> i64 {
+        let frac = self.compact_tunables().target_percent as f64 / 100.0;
+        let tokens = (self.token_budget() as f64 * frac) as i64;
+        tokens.clamp(MIN_SUMMARY_TOKENS, MAX_SUMMARY_TOKENS).min(self.token_budget().max(1))
+    }
+
+    /// Below this many tokens a summary is not worth the history it replaced
+    /// (see [`Agent::compact`]). Capped by the summary's own target, so an
+    /// absurdly small window does not make every summary "too short".
+    fn min_summary_tokens(&self) -> i64 {
+        MIN_SUMMARY_TOKENS.min(self.summary_target_tokens())
+    }
+
+    /// How large (in tokens) the transcript sent to the summarizer may be:
+    /// always a fraction of the window, so the request leaves room for the
+    /// instruction, the summary and the server's chat template.
+    ///
+    /// The tunable is configured in characters (`JONNYQ_SUMMARY_TRANSCRIPT_
+    /// CAP`), the unit it is documented in; it converts at the English rate
+    /// and only ever tightens the window-derived bound.
+    fn transcript_cap_tokens(&self) -> i64 {
+        let tun = self.compact_tunables();
+        let half_window = self.token_budget() / 2;
+        let configured = (tun.transcript_cap.max(1) / APPROX_CHARS_PER_TOKEN).max(256);
+        half_window.min(configured).max(256)
+    }
+
+    /// Records why compaction did not happen, and stops trying (with
+    /// [`COMPACT_MAX_FAILURES`] consecutive ones) once it is clear the
+    /// provider will not cooperate.
+    fn note_compaction_failure(&self, why: &str) {
+        let n = self.compact_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut msg = why.to_string();
+        if n >= COMPACT_MAX_FAILURES {
+            msg.push_str(&format!(
+                " ({} failures in a row - further summarizing is disabled; history will be pruned instead)",
+                n
+            ));
+        }
+        self.ui.meta(&msg);
+    }
+
+    /// Adds a compaction request's provider usage to the running total the
+    /// turn's metrics line reports: those tokens were really spent, and
+    /// ignoring them made the footer understate every compaction.
+    fn record_compaction_usage(&self, u: Usage) {
+        if u.total_tokens == 0 && !u.has_timing {
+            return;
+        }
+        let mut pending = self.pending_compaction_usage.lock().unwrap();
+        *pending = sum_usage(*pending, u);
+    }
+
+    /// Takes (and clears) the compaction usage accumulated since the last
+    /// call, so `run_turn` can fold it into the turn's totals.
+    fn take_compaction_usage(&self) -> Usage {
+        std::mem::take(&mut *self.pending_compaction_usage.lock().unwrap())
+    }
+
+    /// One-line-per-message view of what history is currently costing, for
+    /// `/history`: the context is otherwise invisible until it overflows.
+    pub fn history_report(&self) -> String {
+        let h = self.history.lock().unwrap().clone();
+        let mut out = String::new();
+        let mut total = 0i64;
+        for (i, m) in h.iter().enumerate() {
+            let t = estimate_tokens(&m.content)
+                + m.tool_calls
+                    .iter()
+                    .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
+                    .sum::<i64>();
+            total += t;
+            let calls = if m.tool_calls.is_empty() {
+                String::new()
+            } else {
+                format!(" +{} call(s)", m.tool_calls.len())
+            };
+            out.push_str(&format!(
+                "  #{} {:<9} {:>7} tok {:>8} chars{}\n",
+                i,
+                m.role.as_str(),
+                crate::ui::group_digits(t),
+                crate::ui::group_digits(m.content.chars().count() as i64),
+                calls
+            ));
+        }
+        // Before the first turn of a session the per-request figures have
+        // never been measured, so compute them here rather than reporting 0
+        // for the two costs that are always present. (Measured outside the
+        // state read lock: build_system_message/systems may take locks of
+        // their own.)
+        let (have_sys, have_specs) = {
+            let s = self.ui.state.read().unwrap();
+            (s.sys_tokens, s.spec_tokens)
+        };
+        let (sys_tokens, spec_tokens) = if have_sys > 0 || have_specs > 0 {
+            (have_sys, have_specs)
+        } else {
+            let sys = estimate_tokens(&self.build_system_message().content);
+            let specs = if self.tool_call_mode() != ToolCallMode::Prompt {
+                estimate_tokens(&specs_for_estimate(&self.tools.specs()))
+            } else {
+                0
+            };
+            (sys, specs)
+        };
+        let est = sys_tokens + spec_tokens + total;
+        out.push_str(&format!(
+            "  total history {} tok; request estimate {} / {} tokens (system {} + tools {} + history {})",
+            crate::ui::group_digits(total),
+            crate::ui::group_digits(est),
+            crate::ui::group_digits(self.token_budget()),
+            crate::ui::group_digits(sys_tokens),
+            crate::ui::group_digits(spec_tokens),
+            crate::ui::group_digits(total),
+        ));
+        out
+    }
+
+    /// Summarizes now, on demand (`/compact`), ignoring the size trigger.
+    pub async fn force_compact(&self, cancel: CancellationToken) {
+        // Compaction is normally skipped when the trigger has not fired or
+        // the backoff is on; an explicit request overrides both.
+        self.compact_failures.store(0, Ordering::SeqCst);
+        self.compact_floor_tokens.store(0, Ordering::SeqCst);
+        self.compact(cancel).await;
+    }
+}
+
+
+
+/// Cuts `s` to at most `max_chars` characters, keeping the beginning (70%)
+/// and the end (30%) with a marker between them.
+///
+/// Both ends matter: the summary's preamble is at the front, but the "open
+/// tasks" the instruction explicitly asks to preserve are what a model writes
+/// last, and a head-only cut threw exactly that away. Measured in characters
+/// (never bytes) because every budget in this file is a character count, and
+/// charging a 3-byte-per-character Thai summary in bytes silently gave it a
+/// third of the allowance it was told it had (which then re-triggered
+/// compaction immediately).
+pub fn clamp_head_tail_chars(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    let marker = |hidden: usize| format!("\n\n[... {} characters omitted ...]\n\n", hidden);
+    // Shrink the kept parts until the marker itself fits too, so the result
+    // never exceeds max_chars.
+    let mut keep = max_chars;
+    for _ in 0..4 {
+        let head = keep - keep / 3;
+        let tail = keep - head;
+        let hidden = n - keep;
+        let note = marker(hidden);
+        if head + tail + note.chars().count() <= max_chars {
+            let head_end = char_index(s, head);
+            let tail_start = char_index(s, n - tail);
+            return format!("{}{}{}", &s[..head_end], note, &s[tail_start..]);
+        }
+        keep = keep.saturating_sub(note.chars().count() + 1);
+    }
+    let head_end = char_index(s, max_chars);
+    s[..head_end].to_string()
+}
+
+/// [`clamp_head_tail_chars`] against a *token* budget, using the same
+/// script-aware estimate the compaction trigger measures with.
+///
+/// Every budget that protects the context window has to be counted in the
+/// unit the window is counted in. A character cap is not that: an
+/// 8,192-character transcript cap looked safely like half of a 4,096-token
+/// window while holding 5,120 tokens of Thai - the summarize request would
+/// then again be bigger than the window it was meant to fix, which is the
+/// original failure.
+pub fn clamp_head_tail_tokens(s: &str, max_tokens: i64) -> String {
+    if estimate_tokens(s) <= max_tokens {
+        return s.to_string();
+    }
+    // Binary-search the largest character cut whose estimate still fits;
+    // estimates rise monotonically with length, so this converges.
+    let mut lo = 0usize;
+    let mut hi = s.chars().count();
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if estimate_tokens(&clamp_head_tail_chars(s, mid)) <= max_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    clamp_head_tail_chars(s, lo)
+}
+
+/// Estimated tokens of a set of messages, used for the "did this compaction
+/// actually shrink anything?" comparison. Character counts cannot answer
+/// that: the window is billed in tokens, and the summary, the kept tail and
+/// the messages they replaced are rarely written in the same script.
+fn tokens_of(msgs: &[Message]) -> i64 {
+    msgs.iter()
+        .map(|m| {
+            estimate_tokens(&m.content)
+                + m.tool_calls
+                    .iter()
+                    .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
+                    .sum::<i64>()
+        })
+        .sum()
+}
+
+/// Byte offset of the `n`-th character of `s` (or `s.len()` if shorter), i.e.
+/// a valid UTF-8 boundary with `n` characters before it.
+fn char_index(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Rough, tokenizer-free token estimate that accounts for the script the
+/// text is written in.
+///
+/// The flat "4 characters per token" rule only holds for plain English: code,
+/// JSON and base64 sit near 3 characters per token, Thai near 1.5-2 and CJK
+/// near 1. Dividing a codepoint count by 4 therefore under-estimated Thai
+/// text by 2-4x, which is what let the real context usage run far past the
+/// point where compaction was supposed to have kicked in. Codepoints above
+/// U+2E7F (Thai, CJK, Devanagari, ...) are costed at ~1.6 characters per
+/// token.
+pub fn estimate_tokens(s: &str) -> i64 {
+    let (mut wide, mut ascii) = (0i64, 0i64);
+    for c in s.chars() {
+        if is_wide_script(c) {
+            wide += 1;
+        } else {
+            ascii += 1;
+        }
+    }
+    ascii / APPROX_CHARS_PER_TOKEN + wide * 5 / 8
+}
+
+/// Characters of scripts that a byte/character-based estimate cannot price
+/// at the English rate: Thai, Khmer, Myanmar and CJK each burn roughly 1.5-2
+/// (Thai) or ~1 (CJK) characters per token.
+///
+/// Note this cannot be a single "codepoint above U+2E7F" cut-off - Thai sits
+/// at U+0E00-U+0E7F, far *below* it, so such a test silently misses the
+/// script this project's users write in most.
+fn is_wide_script(c: char) -> bool {
+    matches!(c as u32,
+        0x0600..=0x06FF  // Arabic
+        | 0x0900..=0x097F // Devanagari
+        | 0x0E00..=0x0E7F // Thai
+        | 0x1000..=0x109F // Myanmar
+        | 0x1780..=0x17FF // Khmer
+        | 0x3000..=0x30FF // CJK punctuation, Hiragana, Katakana
+        | 0x3400..=0x4DBF // CJK extension A
+        | 0x4E00..=0x9FFF // CJK unified ideographs
+        | 0xAC00..=0xD7AF // Hangul syllables
+    )
+}
+
+/// The tool specs as text, for estimating what they cost the request each round. The
+/// exact serialization the provider uses is not what is measured - only the
+/// order of magnitude matters, and the name/description/parameter text is
+/// what carries it.
+fn specs_for_estimate(specs: &[crate::llm::ToolSpec]) -> String {
+    let mut s = String::new();
+    for t in specs {
+        s.push_str(&t.name);
+        s.push(' ');
+        s.push_str(&t.description);
+        s.push_str(&t.parameters.to_string());
+        s.push('\n');
+    }
+    s
+}
+
+/// True when `s` contains a base64 data URI. `read_pic` returns one, and a
+/// Renders history for the summarizer: one line per message, with tool
+/// results shortened, base64 payloads replaced by a placeholder, the tool
+/// calls the model made shown (a `assistant: ` line with no content told the
+/// summarizer nothing about what actually happened), and, if the whole thing
+/// is still too big, a head+tail clamp - because when something has to be
+/// dropped it should be the middle of the conversation, never its latest
+/// findings.
+///
+/// `msgs` is the part of history being summarized - the kept tail has already
+/// been split off by the caller, so every tool result here is "old" and its
+/// full text is neither summarized (the prompt asks for it to be omitted) nor
+/// needed again.
+///
+/// Returns the transcript and how many tokens the history actually had, so
+/// the log line can say how much was omitted.
+fn transcript_for_summary(msgs: &[Message], cap_tokens: i64) -> (String, i64) {
+    let raw_tokens = tokens_of(msgs);
+    let mut out = String::new();
+    for m in msgs {
+        // Any base64 payload is opaque to the summarizer, however small, so
+        // it never has to be sent at all (unlike history, where a small one
+        // may still be worth its bytes).
+        let owned: Option<String> = match crate::tools::elide_data_uris(&m.content) {
+            Some(elided) => Some(elided),
+            None if m.role == Role::Tool => Some(clamp_head_tail_tokens(&m.content, SUMMARY_TOOL_RESULT_TOKENS)),
+            None => None,
+        };
+        let body = owned.as_deref().unwrap_or(m.content.as_str());
+        let calls = if m.tool_calls.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [requested: {}]",
+                m.tool_calls.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        };
+        out.push_str(&format!("{}: {}{}\n", m.role, body, calls));
+    }
+    (clamp_head_tail_tokens(&out, cap_tokens), raw_tokens)
 }
 
 /// Condenses a finished request's usage and wall time into the figures
@@ -807,10 +1655,17 @@ fn go_wall(d: Duration) -> String {
     crate::ui::go_duration_string((d.as_secs_f64() * 1000.0).round() as i64)
 }
 
-/// Cuts s to at most max_bytes bytes, backing off to the nearest earlier
-/// UTF-8 rune boundary so multi-byte characters (e.g. Thai text) are never
-/// split into invalid UTF-8.
-pub fn truncate_chars(s: &str, max_bytes: usize) -> String {
+/// Cuts `s` to at most `max_bytes` **bytes**, backing off to the nearest
+/// earlier UTF-8 rune boundary so multi-byte characters (e.g. Thai text) are
+/// never split into invalid UTF-8, and keeps the *head*.
+///
+/// Named for what it actually does: the old name (`truncate_chars`) promised
+/// a character cap while the body measured `s.len()` bytes, and every
+/// context budget here is a character/token count - a Thai string charged in
+/// bytes gets a third of the allowance it was promised. Nothing that respects
+/// a context budget may use this; use [`clamp_head_tail_chars`] or
+/// [`clamp_head_tail_tokens`].
+pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     if max_bytes == 0 || s.len() <= max_bytes {
         return s.to_string();
     }
@@ -988,7 +1843,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_turn_compacts_mid_turn_when_history_grows_large() {
-        let big_arg = "x".repeat(200);
+        // Big enough that the tool result alone crosses the trigger for this
+        // window. The window has to be one that can actually host a summarize
+        // request (~80 tokens of instruction plus a transcript plus a reply) -
+        // a 100-token window cannot, and compaction correctly prunes instead.
+        let big_arg = "x".repeat(2_000);
         let args = serde_json::json!({"text": big_arg}).to_string();
         let responses = vec![
             vec![
@@ -1001,44 +1860,467 @@ mod tests {
             vec![content("final answer"), done(1, 1)],
         ];
         let (agent, _e, log) = new_test_agent(responses);
-        agent.set_context_size(100);
+        agent.set_context_size(512); // trigger at ~307 tokens
         agent.run_turn(CancellationToken::new(), "do the big thing").await.unwrap();
         let h = agent.history.lock().unwrap();
-        assert_eq!(h.len(), 2, "expected [summary, final answer]: {:?}", h);
+        // The summary now leads the history; the recent messages that follow
+        // it are kept verbatim (that is the point - the agent must not forget
+        // what it was doing mid-turn), and the final answer lands at the end.
         assert_eq!(h[0].role, Role::System);
         assert!(h[0].content.contains("Summary of earlier conversation"), "got: {}", h[0].content);
-        assert_eq!(h[1].role, Role::Assistant);
-        assert_eq!(h[1].content, "final answer");
-        assert!(!h[0].content.contains(&big_arg) && !h[1].content.contains(&big_arg));
+        let last = h.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "final answer");
+        // The summarized part must not survive inside the summary.
+        assert!(!h[0].content.contains(&big_arg));
         drop(h);
         let text = std::fs::read_to_string(&log.file).unwrap();
-        assert!(text.contains("[context compacted]"), "log: {text}");
+        assert!(text.contains("[context compacted:"), "log: {text}");
     }
 
     #[tokio::test]
     async fn compact_enforces_target_size_even_if_model_ignores_instruction() {
-        let verbose = "lorem ipsum ".repeat(100); // ~1200 chars, ignores any length request
+        let verbose = "lorem ipsum ".repeat(400); // ~4800 chars, ignores any length request
         let responses = vec![vec![content(&verbose), done(1, 1)]];
         let (agent, _e, _log) = new_test_agent(responses);
-        agent.set_context_size(100); // charBudget = 400, target = 100
-        agent.push_history(Message { role: Role::User, content: "some prior turn".into(), ..Default::default() });
+        // A window that can hold the instruction + a transcript + a reply, so
+        // compaction really does summarize (a 100-token window cannot, and the
+        // assertion below used to pass against an untouched history).
+        agent.set_context_size(512); // target = 25% = 128 tokens
+        // History must be worth shrinking: if the summary + kept tail is not
+        // smaller than what it replaces, compaction correctly does nothing.
+        let filler = "a long-winded body that summarizing will shrink ".repeat(20);
+        for i in 0..8 {
+            agent.push_history(Message {
+                role: Role::User,
+                content: format!("prior turn {i}: {filler}"),
+                ..Default::default()
+            });
+        }
         agent.compact(CancellationToken::new()).await;
         let h = agent.history.lock().unwrap();
-        assert_eq!(h.len(), 1, "expected exactly one summary message");
-        let target = (agent.char_budget() as f64 * COMPACT_TARGET_FRACTION) as usize;
-        assert!(h[0].content.len() <= target, "expected <= {} chars, got {}", target, h[0].content.len());
-        assert!(!h[0].content.contains(&verbose));
+        let target = agent.summary_target_tokens();
+        let summary = &h[0].content;
+        assert!(summary.starts_with("Summary of earlier conversation"), "got: {summary}");
+        assert!(
+            estimate_tokens(summary) <= target,
+            "expected <= {} tokens, got {}",
+            target,
+            estimate_tokens(summary)
+        );
+        assert!(!summary.contains(&verbose));
+    }
+
+    /// Returns a fixed string, to drive the tool-result size cap.
+    struct BlobTool(String);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for BlobTool {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::llm::ToolSpec {
+                name: "blob".into(),
+                description: "returns a fixed blob".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _ctx: crate::tools::CallCtx, _args: &serde_json::Value) -> crate::error::R<String> {
+            Ok(self.0.clone())
+        }
     }
 
     #[test]
-    fn truncate_chars_keeps_valid_utf8() {
+    fn truncate_bytes_keeps_valid_utf8() {
         let thai: String = (0..50).map(|_| char::from_u32(0x0E2A).unwrap()).collect(); // 2-byte runes
         for max in 1..40usize {
-            let out = truncate_chars(&thai, max);
+            let out = truncate_bytes(&thai, max);
             assert!(out.is_char_boundary(out.len()), "cut at {max} split a rune");
-            assert!(out.len() <= max, "truncate_chars(_, {max}) returned {} bytes", out.len());
+            assert!(out.len() <= max, "truncate_bytes(_, {max}) returned {} bytes", out.len());
         }
-        assert_eq!(truncate_chars("abc", 10), "abc");
+        assert_eq!(truncate_bytes("abc", 10), "abc");
+    }
+
+    // --- context compaction regressions -----------------------------------
+    //
+    // Each of these reproduces a failure mode that used to make compaction
+    // destroy the conversation instead of protecting it.
+
+    /// A long summary the model ignored the length limit for must be cut in
+    /// the unit the window is billed in - tokens, not bytes and not
+    /// characters: measuring a Thai summary in bytes used to give it a third
+    /// of the allowance it was promised, and even a character allowance is
+    /// 2-4x too generous for Thai, so the summary alone could re-fill the
+    /// window and re-trigger compaction on the very next round.
+    #[tokio::test]
+    async fn summary_target_is_measured_in_tokens_not_chars_or_bytes() {
+        for (label, body) in [
+            ("ascii", "abcdefgh".repeat(3_000)),
+            ("thai", "\u{0E2A}\u{0E23}\u{0E19}".repeat(3_000)), // 9000 chars, 27 KB of UTF-8
+        ] {
+            let responses = vec![vec![content(&body), done(1, 1)]];
+            let (agent, _e, _log) = new_test_agent(responses);
+            agent.set_context_size(512); // target = 25% = 128 tokens
+            // Enough history that a 128-token summary is a real shrink.
+            agent.push_history(Message {
+                role: Role::User,
+                content: "some prior turn with a body long enough to be worth summarizing ".repeat(30),
+                ..Default::default()
+            });
+            agent.compact(CancellationToken::new()).await;
+            let h = agent.history.lock().unwrap();
+            assert!(
+                h[0].content.starts_with("Summary of earlier conversation"),
+                "{label}: history was not summarized, so the assertion below proves nothing: {:?}",
+                h[0].role
+            );
+            let target = agent.summary_target_tokens();
+            let got = estimate_tokens(&h[0].content);
+            assert!(
+                got <= target,
+                "{label}: expected <= {target} tokens, got {got} ({} chars, {} bytes)",
+                h[0].content.chars().count(),
+                h[0].content.len()
+            );
+        }
+    }
+
+    /// 1000 Thai codepoints are ~500-660 tokens, not the 250 a flat
+    /// 4-chars/token rule reported - the under-count was why the window
+    /// overflowed before compaction ever fired.
+    #[test]
+    fn thai_history_is_estimated_at_its_real_token_cost() {
+        let thai: String = (0..1000).map(|_| char::from_u32(0x0E2A).unwrap()).collect();
+        let t = estimate_tokens(&thai);
+        assert!((500..=700).contains(&t), "1000 Thai chars should be ~500-660 tokens, got {t}");
+        // English keeps the old behaviour.
+        assert_eq!(estimate_tokens(&"x".repeat(4000)), 1000);
+        // And mixed text costs at least as much as either part alone.
+        assert!(estimate_tokens(&format!("{}{}", "x".repeat(4000), thai)) > 1000);
+    }
+
+    #[test]
+    fn clamp_head_tail_keeps_both_ends_within_the_char_budget() {
+        let s: String = (0..1000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let cut = clamp_head_tail_chars(&s, 200);
+        assert!(cut.chars().count() <= 200, "got {} chars", cut.chars().count());
+        assert!(cut.starts_with("abcdefghij"), "head dropped: {cut}");
+        assert!(cut.ends_with(&s[s.chars().count() - 30..]), "tail dropped: {cut}");
+        // Thai (3 bytes/char) must be cut on a boundary and by characters.
+        let thai: String = (0..500).map(|_| char::from_u32(0x0E01).unwrap()).collect();
+        let cut = clamp_head_tail_chars(&thai, 100);
+        assert_eq!(cut.chars().count(), cut.chars().count()); // valid UTF-8 by construction
+        assert!(cut.chars().count() <= 100);
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    /// A provider that answers the summarize request with thinking only (a
+    /// reasoning model, or a stream that closes without a completion) must
+    /// never end up replacing history with an empty "summary".
+    #[tokio::test]
+    async fn empty_or_thinking_only_summary_never_clears_history() {
+        for events in [
+            vec![done(1, 1)], // Done, no content at all
+            vec![ChatEvent::Thinking { delta: "pondering the transcript".into() }, done(1, 1)],
+            vec![], // stream ended without a completion event
+        ] {
+            let (agent, _e, log) = new_test_agent(vec![events]);
+            agent.set_context_size(512);
+            for i in 0..10 {
+                agent.push_history(Message {
+                    role: Role::User,
+                    content: format!("message number {i} with enough text to matter"),
+                    ..Default::default()
+                });
+            }
+            let before = agent.history.lock().unwrap().len();
+            agent.compact(CancellationToken::new()).await;
+            let h = agent.history.lock().unwrap();
+            assert_eq!(h.len(), before, "history must survive a summary-less compaction");
+            assert!(h.iter().all(|m| !m.content.starts_with("Summary of earlier conversation")));
+            drop(h);
+            let text = std::fs::read_to_string(&log.file).unwrap();
+            assert!(text.contains("history kept"), "log: {text}");
+        }
+    }
+
+    /// The request asking for a summary must itself fit the window it is
+    /// trying to fix: it has to declare the window size (so Ollama cannot
+    /// silently front-trim it) and stay inside the transcript cap even when
+    /// history holds a 300 KB base64 blob.
+    #[tokio::test]
+    async fn compaction_request_never_oversizes_the_window() {
+        let blob = "data:image/png;base64,";
+        let mut big = String::from(blob);
+        big.push_str(&"A".repeat(300_000));
+        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
+        agent.set_context_size(4096);
+        for i in 0..10 {
+            let content = if i == 3 { big.clone() } else { format!("ordinary message {i}") };
+            agent.push_history(Message { role: Role::Tool, content, name: "t".into(), ..Default::default() });
+        }
+        agent.compact(CancellationToken::new()).await;
+        let reqs = provider.sent_reqs.lock().unwrap();
+        let req = reqs.last().expect("a summarize request");
+        assert_eq!(req.context_size, 4096, "num_ctx must be declared, never left at 0");
+        assert!(req.max_output_tokens.unwrap_or(0) > 0, "the reply must be length-capped");
+        let transcript = estimate_tokens(&req.messages.last().unwrap().content);
+        let cap = agent.transcript_cap_tokens();
+        assert!(transcript <= cap, "transcript {transcript} tokens exceeds the cap of {cap}");
+        assert!(
+            !req.messages.last().unwrap().content.contains("data:image/png;base64,AAAA"),
+            "the base64 blob must not be sent to the summarizer"
+        );
+    }
+
+    /// The same guarantee for the script this project's users write in: a
+    /// cap measured in *characters* looked like half a 4,096-token window
+    /// while holding 5,120 tokens of Thai, so the request asking for a
+    /// summary was again larger than the window it was meant to fix - the
+    /// original failure, just only for non-English conversations.
+    #[tokio::test]
+    async fn a_thai_transcript_cannot_oversize_the_summarize_request() {
+        let thai: String = (0..40_000).map(|_| char::from_u32(0x0E01).unwrap()).collect();
+        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
+        agent.set_context_size(4096);
+        for i in 0..12 {
+            let body = if i == 1 { thai.clone() } else { format!("ordinary message {i}") };
+            agent.push_history(Message { role: Role::User, content: body, ..Default::default() });
+        }
+        let window = 4096;
+        agent.compact(CancellationToken::new()).await;
+        let reqs = provider.sent_reqs.lock().unwrap();
+        let req = reqs.last().expect("a summarize request");
+        let sent: i64 = req.messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+        assert!(
+            sent < window,
+            "the summarize request was ~{sent} tokens against a {window}-token window"
+        );
+    }
+
+    /// A provider that keeps rejecting the request must not be re-asked on
+    /// every single tool round (each retry used to be a fresh full-size LLM
+    /// call, forever).
+    #[tokio::test]
+    async fn compaction_backs_off_after_repeated_failures() {
+        // Every call errors, so nothing but the summarize requests can be
+        // counted here: the third attempt must not be sent at all.
+        let responses: Vec<Vec<ChatEvent>> = Vec::new();
+        let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
+        agent.set_context_size(512);
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: Role::User,
+                content: format!("message {i} with plenty of content to be worth summarizing"),
+                ..Default::default()
+            });
+        }
+        for _ in 0..6 {
+            agent.compact(CancellationToken::new()).await;
+        }
+        let calls = provider.call_count();
+        assert_eq!(calls as i64, COMPACT_MAX_FAILURES, "expected exactly {COMPACT_MAX_FAILURES} summarize attempts, got {calls}");
+        // History was pruned instead of left to grow.
+        let chars: usize = agent.history.lock().unwrap().iter().map(|m| m.content.len()).sum();
+        let total: usize = (0..10)
+            .map(|i| format!("message {i} with plenty of content to be worth summarizing").len())
+            .sum();
+        assert!(chars < total, "history should have shrunk, {} vs {}", chars, total);
+    }
+
+    /// The messages the agent is working with must survive a compaction:
+    /// forgetting the file it just read is what made it re-read everything and
+    /// refill the window immediately.
+    #[tokio::test]
+    async fn compaction_keeps_recent_messages_verbatim() {
+        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent.set_context_size(320);
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: if i % 2 == 0 { Role::User } else { Role::Tool },
+                content: format!("message number {i} containing src/main.rs and the error about E0382"),
+                ..Default::default()
+            });
+        }
+        agent.compact(CancellationToken::new()).await;
+        let h = agent.history.lock().unwrap();
+        assert_eq!(h[0].role, Role::System, "the summary leads");
+        assert!(h[0].content.contains("Summary of earlier conversation"));
+        let last = h.last().unwrap().content.clone();
+        assert!(last.contains("message number 9"), "recent message not kept verbatim: {last}");
+        let keep = agent.compact_tunables().keep_recent as usize;
+        assert!(h.len() > keep, "expected the recent tail to survive: {} messages", h.len());
+    }
+
+    /// A window too small to hold the summarize request's own instruction must
+    /// never have one sent to it. Ollama would trim it from the front and
+    /// answer 200 with a summary of the wrong text, and that summary would
+    /// then replace the conversation - so prune instead and say why.
+    #[tokio::test]
+    async fn a_window_too_small_to_summarize_prunes_instead_of_sending() {
+        let (agent, _e, log, provider) = new_test_agent_with_provider(Vec::new());
+        agent.set_context_size(96); // less than the instruction costs
+        let original: Vec<Message> = (0..10)
+            .map(|i| {
+                Message {
+                    role: Role::User,
+                    content: format!("message {i} with plenty of content to be worth summarizing"),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let before = tokens_of(&original);
+        for m in original {
+            agent.push_history(m);
+        }
+        agent.compact(CancellationToken::new()).await;
+        assert_eq!(provider.call_count(), 0, "no summarize request may be sent to this window");
+        let text = std::fs::read_to_string(&log.file).unwrap();
+        assert!(text.contains("too small to summarize"), "log: {text}");
+        let after = tokens_of(&agent.history.lock().unwrap());
+        assert!(after < before, "history should have shrunk: {before} -> {after} tokens");
+    }
+
+    /// A tool result is capped before it can reach history, so one
+    /// `cargo build -vv` can no longer push the conversation past the window
+    /// in a single step.
+    #[tokio::test]
+    async fn oversized_tool_results_are_capped_before_history() {
+        let huge = "build output line\n".repeat(20_000); // ~360 KB
+        let mut reg = crate::tools::Registry::new();
+        reg.register(std::sync::Arc::new(BlobTool(huge.clone())));
+        let out = reg
+            .call(crate::tools::CallCtx { cancel: CancellationToken::new() }, "blob", "{}")
+            .await
+            .unwrap();
+        assert!(out.chars().count() <= crate::tools::max_tool_result_chars());
+        assert!(out.contains("omitted to fit"), "expected a truncation marker: {out}");
+        // The tail is what matters most (exit codes, errors) and must survive.
+        assert!(out.trim_end().ends_with("build output line"), "tail was dropped");
+        // And a small result is untouched.
+        let mut small = crate::tools::Registry::new();
+        small.register(std::sync::Arc::new(BlobTool("short".into())));
+        let out = small.call(crate::tools::CallCtx { cancel: CancellationToken::new() }, "blob", "{}").await.unwrap();
+        assert_eq!(out, "short");
+    }
+
+    /// The trigger used to look at history alone, so the system message and
+    /// the tool specs (~1k tokens, ~6% of a default window) were never
+    /// counted and the real usage was always higher than reported.
+    #[tokio::test]
+    async fn trigger_counts_the_system_message_and_tool_specs() {
+        let (agent, _e, _log) = new_test_agent(Vec::new());
+        agent.set_context_size(1000); // trigger at 600 tokens
+        agent.ui.state.write().unwrap().sys_tokens = 400;
+        agent.ui.state.write().unwrap().spec_tokens = 150;
+        agent.push_history(Message { role: Role::User, content: "x".repeat(180), ..Default::default() });
+        // 400 + 150 + 45 = 595 - under the trigger...
+        assert!(!agent.should_compact());
+        agent.push_history(Message { role: Role::User, content: "y".repeat(80), ..Default::default() });
+        // ...and over once the fixed overhead is included (615 > 600).
+        assert!(agent.should_compact(), "fixed overhead must count towards the trigger");
+    }
+
+    /// After a compaction the request cannot get meaningfully smaller (the
+    /// system message and tool specs are a floor), so without this the same
+    /// window would re-compact on every tool round forever.
+    #[tokio::test]
+    async fn compaction_does_not_refire_without_regrowth() {
+        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent.set_context_size(200); // tiny: even the summary sits over the trigger
+        for i in 0..12 {
+            agent.push_history(Message {
+                role: Role::User,
+                content: format!("message {i} with a good amount of text in it"),
+                ..Default::default()
+            });
+        }
+        agent.compact(CancellationToken::new()).await;
+        assert!(agent.compact_floor_tokens.load(Ordering::SeqCst) > 0);
+        assert!(!agent.should_compact(), "immediately after a compaction the trigger must be off");
+    }
+
+    /// `/history` and `/compact` exist so this subsystem can be inspected and
+    /// driven by hand instead of only by a 20-turn session.
+    #[tokio::test]
+    async fn force_compact_and_history_report_are_available() {
+        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent.set_context_size(8000); // nowhere near the trigger
+        for i in 0..10 {
+            agent.push_history(Message {
+                role: Role::User,
+                content: format!("message {i} carrying a paragraph of text so summarizing it pays off"),
+                ..Default::default()
+            });
+        }
+        let report = agent.history_report();
+        assert!(report.contains("user"), "{report}");
+        assert!(report.contains("total history"), "{report}");
+        agent.force_compact(CancellationToken::new()).await;
+        assert!(agent.history.lock().unwrap()[0].content.contains("Summary of earlier conversation"));
+    }
+
+    /// `read_pic` hands back a base64 data URI. The provider only ever gets
+    /// plain text, so that payload can never be *shown* to the model - it is
+    /// pure context cost, and one image used to be able to push the
+    /// conversation hundreds of times past the window.
+    #[tokio::test]
+    async fn base64_tool_results_are_replaced_by_a_placeholder() {
+        let (agent, _e, _log) = new_test_agent(Vec::new());
+        let uri = format!("data:image/png;base64,{}", "A".repeat(500_000));
+        agent.push_history(Message {
+            role: Role::Tool,
+            content: uri,
+            name: "read_pic".into(),
+            ..Default::default()
+        });
+        let h = agent.history.lock().unwrap();
+        let content = &h[0].content;
+        assert!(content.len() < 500, "the payload should have been dropped: {} bytes", content.len());
+        assert!(content.contains("image/png"), "{content}");
+        assert!(content.contains("bytes omitted"), "{content}");
+        assert!(content.contains("read_pic"), "{content}");
+        drop(h);
+        // A small one still fits, and non-tool text is never touched.
+        agent.push_history(Message {
+            role: Role::Tool,
+            content: "data:image/png;base64,AAAA".into(),
+            ..Default::default()
+        });
+        assert_eq!(agent.history.lock().unwrap()[1].content, "data:image/png;base64,AAAA");
+    }
+
+    /// History can already be too big when a turn starts (the previous turn's
+    /// compaction failed, `/prompt <file>` dropped in a large file, or
+    /// `/context` shrank the window) - the guard at the top of `run_turn`
+    /// means the first request of the turn is never the oversize one.
+    #[tokio::test]
+    async fn run_turn_compacts_before_its_first_request_when_history_is_big() {
+        let responses = vec![
+            // #1: the summarize request, issued before anything is sent.
+            vec![content("a usable summary of the conversation so far"), done(1, 1)],
+            // #2: the actual turn.
+            vec![content("answer"), done(1, 1)],
+        ];
+        let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
+        agent.set_context_size(300); // trigger at 180 tokens
+        for i in 0..12 {
+            agent.push_history(Message {
+                role: Role::User,
+                content: format!("earlier message {i} with a body long enough to push history over the trigger"),
+                ..Default::default()
+            });
+        }
+        agent.run_turn(CancellationToken::new(), "carry on").await.unwrap();
+        let reqs = provider.sent_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "expected a summarize request followed by the turn");
+        assert_eq!(reqs[0].messages.len(), 2, "the summarize request is [instruction, transcript]");
+        assert!(reqs[0].messages[0].content.starts_with("Summarize the conversation"));
+        assert!(reqs[1].messages.iter().any(|m| m.content.contains("Summary of earlier conversation")),
+            "the turn's request must carry the summary, not the original history");
     }
 
     // --- ported from Go agent_test.go -------------------------------------
@@ -1156,11 +2438,8 @@ mod tests {
     fn context_status_estimates_without_provider_usage() {
         let (agent, _echo, _log) = new_test_agent(Vec::new());
         agent.set_context_size(1000);
-        let mut s = agent.ui.state.write().unwrap();
-        s.sys_chars = 400;
-        s.real_prompt_tokens = 0;
-        s.history_chars = 400;
-        drop(s);
+        agent.ui.state.write().unwrap().sys_tokens = 100;
+        agent.ui.state.write().unwrap().real_prompt_tokens = 0;
         agent.push_history(Message {
             role: Role::User,
             content: "x".repeat(400),
@@ -1185,9 +2464,9 @@ mod tests {
         });
         {
             let mut s = agent.ui.state.write().unwrap();
-            s.sys_chars = 400;
+            s.sys_tokens = 100;
             s.real_prompt_tokens = 300;
-            s.real_base_chars = 800; // nothing added since the request
+            s.real_base_tokens = 200; // nothing added since the request
         }
 
         let cs = agent.ui.state.read().unwrap().context_status();
@@ -1209,10 +2488,11 @@ mod tests {
     fn context_tracking_resets_on_reset_history() {
         let (agent, _echo, _log) = new_test_agent(Vec::new());
         agent.ui.state.write().unwrap().real_prompt_tokens = 500;
+        agent.push_history(Message { role: Role::User, content: "hi".into(), ..Default::default() });
         agent.reset_history();
         let s = agent.ui.state.read().unwrap();
         assert_eq!(s.real_prompt_tokens, 0, "stale real prompt size must be dropped");
-        assert_eq!(s.history_chars, 0);
+        assert_eq!(s.history_tokens, 0);
     }
 
     /// Go's TestRunTurnShowsContextInHeadersAndMetrics.
@@ -1314,3 +2594,4 @@ mod tests {
         assert_eq!((lu.usage.prompt_tokens, lu.usage.completion_tokens, lu.usage.total_tokens), (7, 3, 10));
     }
 }
+

@@ -132,6 +132,154 @@ fn as_string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
+// ---------------------------------------------------------------------------
+// Tool result size limit
+// ---------------------------------------------------------------------------
+
+/// Ceiling on how many characters one tool result may contribute to the
+/// conversation history.
+///
+/// A tool result is appended to history verbatim and stays there until it is
+/// compacted away, so one unbounded result (a `cargo build -vv`, a minified
+/// JS file, a base64 image) can push the conversation several times past the
+/// context window in a single step. That forces compaction to summarize a
+/// transcript far larger than the window it is trying to fit into - which is
+/// the root cause of the "compact then amnesia" behaviour. Capping here stops
+/// the problem at its source instead of trying to repair it afterwards.
+///
+/// Overridable with `JONNYQ_MAX_TOOL_RESULT_CHARS` (see
+/// [`set_max_tool_result_chars`]).
+pub const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 64_000;
+
+static MAX_TOOL_RESULT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TOOL_RESULT_CHARS);
+
+/// Sets the tool-result ceiling (a value <= 0 restores the default). Called
+/// at startup and by `/env reload` through [`Registry::configure`].
+pub fn set_max_tool_result_chars(n: usize) {
+    MAX_TOOL_RESULT_CHARS.store(if n == 0 { DEFAULT_MAX_TOOL_RESULT_CHARS } else { n }, Ordering::SeqCst);
+}
+
+/// The ceiling currently in effect.
+pub fn max_tool_result_chars() -> usize {
+    MAX_TOOL_RESULT_CHARS.load(Ordering::SeqCst)
+}
+
+/// Shrinks an oversized tool result to at most `max` characters, keeping the
+/// first 70% and the last 30% of it (error messages and exit codes live at
+/// the end of command output, the identifying header at the start), on
+/// character boundaries so multi-byte text is never split.
+///
+/// Returns the text unchanged when it already fits, and never returns
+/// something longer than the input or longer than `max` - the marker line is
+/// part of the budget, so a caller that asks for 500 characters gets at most
+/// 500 characters back.
+pub fn cap_tool_result_chars(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max == 0 {
+        return if max == 0 { String::new() } else { s.to_string() };
+    }
+    let note_for = |hidden: usize| {
+        format!("\n\n[... {} characters omitted to fit the {}-character tool-result limit ...]\n\n", hidden, max)
+    };
+    // The marker counts against the budget, so shrink the kept parts until
+    // content + marker fit: guessing its length up front (the old
+    // fixed-size reserve) overshot the cap for small `max` values.
+    let mut keep = max;
+    for _ in 0..4 {
+        let head = keep - keep / 3; // 70/30 split
+        let tail = keep - head;
+        let note = note_for(n.saturating_sub(keep));
+        if head + tail + note.chars().count() <= max {
+            let head_end = char_boundary(s, head);
+            let tail_start = char_boundary(s, n - tail).max(head_end);
+            let (head_s, tail_s) = (&s[..head_end], &s[tail_start..]);
+            let hidden = n.saturating_sub(head_s.chars().count() + tail_s.chars().count());
+            return format!("{}{}{}", head_s, note_for(hidden), tail_s);
+        }
+        keep = keep.saturating_sub(note.chars().count() + 1);
+    }
+    // `max` is too small for content plus a marker: a plain head cut.
+    s[..char_boundary(s, max)].to_string()
+}
+
+/// Byte offset of the `n`-th character of `s` (or `s.len()` when it has
+/// fewer than `n`), i.e. a valid UTF-8 boundary that keeps `n` characters
+/// before it.
+fn char_boundary(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// [`cap_tool_result_chars`] at the currently configured limit. Tools should
+/// return their output through this so no single result can blow up the
+/// context on its own.
+pub fn cap_tool_result(s: String) -> String {
+    cap_tool_result_chars(&s, max_tool_result_chars())
+}
+
+/// Data URIs up to this many bytes are allowed to stay in history verbatim;
+/// bigger ones are replaced by a placeholder by the agent (see
+/// `Agent::history_content_for`), because a base64 blob that a text-only
+/// provider cannot even render is pure context cost.
+pub const KEPT_DATA_URI_BYTES: usize = 16_000;
+
+/// Length of the base64 payload starting at byte offset `start` of `s`,
+/// where `s[start..]` begins with `data:`. Returns `None` when this is not a
+/// base64 data URI. The payload runs to the first whitespace, since base64
+/// and mime types contain none - that is what makes the match work both for
+/// a result that *is* a data URI and for one wrapped in other text (prompt
+/// mode prefixes `Tool result (read_pic): `).
+fn data_uri_span(s: &str, start: usize) -> Option<(usize, &str)> {
+    let rest = &s[start + "data:".len()..];
+    let semi = rest.find(';')?;
+    let mime = &rest[..semi];
+    if mime.is_empty() || !rest[semi..].starts_with(";base64,") {
+        return None;
+    }
+    let payload_at = start + "data:".len() + semi + ";base64,".len();
+    let end = s[payload_at..].find(char::is_whitespace).map(|i| payload_at + i).unwrap_or(s.len());
+    Some((end - start, mime))
+}
+
+/// The first base64 data URI in `s`, if any, replaced by a placeholder that
+/// says what it was, how big it was, and how to get it back. `None` when `s`
+/// holds none, so callers can leave the common case untouched.
+///
+/// Everything after `;base64,` is opaque to a text summarizer and cannot be
+/// rendered by a provider whose message body is plain text: it is pure
+/// context cost, and a single `read_pic` result used to be able to push a
+/// conversation hundreds of times past the window (which is what made the
+/// next compaction request itself too big to send).
+pub fn elide_data_uris(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    let mut found = false;
+    while let Some(at) = rest.find("data:") {
+        let (len, mime) = match data_uri_span(rest, at) {
+            Some(v) => v,
+            // Not a data URI after all (a file that mentions "data:" in
+            // prose): keep the text up to and past it and keep looking.
+            None => {
+                out.push_str(&rest[..at + "data:".len()]);
+                rest = &rest[at + "data:".len()..];
+                continue;
+            }
+        };
+        found = true;
+        out.push_str(&rest[..at]);
+        out.push_str(&format!(
+            "[{} data URI of {} bytes omitted: the provider is sent plain text, so the encoded bytes are \
+unusable here. Re-run read_pic if the image itself has to be rendered.]",
+            mime, len
+        ));
+        rest = &rest[at + len..];
+    }
+    if !found {
+        return None;
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 fn bool_arg(args: &Value, key: &str, def: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(def)
 }
@@ -189,6 +337,10 @@ impl Registry {
     /// Hands a (re-read) config to every registered tool - `/env reload`
     /// calls this so tool tunables follow the file without a restart.
     pub fn configure(&self, cfg: &Config) {
+        // The shared tool-result ceiling is not per-tool, but it belongs to
+        // the same settings layer; every result is capped through
+        // [`cap_tool_result`] before it reaches the conversation history.
+        set_max_tool_result_chars(cfg.max_tool_result_chars.max(0) as usize);
         for t in self.tools.values() {
             t.configure(cfg);
         }
@@ -205,13 +357,64 @@ impl Registry {
             serde_json::from_str(args_json)
                 .map_err(|e| AgentError::new(format!("invalid arguments for {}: {}", name, e)))?
         };
-        tool.call(ctx, &parsed).await
+        // Capped here as well as in the agent loop so a tool result can never
+        // reach a conversation (or a log) unbounded, whatever calls it.
+        tool.call(ctx, &parsed).await.map(cap_tool_result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap is a promise made to the agent loop, so it has to hold for
+    /// every `max`: the marker line used to sit on *top* of the budget, so
+    /// asking for 20 characters got 79 back, and the same helper is used
+    /// with small per-message budgets when pruning the kept tail.
+    #[test]
+    fn cap_tool_result_never_exceeds_its_cap() {
+        for max in [1usize, 3, 20, 50, 100, 128, 200, 4_000, 64_000] {
+            let out = cap_tool_result_chars(&"x".repeat(100_000), max);
+            assert!(out.chars().count() <= max, "max {max} produced {} chars", out.chars().count());
+        }
+        // Multi-byte text is cut on a character boundary, never mid-rune.
+        let thai: String = (0..5_000).map(|_| char::from_u32(0x0E01).unwrap()).collect();
+        let out = cap_tool_result_chars(&thai, 300);
+        assert!(out.chars().count() <= 300);
+        assert!(out.starts_with('\u{0E01}') && out.ends_with('\u{0E01}'), "rune split: {out}");
+        // Fits already / empty cap: unchanged and empty respectively, and
+        // never longer than what went in.
+        assert_eq!(cap_tool_result_chars("short", 100), "short");
+        assert_eq!(cap_tool_result_chars("short", 0), "");
+        // Both ends survive, which is the point (exit codes sit at the end).
+        let s = format!("HEAD{}TAIL", "x".repeat(10_000));
+        let out = cap_tool_result_chars(&s, 500);
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL"), "{out}");
+        assert!(out.contains("characters omitted"));
+    }
+
+    /// A base64 `read_pic` result is what used to blow a compaction request
+    /// past the window; it must come out as a placeholder that still names
+    /// the payload's type and size.
+    #[test]
+    fn data_uris_are_elided_but_other_text_is_left_alone() {
+        let uri = format!("data:image/png;base64,{}", "A".repeat(200_000));
+        let out = elide_data_uris(&uri).expect("a data URI should be elided");
+        assert!(out.chars().count() < 300, "got {} chars", out.chars().count());
+        assert!(out.contains("image/png") && out.contains(&format!("{} bytes", uri.len())), "{out}");
+        // Wrapped in other text (prompt mode prefixes the tool name).
+        let wrapped = elide_data_uris(&format!("Tool result (read_pic): {uri}")).unwrap();
+        assert!(wrapped.starts_with("Tool result (read_pic): ") && wrapped.len() < 400, "{wrapped}");
+        // Text that merely mentions one is not a data URI and stays put.
+        assert!(elide_data_uris("read the file data: and note the base64 mention").is_none());
+        assert!(elide_data_uris("data:text/plain,hello").is_none());
+        assert!(elide_data_uris("").is_none());
+        // Two payloads, both replaced.
+        let two = format!("a {uri} b data:image/jpeg;base64,{} c", "B".repeat(1_000));
+        let out = elide_data_uris(&two).unwrap();
+        assert!(!out.contains("AAAA") && !out.contains("BBBB"), "{out}");
+        assert!(out.starts_with("a ") && out.ends_with(" c"), "{out}");
+    }
 
     /// A tool that only reports what it was configured with, standing in for
     /// the real ones' `/env reload` behaviour.

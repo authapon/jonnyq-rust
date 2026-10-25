@@ -58,9 +58,15 @@ pub fn styled(text: &str, color: &str, bold: bool) -> String {
 // ---------------------------------------------------------------------------
 
 // Context usage thresholds (percent of the context window) for coloring.
-// CONTEXT_WARN_PERCENT mirrors the point at which the agent compacts history.
+// CONTEXT_WARN_PERCENT defaults to the same level the agent compacts at
+// (JONNYQ_COMPACT_HEADROOM_PERCENT); if that is raised, raise this too or the
+// readout stays green right up until history is summarized.
 pub const CONTEXT_WARN_PERCENT: i64 = 60;
 pub const CONTEXT_CRITICAL_PERCENT: i64 = 85;
+
+// The *_tokens fields below are script-aware estimates of the text the agent
+// is about to send (agent::estimate_tokens): the agent owns the strings that
+// get measured, UiState only ever receives the resulting figures.
 
 /// How much of the model's context window is in use. `estimated` is true
 /// when `used` was partly or wholly approximated from text length instead of
@@ -179,12 +185,20 @@ impl std::fmt::Display for RequestStats {
 pub struct UiState {
     /// True once an agent has wired itself in (Go: ContextFn set).
     pub ready: bool,
-    // Context-usage inputs (see agent.ContextStatus). history_chars is kept
-    // current by Agent::history_chars (the Agent owns the real history).
-    pub sys_chars: i64,
-    pub history_chars: i64,
+    // Context-usage inputs (see agent.ContextStatus). The *_tokens fields
+    // are script-aware estimates of the text the agent is about to send
+    // (agent::estimate_tokens), kept current by the agent, which owns the
+    // real strings; context_total is the configured window.
+    pub sys_tokens: i64,
+    pub history_tokens: i64,
+    /// Estimate for the per-request overhead the history does not contain:
+    /// the tool specs sent alongside it (and, in prompt mode, the tool
+    /// descriptions are already inside sys_tokens).
+    pub spec_tokens: i64,
     pub real_prompt_tokens: i64,
-    pub real_base_chars: i64,
+    /// Estimated tokens of the last request the provider reported a real
+    /// prompt size for, so text added since can be estimated on top.
+    pub real_base_tokens: i64,
     pub context_total: i64,
     // Turn stats (Go: TurnStatsFn).
     pub turn_start: Option<Instant>,
@@ -194,19 +208,18 @@ pub struct UiState {
 impl UiState {
     /// Port of agent.ContextStatus(): when the provider reported the last
     /// request's prompt size, that figure is the base and only text added
-    /// since is estimated at ~4 chars/token on top; otherwise the whole
-    /// system message + history is estimated.
+    /// since is estimated on top; otherwise the whole system message + tool
+    /// specs + history is estimated.
     pub fn context_status(&self) -> ContextStatus {
-        const APPROX_CHARS_PER_TOKEN: i64 = 4;
-        let chars = self.sys_chars + self.history_chars;
+        let est = self.sys_tokens + self.spec_tokens + self.history_tokens;
         let mut cs = ContextStatus { used: 0, total: self.context_total, estimated: true };
         if self.real_prompt_tokens > 0 {
-            let delta = (chars - self.real_base_chars).max(0);
-            cs.used = self.real_prompt_tokens + delta / APPROX_CHARS_PER_TOKEN;
+            let delta = (est - self.real_base_tokens).max(0);
+            cs.used = self.real_prompt_tokens + delta;
             cs.estimated = delta > 0;
             return cs;
         }
-        cs.used = chars / APPROX_CHARS_PER_TOKEN;
+        cs.used = est;
         cs
     }
 }
@@ -663,7 +676,7 @@ mod tests {
             let mut s = t.w.state.write().unwrap();
             s.ready = true;
             s.real_prompt_tokens = 6300;
-            s.real_base_chars = 6300 * 4;
+            s.real_base_tokens = 6300;
             s.context_total = 16348;
         }
         t.w.thinking("hmm");
@@ -713,7 +726,7 @@ mod tests {
             let mut s = t.w.state.write().unwrap();
             s.ready = true;
             s.real_prompt_tokens = 100;
-            s.real_base_chars = 400;
+            s.real_base_tokens = 100;
             s.context_total = 1000;
             s.turn_start = Some(Instant::now() - Duration::from_millis(25100));
             s.last_req = None;

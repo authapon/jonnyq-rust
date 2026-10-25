@@ -56,7 +56,13 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 ### agent loop
 
 - **tool-calling loop** ส่ง conversation + tools spec ไป provider → stream thinking/answer ออกจอ → รัน tool ที่ model เรียก → ส่งผลลัพธ์กลับ → วนจนได้คำตอบสุดท้าย
-- **context compaction อัตโนมัติ** — เมื่อ history (ประเมินแบบหยาบ ~4 ตัวอักษร/token) เกิน **~60%** ของ context size จะสรุป history ทั้งหมดเหลือข้อความเดียว (บังคับให้ summary ไม่เกิน **~25%** ของ budget เดิม) ตรวจทั้ง **หลังทุกรอบ tool call** (ไม่ใช่รอจบ turn) และหลังจบ turn
+- **context compaction อัตโนมัติ** — เมื่อ request ปัจจุบัน (ประเมินตาม script: อังกฤษ ~4 ตัวอักษร/token, ไทย-CJK-ฮินดี ~1.6 — ของเดิมใช้ 4 ตัวอักษร/token กับทุกภาษา ทำให้ประเมินต่ำไป 2-4 เท่าสำหรับภาษาไทย compact เกิดช้ากว่าที่ตั้งใจไว้) โตเกิน **~60%** ของ context window จะสรุปช่วงเก่าของบทสนทนาเป็น summary แล้ว **เก็บข้อความท้ายสุดไว้ทั้งดุ้น (default 6 ข้อความ)** — agent ยังเห็น file path / error / output ที่กำลังทำงานด้วย ไม่ต้องกลับไปอ่านใหม่ (ซึ่งเป็นสาเหตุที่ทำให้ history ล้นซ้ำทันทีหลัง compact)
+  - ตรวจ compact **ต้น turn ใหม่ → หลังทุกรอบ tool call → หลังจบ turn** — การตรวจต้น turn กัน request แรกของ turn ล้นเกิน window กรณีที่ compact รอบก่อนล้มเหลว, `/prompt <file>` ยัดไฟล์ก้อนใหญ่เข้า history ตรง ๆ หรือ `/context` ถูกลงกลาง session
+  - **request ที่ขอสรุปต้องเล็กกว่า window ที่มันกำลังจะแก้** (root cause ของปัญหาทั้งหมด) — cap transcript เป็น **token** + ส่ง `num_ctx` ให้ server รู้ตัว + จำกัดความยาวคำตอบ (`num_predict` / `max_tokens`) เพราะ Ollama ไม่ error เมื่อ prompt เกิน window แต่ **ตัด token ทิ้งจากหัวแบบเงียบ ๆ** แล้วตอบ 200 (ส่วนหัวคือคำสั่ง "สรุปไม่เกิน N ตัวอักษร" พอดี) ส่วน OpenAI-compatible ตอบ 400
+  - **ไม่มีทางที่ history จะถูกแทนที่ด้วย summary ที่ใช้ไม่ได้** — summary ว่างเปล่า / มีแค่ thinking channel (qwen3, deepseek-r1) / stream จบโดยไม่มี Done / model วนซ้ำตอนสรุป / สั้นเกินกว่าจะรักษาเนื้อหาไว้ได้ → **คง history เดิมไว้** แล้วพิมพ์เหตุผลออกจอ และ **หลังล้มเหลวติดกัน 2 ครั้งจะหยุดยิง request ขอสรุป** (เปลี่ยนไป prune ข้อความเก่าแทน ซึ่งได้ผลแม้ provider กำลังล่ม) พร้อมตั้งพื้นให้ history โตขึ้น 1.25 เท่าก่อนลอง compact อีกครั้ง กัน compact ซ้ำทุก tool round
+  - **cap ผลลัพท์ของ tool ก่อนเข้า history** (`JONNYQ_MAX_TOOL_RESULT_CHARS` default 64,000 ตัวอักษร — เก็บ head 70% + tail 30% เพราะ exit code/error มักอยู่ท้าย) กัน `cargo build -vv` หรือ `read_file` ไฟล์ minified รอบเดียวดัน history ข้าม window หลายเท่า; base64 data URI ก้อนใหญ่จาก `read_pic` ถูกแทนด้วย placeholder (provider รับ body เป็น plain text อยู่แล้ว จึง render ไม่ได้อยู่ดี — มีแต่ค่า context ที่จ่ายเปล่า)
+  - ดูได้ที่ `/history` (ขนาดรายข้อความ + ยอดเทียบ window) และบังคับทำด้วย `/compact` — log หลัง compact บอกตัวเลขจริง (จำนวนข้อความที่สรุป, tokens ก่อน-หลัง, transcript ที่ส่งไป, ขนาด summary) แทนข้อความ `[context compacted]` ที่ไม่บอกอะไร
+  - ถ้า provider รายงาน prompt tokens น้อยกว่าที่ประเมินไว้มาก ๆ (หน้าต่าง server เล็กกว่าที่ขอ) jonnyq จะเตือนแทนการเงียบ — นั่นคือหลักฐานว่า server กำลังตัด prompt จากหัว (เตือนครั้งเดียวต่อ 1 การตั้งค่า context)
 - **ตัดการคิดวนซ้ำ** (`RepeatDetector`) — ถ้าบรรทัดเดิม (>20 ตัวอักษร) เกิดซ้ำครบ 3 ครั้งในหน้าต่าง 8 บรรทัดล่าสุด จะยกเลิก request นั้นทันที บันทึกข้อความสั้น ๆ แทนขยะที่วนซ้ำ แล้วปล่อยให้กลไก retry/stall จัดการต่อ (turn จบปกติ ไม่ error)
 - **budget tool call ต่อ turn** (`-max-tool-calls-per-turn`, default 50) เป็น safety valve กัน model วนเรียก tool ไม่รู้จบ
 - system prompt ทุกโหมดกำชับให้ model **คิดแบบเด็ดขาดและกระชับ** (ตัดสินใจแล้วลงมือทำ ไม่วนคิดเรื่องเดิม แต่ต้องยังตรวจสอบสิ่งที่ไม่แน่ใจด้วย tool ก่อนสรุป)
@@ -246,6 +252,11 @@ jonnyq **โหลดไฟล์ `.env` ให้เอง** ตั้งแต
 | `-pdf-max-pages` | `JONNYQ_PDF_MAX_PAGES` | `50` | จำนวนหน้า PDF สูงสุดที่ `read_pdf` อ่าน |
 | `-pdf-dpi` | `JONNYQ_PDF_DPI` | `150` | DPI ตอน render หน้า PDF เป็น PNG (กรณี PDF ไม่มี text) |
 | `-run-command-timeout-sec` | `JONNYQ_RUN_COMMAND_TIMEOUT_SEC` | `300` | timeout ของ `run_command` (วินาที) — ปรับระหว่างรันได้ด้วย `/run_command_timeout` |
+| `-compact-headroom-percent` | `JONNYQ_COMPACT_HEADROOM_PERCENT` | `60` | เปอร์เซ็นต์ของ context window (นับทั้ง system prompt + tool specs + history) ที่จะ trigger การ compact |
+| `-compact-target-percent` | `JONNYQ_COMPACT_TARGET_PERCENT` | `25` | เปอร์เซ็นต์ของ window ที่ summary ใช้ได้ (เพดานจริงตัดที่ **1,000 tokens** และมีพื้นที่ 100 tokens) |
+| `-compact-keep-recent` | `JONNYQ_COMPACT_KEEP_RECENT` | `6` | จำนวนข้อความท้าย history ที่เก็บไว้ทั้งดุ้นหลัง compact (กัน "compact แล้วลืม") |
+| `-summary-transcript-cap` | `JONNYQ_SUMMARY_TRANSCRIPT_CAP` | `48000` | เพดานของ transcript ที่ส่งไปขอสรุป กำหนดเป็นตัวเลขตัวอักษร แต่ **แปลงเป็น tokens (~4 ตัวอักษร/token) และถูกเพดาน "ครึ่งหนึ่งของ window" บังคับอีกชั้น** — request ขอสรุป**ต้อง**เล็กกว่า window มิฉะนั้น Ollama จะตัดหัวทิ้งเงียบ ๆ หรือ OpenAI ตอบ 400 |
+| `-max-tool-result-chars` | `JONNYQ_MAX_TOOL_RESULT_CHARS` | `64000` | เพดานตัวอักษรของ tool result หนึ่งตัวก่อนเข้า history (เก็บ head 70% + tail 30%) |
 | `-max-tool-calls-per-turn` | `JONNYQ_MAX_TOOL_CALLS_PER_TURN` | `50` | จำนวน tool call สูงสุดใน 1 turn (safety valve กัน tool-call loop) |
 | `-watch-magic-word` | `JONNYQ_WATCH_MAGIC_WORD` | `AI!` | magic word ที่ `/watchfile` ใช้ค้นหา |
 | `-watch-poll-interval-sec` | `JONNYQ_WATCH_POLL_INTERVAL_SEC` | `1` | ความถี่ poll ของ `/watchfile` (วินาที, ขั้นต่ำ 1) |
@@ -368,6 +379,8 @@ set -a; . ./.env; set +a; jonnyq
 | `/list_model` | แสดงรายชื่อ model ที่ provider ปัจจุบันมี |
 | `/context <size>` | ตั้ง context size (จำนวนเต็มบวก) |
 | `/think <true\|false>` | เปิด/ปิด thinking |
+| `/compact` | สรุป (summarize) history ทันที โดยไม่ต้องรอให้ history โตถึง trigger — มีประโยชน์เวลาจะดีบัก/ทดสอบ behaviour ของการ compact |
+| `/history` | แสดงขนาด history ทีละข้อความว่ากิน context เท่าไหร่ (tokens + chars) พร้อมยอดรวมทั้ง request เทียบกับ context window |
 | `/run_command_timeout <seconds>` | ตั้ง timeout ของ `run_command` ระหว่างที่กำลังรันอยู่ |
 | `/prompt <file>` | อ่านเนื้อหาไฟล์มาเป็น prompt แล้วส่งเลย เหมือนพิมพ์เอง |
 | `/plan` | สร้าง `.progress` จาก `requirements.md` ถ้ายังไม่มี หรือ reconcile ถ้า requirement เปลี่ยน (เช็คความสอดคล้องกับโค้ดจริงด้วย) — **ไม่เขียนโค้ดใด ๆ** |

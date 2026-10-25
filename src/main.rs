@@ -85,6 +85,7 @@ async fn main() {
     );
     agent.set_tool_call_mode(jonnyq::agent::ToolCallMode::from_config(&cfg.tool_call_mode));
     agent.set_output_file(&cfg.output_file);
+    agent.configure(&cfg);
     let agent = Arc::new(agent);
 
     let r = Repl::new(cfg, agent, w.clone(), run_command);

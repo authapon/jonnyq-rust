@@ -35,6 +35,8 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /model <model>                    set the model name
   /list_model                       list models available from the current provider
   /context <size>                   set the context size
+  /compact                          summarize history now, regardless of size (debugging / making room)
+  /history                          per-message size of history and how it adds up against the window
   /think <true|false>               enable or disable model thinking
   /run_command_timeout <seconds>    set the run_command timeout in seconds
   /prompt <file>                    read a prompt from file and send it, as if typed
@@ -359,6 +361,19 @@ so it doesn't fire again.",
                 self.cfg.lock().await.context_size = n;
                 self.agent.set_context_size(n);
                 self.ui.plainln(&format!("context size set to {n}"));
+            }
+
+            "/compact" => {
+                // Summarize now, ignoring the size trigger - the only way to
+                // reproduce/inspect compaction without waiting for a long
+                // session to fill up.
+                self.ui.plainln("[compact] summarizing history now...");
+                self.agent.force_compact(cancel.clone()).await;
+            }
+
+            "/history" => {
+                let report = self.agent.history_report();
+                self.ui.plainln(report.trim_end());
             }
 
             "/think" => {
@@ -688,6 +703,7 @@ so it doesn't fire again.",
         self.agent.set_skill_paths(new_cfg.skill_paths.clone());
         self.agent.set_output_file(&new_cfg.output_file);
         self.agent.tools.configure(&new_cfg);
+        self.agent.configure(&new_cfg);
 
         // The provider is rebuilt only when something about it changed, so a
         // reload that touched nothing else doesn't discard a working client.
@@ -1098,6 +1114,22 @@ mod tests {
             res.unwrap_or_else(|e| panic!("{cmd}: unexpected error: {e}"));
             assert!(exit, "{cmd}: expected exit=true");
         }
+    }
+
+    /// `/history` and `/compact` exist so the compaction subsystem can be
+    /// inspected and driven by hand instead of only by a long session.
+    #[tokio::test]
+    async fn history_and_compact_commands_are_wired_up() {
+        let t = new_test_repl().await;
+        let (exit, res) = t.repl.handle_slash(CancellationToken::new(), "/history").await;
+        res.unwrap();
+        assert!(!exit);
+        let log = t.log_contents();
+        assert!(log.contains("total history"), "got: {log}");
+
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/compact").await;
+        res.unwrap();
+        assert!(t.log_contents().contains("[compact]"), "got: {}", t.log_contents());
     }
 
     #[tokio::test]

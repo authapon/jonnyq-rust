@@ -106,6 +106,12 @@ pub struct ChatRequest {
     /// num_ctx). OpenAI-compatible providers have no equivalent per-request
     /// knob and ignore it.
     pub context_size: i64,
+    /// When set, the ceiling on how many tokens the model may answer with
+    /// (Ollama's `options.num_predict`, OpenAI's `max_tokens`). Used by
+    /// context compaction: without it a server's own (often tiny, 128-512
+    /// token) default silently cuts the summary off mid-sentence and the
+    /// agent believes it is complete.
+    pub max_output_tokens: Option<i64>,
 }
 
 impl Default for ChatRequest {
@@ -116,6 +122,7 @@ impl Default for ChatRequest {
             tools: Vec::new(),
             thinking: false,
             context_size: 0,
+            max_output_tokens: None,
         }
     }
 }
@@ -140,6 +147,7 @@ pub struct ChatRequestSnapshot {
     pub tool_names: Vec<String>,
     pub thinking: bool,
     pub context_size: i64,
+    pub max_output_tokens: Option<i64>,
 }
 
 impl ChatRequestSnapshot {
@@ -150,6 +158,7 @@ impl ChatRequestSnapshot {
             tool_names: r.tools.iter().map(|t| t.name.clone()).collect(),
             thinking: r.thinking,
             context_size: r.context_size,
+            max_output_tokens: r.max_output_tokens,
         }
     }
 

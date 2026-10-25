@@ -37,7 +37,7 @@ impl StreamTimer {
 
     /// Records a streamed delta carrying `n` characters of output.
     fn mark(&mut self, n: usize) {
-        if n <= 0 {
+        if n == 0 {
             return;
         }
         let now = Instant::now();
@@ -243,6 +243,9 @@ impl Provider for OpenAiProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(to_openai_tools(&req.tools));
         }
+        if let Some(n) = req.max_output_tokens.filter(|n| *n > 0) {
+            body["max_tokens"] = json!(n);
+        }
 
         let mut timer = StreamTimer::new();
         let resp = super::types::until_cancelled(
@@ -272,7 +275,6 @@ impl Provider for OpenAiProvider {
             let mut builders: BTreeMap<usize, ToolCallBuilder> = BTreeMap::new();
             let mut usage = Usage::default();
             let mut line_buf = String::new();
-            let mut done_sent = false;
 
             macro_rules! flush_tool_calls {
                 () => {{
@@ -325,7 +327,8 @@ impl Provider for OpenAiProvider {
                     if payload == "[DONE]" {
                         flush_tool_calls!();
                         let _ = tx.send(ChatEvent::Done { usage: timer.apply(usage) });
-                        done_sent = true;
+                        // Returning here is what prevents the tail of the
+                        // loop below from emitting a second Done.
                         return;
                     }
                     let parsed: OaChunk = match serde_json::from_str(payload) {
@@ -371,9 +374,11 @@ impl Provider for OpenAiProvider {
                     }
                 }
             }
-            if done_sent {
-                return;
-            }
+            // Reached only when the stream ended without a "[DONE]" sentinel
+            // (a server that closed the body early, or one that never sends
+            // it) - flush whatever tool calls were accumulating and close
+            // the stream with a Done so the caller sees a completion instead
+            // of a truncated reply.
             flush_tool_calls!();
             let _ = tx.send(ChatEvent::Done { usage: timer.apply(usage) });
         });
@@ -406,6 +411,23 @@ mod tests {
     use crate::llm::{ChatRequest, Message, Role, ToolCall};
     use crate::testsupport::{StubResponse, TestServer};
     use tokio_util::sync::CancellationToken;
+
+    /// The compaction request needs a reply cap: an OpenAI-compatible server
+    /// that applies its own small default truncates the summary mid-sentence
+    /// and the agent believes it is complete.
+    #[tokio::test]
+    async fn max_tokens_is_sent_when_requested() {
+        let srv = TestServer::with_handler(|_r| StubResponse::sse("data: [DONE]\n\n")).await;
+        let req = ChatRequest { max_output_tokens: Some(512), ..user("summarize") };
+        collect(&OpenAiProvider::new(&srv.url, ""), req).await;
+        let body = srv.last_request().body_json();
+        assert_eq!(body["max_tokens"], 512, "body: {body}");
+
+        let srv = TestServer::with_handler(|_r| StubResponse::sse("data: [DONE]\n\n")).await;
+        collect(&OpenAiProvider::new(&srv.url, ""), user("hi")).await;
+        let body = srv.last_request().body_json();
+        assert!(body.get("max_tokens").is_none(), "body: {body}");
+    }
 
     async fn collect(p: &OpenAiProvider, req: ChatRequest) -> Vec<ChatEvent> {
         let (mut rx, _c) = p.chat(CancellationToken::new(), &req).await.expect("chat");

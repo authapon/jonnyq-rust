@@ -162,8 +162,20 @@ impl Provider for OllamaProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(to_ollama_tools(&req.tools));
         }
+        // num_ctx tells the server the window size we are writing to. It
+        // must be sent whenever we know it: Ollama does not error when a
+        // prompt exceeds it, it silently drops tokens from the *front* of
+        // the prompt (which is where the instructions live) and still
+        // answers 200. Without it the server's own default applies.
+        let mut options = serde_json::Map::new();
         if req.context_size > 0 {
-            body["options"] = json!({ "num_ctx": req.context_size });
+            options.insert("num_ctx".into(), json!(req.context_size));
+        }
+        if let Some(n) = req.max_output_tokens.filter(|n| *n > 0) {
+            options.insert("num_predict".into(), json!(n));
+        }
+        if !options.is_empty() {
+            body["options"] = Value::Object(options);
         }
 
         let resp = super::types::until_cancelled(
@@ -448,6 +460,48 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert!(last.get("content").is_some(), "tool message must carry a content key: {last}");
         assert_eq!(last["content"], "");
+    }
+
+    /// The summarize request must always declare the window it is writing
+    /// to: when `options.num_ctx` is omitted Ollama applies its own default
+    /// and silently drops the *front* of an oversized prompt (where the
+    /// instructions are) while still answering 200.
+    #[tokio::test]
+    async fn options_carry_num_ctx_and_num_predict() {
+        let srv =
+            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n")).await;
+        let req = ChatRequest {
+            context_size: 32768,
+            max_output_tokens: Some(700),
+            ..user("summarize")
+        };
+        collect(&OllamaProvider::new(&srv.url, ""), req).await;
+        let body = srv.last_request().body_json();
+        assert_eq!(body["options"]["num_ctx"], 32768, "body: {body}");
+        assert_eq!(body["options"]["num_predict"], 700, "body: {body}");
+    }
+
+    /// Only what was asked for is sent: a request that knows its window but
+    /// sets no reply cap must not invent one (and vice versa).
+    #[tokio::test]
+    async fn options_omit_what_was_not_requested() {
+        let srv =
+            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n")).await;
+        collect(&OllamaProvider::new(&srv.url, ""), ChatRequest { context_size: 4096, ..user("hi") }).await;
+        let body = srv.last_request().body_json();
+        assert_eq!(body["options"]["num_ctx"], 4096);
+        assert!(body["options"].get("num_predict").is_none(), "body: {body}");
+
+        collect(&OllamaProvider::new(&srv.url, ""), ChatRequest { max_output_tokens: Some(64), ..user("hi") })
+            .await;
+        let body = srv.last_request().body_json();
+        assert_eq!(body["options"]["num_predict"], 64);
+        assert!(body["options"].get("num_ctx").is_none(), "body: {body}");
+
+        // Neither: no options key at all, exactly as before.
+        collect(&OllamaProvider::new(&srv.url, ""), user("hi")).await;
+        let body = srv.last_request().body_json();
+        assert!(body.get("options").is_none(), "body: {body}");
     }
 
     #[tokio::test]

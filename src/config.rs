@@ -39,6 +39,21 @@ pub const DEFAULT_WATCH_POLL_INTERVAL_SEC: i64 = 1;
 pub const DEFAULT_NTFY_URL: &str = "";
 pub const DEFAULT_TOOL_CALL_MODE: &str = "native";
 
+/// Context-compaction defaults (see `agent::CompactTunables` and the
+/// `JONNYQ_COMPACT_*` settings): the fraction of the context window at which
+/// history gets summarized, the fraction the summary may occupy, how many
+/// recent messages survive a compaction verbatim, and the character ceiling
+/// on the transcript sent to be summarized.
+pub const DEFAULT_COMPACT_HEADROOM_PERCENT: i64 = 60;
+pub const DEFAULT_COMPACT_TARGET_PERCENT: i64 = 25;
+pub const DEFAULT_COMPACT_KEEP_RECENT: i64 = 6;
+pub const DEFAULT_SUMMARY_TRANSCRIPT_CAP: i64 = 48_000;
+
+/// Ceiling on how many characters one tool result may contribute to the
+/// conversation history (`JONNYQ_MAX_TOOL_RESULT_CHARS`) - see
+/// `tools::cap_tool_result`.
+pub const DEFAULT_MAX_TOOL_RESULT_CHARS: i64 = 64_000;
+
 const USAGE: &str = "Usage: jonnyq [flags]
 
 Flags:
@@ -57,6 +72,16 @@ Flags:
   -pdf-dpi <n>                  PDF render DPI (default 150)
   -run-command-timeout-sec <n>  run_command timeout seconds (default 300)
   -max-tool-calls-per-turn <n>  max tool calls per turn (default 50)
+  -compact-headroom-percent <n> percent of the context window that triggers
+                                compaction (default 60)
+  -compact-target-percent <n>   percent of the window the summary may use
+                                (default 25)
+  -compact-keep-recent <n>      messages kept verbatim through a compaction
+                                (default 6)
+  -summary-transcript-cap <n>   max characters sent to be summarized
+                                (default 48000)
+  -max-tool-result-chars <n>    per-tool-result character cap on history
+                                (default 64000)
   -watch-magic-word <word>      magic word /watchfile scans for (default \"AI!\")
   -watch-poll-interval-sec <n>  /watchfile polling interval seconds (default 1)
   -ntfy-url <url>               ntfy topic URL for /plan and /coding notifications
@@ -214,6 +239,15 @@ pub struct Config {
     pub run_command_timeout_sec: i64,
     pub max_tool_calls_per_turn: i64,
 
+    /// Context-compaction tuning, applied to the agent at startup and by
+    /// `/env reload`. See `agent::CompactTunables`.
+    pub compact_headroom_percent: i64,
+    pub compact_target_percent: i64,
+    pub compact_keep_recent: i64,
+    pub summary_transcript_cap: i64,
+    /// `tools::set_max_tool_result_chars` ceiling.
+    pub max_tool_result_chars: i64,
+
     pub watch_magic_word: String,
     pub watch_poll_interval_sec: i64,
 
@@ -272,6 +306,11 @@ impl Default for Config {
             pdf_dpi: DEFAULT_PDF_DPI,
             run_command_timeout_sec: DEFAULT_RUN_COMMAND_TIMEOUT_SEC,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            compact_headroom_percent: DEFAULT_COMPACT_HEADROOM_PERCENT,
+            compact_target_percent: DEFAULT_COMPACT_TARGET_PERCENT,
+            compact_keep_recent: DEFAULT_COMPACT_KEEP_RECENT,
+            summary_transcript_cap: DEFAULT_SUMMARY_TRANSCRIPT_CAP,
+            max_tool_result_chars: DEFAULT_MAX_TOOL_RESULT_CHARS,
             watch_magic_word: DEFAULT_WATCH_MAGIC_WORD.into(),
             watch_poll_interval_sec: DEFAULT_WATCH_POLL_INTERVAL_SEC,
             ntfy_url: DEFAULT_NTFY_URL.into(),
@@ -425,6 +464,41 @@ impl Config {
                 false,
             ),
             (
+                "compact-headroom-percent",
+                "COMPACT_HEADROOM_PERCENT",
+                self.compact_headroom_percent.to_string(),
+                self.src("COMPACT_HEADROOM_PERCENT"),
+                false,
+            ),
+            (
+                "compact-target-percent",
+                "COMPACT_TARGET_PERCENT",
+                self.compact_target_percent.to_string(),
+                self.src("COMPACT_TARGET_PERCENT"),
+                false,
+            ),
+            (
+                "compact-keep-recent",
+                "COMPACT_KEEP_RECENT",
+                self.compact_keep_recent.to_string(),
+                self.src("COMPACT_KEEP_RECENT"),
+                false,
+            ),
+            (
+                "summary-transcript-cap",
+                "SUMMARY_TRANSCRIPT_CAP",
+                self.summary_transcript_cap.to_string(),
+                self.src("SUMMARY_TRANSCRIPT_CAP"),
+                false,
+            ),
+            (
+                "max-tool-result-chars",
+                "MAX_TOOL_RESULT_CHARS",
+                self.max_tool_result_chars.to_string(),
+                self.src("MAX_TOOL_RESULT_CHARS"),
+                false,
+            ),
+            (
                 "max-tool-calls-per-turn",
                 "MAX_TOOL_CALLS_PER_TURN",
                 self.max_tool_calls_per_turn.to_string(),
@@ -506,6 +580,11 @@ const KNOWN_FLAGS: &[&str] = &[
     "pdf-max-pages",
     "pdf-dpi",
     "run-command-timeout-sec",
+    "compact-headroom-percent",
+    "compact-target-percent",
+    "compact-keep-recent",
+    "summary-transcript-cap",
+    "max-tool-result-chars",
     "max-tool-calls-per-turn",
     "watch-magic-word",
     "watch-poll-interval-sec",
@@ -725,6 +804,21 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     );
     sources.insert("RUN_COMMAND_TIMEOUT_SEC".to_string(), src);
     c.run_command_timeout_sec = n;
+    let (n, src) = r.int("compact-headroom-percent", "COMPACT_HEADROOM_PERCENT", DEFAULT_COMPACT_HEADROOM_PERCENT);
+    sources.insert("COMPACT_HEADROOM_PERCENT".to_string(), src);
+    c.compact_headroom_percent = n;
+    let (n, src) = r.int("compact-target-percent", "COMPACT_TARGET_PERCENT", DEFAULT_COMPACT_TARGET_PERCENT);
+    sources.insert("COMPACT_TARGET_PERCENT".to_string(), src);
+    c.compact_target_percent = n;
+    let (n, src) = r.int("compact-keep-recent", "COMPACT_KEEP_RECENT", DEFAULT_COMPACT_KEEP_RECENT);
+    sources.insert("COMPACT_KEEP_RECENT".to_string(), src);
+    c.compact_keep_recent = n;
+    let (n, src) = r.int("summary-transcript-cap", "SUMMARY_TRANSCRIPT_CAP", DEFAULT_SUMMARY_TRANSCRIPT_CAP);
+    sources.insert("SUMMARY_TRANSCRIPT_CAP".to_string(), src);
+    c.summary_transcript_cap = n;
+    let (n, src) = r.int("max-tool-result-chars", "MAX_TOOL_RESULT_CHARS", DEFAULT_MAX_TOOL_RESULT_CHARS);
+    sources.insert("MAX_TOOL_RESULT_CHARS".to_string(), src);
+    c.max_tool_result_chars = n;
     let (n, src) = r.int(
         "max-tool-calls-per-turn",
         "MAX_TOOL_CALLS_PER_TURN",
@@ -1273,6 +1367,11 @@ mod tests {
             "pdf-max-pages JONNYQ_PDF_MAX_PAGES",
             "pdf-dpi JONNYQ_PDF_DPI",
             "run-command-timeout-sec JONNYQ_RUN_COMMAND_TIMEOUT_SEC",
+            "compact-headroom-percent JONNYQ_COMPACT_HEADROOM_PERCENT",
+            "compact-target-percent JONNYQ_COMPACT_TARGET_PERCENT",
+            "compact-keep-recent JONNYQ_COMPACT_KEEP_RECENT",
+            "summary-transcript-cap JONNYQ_SUMMARY_TRANSCRIPT_CAP",
+            "max-tool-result-chars JONNYQ_MAX_TOOL_RESULT_CHARS",
             "max-tool-calls-per-turn JONNYQ_MAX_TOOL_CALLS_PER_TURN",
             "watch-magic-word JONNYQ_WATCH_MAGIC_WORD",
             "watch-poll-interval-sec JONNYQ_WATCH_POLL_INTERVAL_SEC",
