@@ -8,6 +8,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,17 @@ pub const COLOR_BRIGHT_BLUE: &str = "\x1b[94m";
 pub const COLOR_BRIGHT_WHITE: &str = "\x1b[97m";
 
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+
+/// A second pair of eyes on everything [`Writer`] puts on stdout.
+///
+/// The web console registers one through [`Writer::add_console_sink`] so the
+/// browser shows the same text (ANSI escapes included - the browser-side
+/// renderer turns them into gruvbox colours) as the terminal does, without
+/// [`Writer`] having to know anything about HTTP.
+pub trait ConsoleSink: Send + Sync {
+    /// One chunk of terminal output, exactly as it was written to stdout.
+    fn console(&self, text: &str);
+}
 
 pub fn strip_ansi(s: &str) -> String {
     ANSI_RE.replace_all(s, "").into_owned()
@@ -341,7 +353,9 @@ struct WriterInner {
 }
 
 /// Prints colored text to stdout (when stdout is a terminal) and always
-/// appends the plain-text equivalent to a log file.
+/// appends the plain-text equivalent to a log file. Every chunk written to
+/// stdout is also handed to the registered [`ConsoleSink`]s, which is how the
+/// web console shows the same output the terminal does.
 pub struct Writer {
     log: Mutex<std::fs::File>,
     /// The path `log` is currently open on, so `/env reload` can tell whether
@@ -351,6 +365,7 @@ pub struct Writer {
     inner: Mutex<WriterInner>,
     pub state: RwLock<UiState>,
     closed: AtomicBool,
+    sinks: Mutex<Vec<Arc<dyn ConsoleSink>>>,
 }
 
 impl Writer {
@@ -363,7 +378,41 @@ impl Writer {
             inner: Mutex::new(WriterInner { current: Section::None, at_line_start: true }),
             state: RwLock::new(UiState { ..Default::default() }),
             closed: AtomicBool::new(false),
+            sinks: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Registers a second destination for terminal output (the web console).
+    /// Sinks are kept in registration order and see every chunk in the order
+    /// it was written. Never removed: the console of a session that stops
+    /// serving simply becomes a sink that nobody listens to (its send fails and
+    /// the sink drops the chunk).
+    pub fn add_console_sink(&self, sink: Arc<dyn ConsoleSink>) {
+        self.sinks.lock().unwrap().push(sink);
+    }
+
+    fn mirror(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Cloned out of the lock so a sink that itself registers or writes
+        // through this Writer cannot deadlock against it.
+        let sinks = self.sinks.lock().unwrap().clone();
+        for s in sinks.iter() {
+            s.console(text);
+        }
+    }
+
+    /// One chunk to stdout (and to the console sinks), without touching the
+    /// log. The terminal and the browser must see the same bytes, escapes
+    /// included, so everything printed goes through here.
+    fn out(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        print!("{}", text);
+        let _ = std::io::stdout().flush();
+        self.mirror(text);
     }
 
     pub fn close(&self) {
@@ -406,11 +455,10 @@ impl Writer {
             return;
         }
         if self.color_out {
-            print!("{}{}{}", color, text, COLOR_RESET);
+            self.out(&format!("{}{}{}", color, text, COLOR_RESET));
         } else {
-            print!("{}", text);
+            self.out(text);
         }
-        let _ = std::io::stdout().flush();
         self.write_log(&strip_ansi(text));
         let mut inner = self.inner.lock().unwrap();
         inner.at_line_start = text.ends_with('\n');
@@ -464,15 +512,15 @@ impl Writer {
         drop(state);
 
         if self.color_out {
-            print!("{}{}{}{}", COLOR_BOLD, bright, stamped, COLOR_RESET);
+            let mut line = format!("{}{}{}{}", COLOR_BOLD, bright, stamped, COLOR_RESET);
             if !ctx_text.is_empty() {
-                print!("{}{}{}", ctx_color, ctx_text, COLOR_RESET);
+                line.push_str(&format!("{}{}{}", ctx_color, ctx_text, COLOR_RESET));
             }
-            println!();
+            line.push('\n');
+            self.out(&line);
         } else {
-            println!("{stamped}{ctx_text}");
+            self.out(&format!("{stamped}{ctx_text}\n"));
         }
-        let _ = std::io::stdout().flush();
         self.write_log(&format!("{}{}\n", stamped, ctx_text));
         self.inner.lock().unwrap().at_line_start = true;
     }
@@ -493,11 +541,10 @@ impl Writer {
     /// thing rather than one of the streamed sections, so they get no header.
     pub fn coloredln(&self, text: &str, color: &str, bold: bool) {
         if self.color_out {
-            println!("{}", styled(text, color, bold));
+            self.out(&format!("{}\n", styled(text, color, bold)));
         } else {
-            println!("{text}");
+            self.out(&format!("{text}\n"));
         }
-        let _ = std::io::stdout().flush();
         self.write_log(&format!("{text}\n"));
         self.inner.lock().unwrap().at_line_start = true;
     }
@@ -506,11 +553,10 @@ impl Writer {
     /// line — used for the `Your answer> ` label the user types after.
     pub fn colored(&self, text: &str, color: &str, bold: bool) {
         if self.color_out {
-            print!("{}", styled(text, color, bold));
+            self.out(&styled(text, color, bold));
         } else {
-            print!("{text}");
+            self.out(text);
         }
-        let _ = std::io::stdout().flush();
         self.write_log(text);
         self.inner.lock().unwrap().at_line_start = false;
     }
@@ -522,11 +568,10 @@ impl Writer {
     /// switches the attributes off again once the line has been read.
     pub fn colored_keep(&self, text: &str, color: &str, bold: bool) {
         if self.color_out {
-            print!("{}", styled(text, color, bold).strip_suffix(COLOR_RESET).unwrap_or(text));
+            self.out(styled(text, color, bold).strip_suffix(COLOR_RESET).unwrap_or(text));
         } else {
-            print!("{text}");
+            self.out(text);
         }
-        let _ = std::io::stdout().flush();
         self.write_log(text);
         self.inner.lock().unwrap().at_line_start = false;
     }
@@ -538,8 +583,7 @@ impl Writer {
     /// log.
     pub fn reset_color(&self) {
         if self.color_out {
-            print!("{COLOR_RESET}");
-            let _ = std::io::stdout().flush();
+            self.out(COLOR_RESET);
         }
     }
 
@@ -584,8 +628,7 @@ impl Writer {
         if text.is_empty() {
             return;
         }
-        print!("{}", text);
-        let _ = std::io::stdout().flush();
+        self.out(text);
         self.write_log(&strip_ansi(text));
         let mut inner = self.inner.lock().unwrap();
         inner.at_line_start = text.ends_with('\n');

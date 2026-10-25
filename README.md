@@ -30,10 +30,11 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 8. [Tools](#tools)
 9. [Automated coding: `/plan` → `.progress` → `/coding`](#automated-coding-plan--progress--coding)
 10. [Skills](#skills)
-11. [Notifications (ntfy)](#notifications-ntfy)
-12. [Files created at runtime](#files-created-at-runtime)
-13. [Security notes](#security-notes)
-14. [License](#license)
+11. [Web console](#web-console)
+12. [Notifications (ntfy)](#notifications-ntfy)
+13. [Files created at runtime](#files-created-at-runtime)
+14. [Security notes](#security-notes)
+15. [License](#license)
 
 ---
 
@@ -199,6 +200,7 @@ The file supports comments, `export KEY=value`, single/double quotes (`\n`, `\t`
 | `-no-proxy` | `JONNYQ_NO_PROXY` | `localhost,127.0.0.1,::1` | comma-separated hosts/CIDRs that bypass the proxy |
 | `-tool-mode` | `JONNYQ_TOOL_MODE` | `native` | `native` or `prompt` |
 | `-skill-path` | `JONNYQ_SKILL_PATH` | (empty) | skill directories, separated by `;` |
+| `-web` | `JONNYQ_WEB_PORT` | `0` (no web interface) | port for the browser console on `http://127.0.0.1:<port>` |
 | `-thinking=true\|false` | `JONNYQ_THINKING` | `true` | enable/disable model thinking (sent to Ollama only) |
 | `-env-file` | `JONNYQ_ENV_FILE` | (empty = `./.env`) | pick another dotenv file, or `off`/`none`/`no` to disable; settable from flag/env only, never inside the file |
 
@@ -313,6 +315,42 @@ A skill is a markdown note the model can pull in on demand. Skills are rediscove
 jonnyq -skill-path '~/my-skills;~/shared-skills'
 # or JONNYQ_SKILL_PATH=$HOME/my-skills;$HOME/shared-skills   (in .env)
 ```
+
+## Web console
+
+```bash
+jonnyq -model qwen3:14b -web 8080     # then open http://127.0.0.1:8080
+```
+
+`-web <port>` serves the same session in the browser, next to the terminal — both
+are live at the same time, and neither can make the other run two turns at once.
+The page has one websocket and no external assets, so it works offline against a
+local model.
+
+| Part | What it does |
+|---|---|
+| **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
+| **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
+| **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
+| **tree** (right) | The working directory, folders first. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
+
+A prompt typed in the browser goes onto a queue that the REPL's own loop reads,
+which is why the answer appears in *both* windows, and why a browser prompt, a
+typed prompt and a `/watchfile` trigger are serialised against each other. The
+textarea freezes while a turn runs and thaws when it finishes. Opening or
+reloading a tab replays the transcript so far, so a second browser window shows
+the conversation that already happened.
+
+`jonnyq -web 8080 < /dev/null` (or a session whose stdin was closed with Ctrl-D)
+keeps running as a browser-only session instead of exiting on EOF — the prompt
+echoes into the console, and `/exit` in a tab ends the session.
+
+The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
+`Origin`, when a browser sends one) names loopback, so it is a local interface
+and nothing else. `GET /health` reports the session as JSON. It is *not* a
+boundary against something already running as you: any browser tab can read the
+working directory. Changing the model, provider, proxy or ntfy topic stays under
+the keyboard — the page has no controls for them.
 
 ## Notifications (ntfy)
 

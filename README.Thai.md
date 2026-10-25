@@ -30,10 +30,11 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 8. [Tools](#tools)
 9. [การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`](#การทำงานอัตโนมัติ-plan--progress--coding)
 10. [Skills](#skills)
-11. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
-12. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
-13. [ความปลอดภัย](#ความปลอดภัย)
-14. [License](#license)
+11. [เวบคอนโซล](#เวบคอนโซล)
+12. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
+13. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
+14. [ความปลอดภัย](#ความปลอดภัย)
+15. [License](#license)
 
 ---
 
@@ -199,6 +200,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `-no-proxy` | `JONNYQ_NO_PROXY` | `localhost,127.0.0.1,::1` | host/CIDR ที่ข้าม proxy (คั่นด้วย `,`) |
 | `-tool-mode` | `JONNYQ_TOOL_MODE` | `native` | `native` หรือ `prompt` |
 | `-skill-path` | `JONNYQ_SKILL_PATH` | (ว่าง) | ไดเรกทอรีของ skill คั่นด้วย `;` |
+| `-web` | `JONNYQ_WEB_PORT` | `0` (ไม่มีเวบ interface) | port ของเวบคอนโซลบน `http://127.0.0.1:<port>` |
 | `-thinking=true\|false` | `JONNYQ_THINKING` | `true` | เปิด/ปิด thinking (ส่งเฉพาะ Ollama) |
 | `-env-file` | `JONNYQ_ENV_FILE` | (ว่าง = `./.env`) | เลือกไฟล์ dotenv อื่น หรือ `off`/`none`/`no` เพื่อปิด — ตั้งผ่าน flag/env เท่านั้น ตั้งในไฟล์ไม่ได้ |
 
@@ -312,6 +314,37 @@ Skill คือความรู้ที่เขียนเป็น markdow
 jonnyq -skill-path '~/my-skills;~/shared-skills'
 # หรือ JONNYQ_SKILL_PATH=$HOME/my-skills;$HOME/shared-skills   (ใน .env)
 ```
+
+## เวบคอนโซล
+
+```bash
+jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.1:8080
+```
+
+`-web <port>` แสดง session เดียวกันบนเวบไปด้วยพร้อมกับ terminal — ทำงานได้ทั้งสอง
+หน้าต่างพร้อมกัน และไม่มีทางทำให้รันสอง turn ซ้อนกัน หน้าเวบใช้ websocket เส้นเดียว
+ไม่มี asset ภายนอก จึงทำงาน offline กับ model ในเครื่องได้
+
+| ส่วน | ทำงานอะไร |
+|---|---|
+| **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
+| **แท็บไฟล์** | เปิดได้หลายไฟล์ คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ |
+| **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
+| **tree** (ขวา) | รายการ working directory (folder ก่อนไฟล์) ขยาย folder เพื่อดูรายการข้างใน คลิกไฟล์ text เพื่อเปิดในแท็บใหม่ ส่วน PDF/image/binary จะขึ้น popup บอกว่าเปิดดูไม่ได้เพราะอะไร |
+
+prompt ที่พิมพ์บนเวบจะถูกเข้าคิวให้ loop ของ REPL เป็นตัวอ่านเอง นี่คือเหตุผลที่
+คำตอบโผล่ทั้งสองหน้าต่าง และทำให้ prompt จากเวบ, prompt ที่พิมพ์ และ trigger ของ
+`/watchfile` ไม่รันซ้อนกัน textarea จะ freeze ระหว่าง turn และกลับมาพิมพ์ได้เมื่อจบ
+
+`jonnyq -web 8080 < /dev/null` (หรือ session ที่ stdin ถูกปิดด้วย Ctrl-D) จะรันต่อ
+แบบมีแต่เวบแทนที่จะ exit ด้วย EOF — prompt ที่ส่งมาจะถูก echo กลับเข้า console และ
+`/exit` ในแท็บจะปิด session
+
+listener ผูกกับ `127.0.0.1` และตอบเฉพาะ request ที่ `Host` (และ `Origin` เมื่อ
+browser ส่งมา) เป็น loopback จึงเป็น interface ในเครื่องเท่านั้น `GET /health` ตอบ
+สถานะ session เป็น JSON ส่วนนี้**ไม่ใช่** wall กันผู้ที่รันเป็น user เดียวกัน: แท็บ
+เวบใดๆ ก็อ่านไฟล์ใน working directory ได้ และการเปลี่ยน model / provider / proxy /
+ntfy topic ยังต้องพิมพ์ที่ keyboard เท่านั้น (หน้าเวบไม่มีปุ่มเหล่านี้)
 
 ## การแจ้งเตือน (ntfy)
 

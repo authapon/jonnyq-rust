@@ -7,9 +7,8 @@
 //!   ([`config::dotenv`]) with `flag > env > file > default` precedence
 //! - [`llm`]     — provider interface + `ollama.rs`, `openai.rs`
 //! - [`net`]     — the shared outbound HTTP clients + the SOCKS proxy setting
-//! - [`tools`]   — read_file, write_file, edit_file, create_folder,
-//!                 web_search, web_fetch, read_pdf, read_pic, run_command,
-//!                 read_skill, ask_user
+//! - [`tools`]   — read_file, write_file, edit_file, create_folder, web_search,
+//!   web_fetch, read_pdf, read_pic, run_command, read_skill, ask_user
 //! - [`agent`]   — tool-calling loop, context compaction, metrics, tool modes
 //! - [`repl`]    — prompt loop + slash commands
 //! - [`skill`]   — skill discovery
@@ -18,6 +17,8 @@
 //! - [`notify`]  — /ntfy: push notifications to ntfy.sh / a self-hosted server
 //! - [`ui`]      — terminal colours + plain-text log
 //! - [`input`]   — the one stdin reader, shared by the REPL and ask_user
+//! - [`web`]     — `-web <port>`: the browser twin of the REPL — live console,
+//!   prompts from the browser, the tool-approval modal, the files browser
 
 pub mod agent;
 pub mod coding;
@@ -35,3 +36,4 @@ mod testsupport;
 pub mod tools;
 pub mod ui;
 pub mod watch;
+pub mod web;

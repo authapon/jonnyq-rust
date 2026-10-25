@@ -14,6 +14,22 @@ use jonnyq::tools;
 use jonnyq::tools::run_command::RunCommandTool;
 use jonnyq::ui::Writer;
 
+/// The one-line session description the web console shows: model, context
+/// usage and window. Built from the agent rather than a snapshot, so the page
+/// shows what the session is using *now* - after `/model`, `/context` or a
+/// compaction - not what it started with.
+fn status_line(agent: Arc<Agent>) -> jonnyq::web::StatusFn {
+    Arc::new(move || {
+        let cs = agent.ui.state.read().unwrap().context_status();
+        let model = if agent.model().is_empty() {
+            "(no model)".to_string()
+        } else {
+            agent.model()
+        };
+        format!("{model} | {cs} | {}", agent.tool_call_mode().as_str())
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -96,7 +112,28 @@ async fn main() {
     agent.configure(&cfg);
     let agent = Arc::new(agent);
 
-    let r = Repl::new(cfg, agent, w.clone(), run_command);
+    let r = Repl::new(cfg, agent.clone(), w.clone(), run_command);
+
+    // The web console (-web <port>): bind before the REPL starts so a port
+    // already in use is reported now, not after a session has begun. It mirrors
+    // the terminal into a browser page at http://127.0.0.1:<port> and feeds
+    // prompts typed there back through the REPL's own loop - see crate::web.
+    if r.cfg.lock().await.web_port > 0 {
+        let port = r.cfg.lock().await.web_port as u16;
+        let status = status_line(agent.clone());
+        match jonnyq::web::WebConsole::bind(port, &work_dir, w.clone(), status) {
+            Ok(web) => {
+                if let Err(e) = web.start() {
+                    eprintln!("web console: {e}");
+                } else {
+                    r.set_web(web.clone()).await;
+                    w.plainln(&format!("[web] console at {}", web.url()));
+                }
+            }
+            Err(e) => eprintln!("web console: {e}"),
+        }
+    }
+
     let err = r.run().await.err();
     w.close();
     if let Some(e) = err {

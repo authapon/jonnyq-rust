@@ -41,6 +41,10 @@ pub const DEFAULT_WATCH_MAGIC_WORD: &str = "AI!";
 pub const DEFAULT_WATCH_POLL_INTERVAL_SEC: i64 = 1;
 pub const DEFAULT_NTFY_URL: &str = "";
 pub const DEFAULT_TOOL_CALL_MODE: &str = "native";
+/// `-web` / `JONNYQ_WEB_PORT`: port of the browser console on 127.0.0.1. Zero
+/// (the default) runs no server, so a session is terminal-only exactly as
+/// before the feature existed.
+pub const DEFAULT_WEB_PORT: i64 = 0;
 
 /// `-no-proxy` / `JONNYQ_NO_PROXY`: the bypass list of an explicitly
 /// configured SOCKS proxy (see [`crate::net::DEFAULT_NO_PROXY`]).
@@ -102,6 +106,8 @@ Flags:
                                 default localhost,127.0.0.1,::1)
   -tool-mode native|prompt      tool-calling mode (default native)
   -skill-path <paths>           semicolon-separated skill directories
+  -web <port>                   serve the web console on http://127.0.0.1:<port>
+                                (0 = no web interface, the default)
   -thinking=true|false          enable model thinking (default true)
   -env-file <path|off>          dotenv file to read settings from (default .env
                                 in the working directory; off/none/no disables it)
@@ -295,6 +301,10 @@ pub struct Config {
 
     pub skill_paths: Vec<String>,
 
+    /// `-web` / `JONNYQ_WEB_PORT`: port of the browser console, bound to
+    /// 127.0.0.1. Zero means no web interface at all.
+    pub web_port: i64,
+
     pub thinking: bool,
 
     /// Where each setting's final value came from, keyed by the `JONNYQ_*`
@@ -352,6 +362,7 @@ impl Default for Config {
             no_proxy: DEFAULT_NO_PROXY.into(),
             tool_call_mode: DEFAULT_TOOL_CALL_MODE.into(),
             skill_paths: Vec::new(),
+            web_port: DEFAULT_WEB_PORT,
             thinking: DEFAULT_THINKING,
             sources: std::collections::HashMap::new(),
             env_file: String::new(),
@@ -674,6 +685,13 @@ impl Config {
                 false,
             ),
             (
+                "web",
+                "WEB_PORT",
+                self.web_port.to_string(),
+                self.src("WEB_PORT"),
+                false,
+            ),
+            (
                 "env-file",
                 "ENV_FILE",
                 self.env_file.clone(),
@@ -753,6 +771,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "no-proxy",
     "tool-mode",
     "skill-path",
+    "web",
     "thinking",
     "env-file",
 ];
@@ -1077,6 +1096,9 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     sources.insert("THINKING".to_string(), src);
     c.thinking = b;
 
+    let (n, src) = r.int("web", "WEB_PORT", DEFAULT_WEB_PORT);
+    sources.insert("WEB_PORT".to_string(), src);
+    c.web_port = n.clamp(0, 65_535);
     let (skill_path_str, src) = r.string("skill-path", "SKILL_PATH", "");
     sources.insert("SKILL_PATH".to_string(), src);
     if !skill_path_str.is_empty() {
@@ -1808,6 +1830,7 @@ mod tests {
             "no-proxy JONNYQ_NO_PROXY",
             "tool-mode JONNYQ_TOOL_MODE",
             "skill-path JONNYQ_SKILL_PATH",
+            "web JONNYQ_WEB_PORT",
             "env-file JONNYQ_ENV_FILE",
         ];
         assert_eq!(got, want, "settings() drifted from the documented table");

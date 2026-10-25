@@ -27,6 +27,7 @@ use crate::notify::Notifier;
 use crate::tools::run_command::RunCommandTool;
 use crate::ui::Writer;
 use crate::watch::{Trigger, Watcher};
+use crate::web::WebConsole;
 
 pub const HELP_TEXT: &str = r#"Slash commands:
   /?  /help                         show this help
@@ -128,6 +129,13 @@ pub struct Repl {
     /// The multi-line prompt in progress (trailing `\`, or an open `"""`
     /// block), so a wake can interrupt a prompt without losing it.
     draft: Mutex<Draft>,
+
+    /// The browser console, when the session was started with `-web`. The loop
+    /// owns it the same way it owns the watcher: it drains the console's prompt
+    /// queue between turns and tells it when it is waiting, so a prompt typed
+    /// in a browser is just another input to the one loop rather than a second
+    /// path that could run a turn concurrently with a typed one.
+    web: Mutex<Option<Arc<WebConsole>>>,
 }
 
 impl Repl {
@@ -152,7 +160,46 @@ impl Repl {
             history: Arc::new(Mutex::new(History::new(history_size))),
             wake: Wake::new(),
             draft: Mutex::new(Draft::default()),
+            web: Mutex::new(None),
         }
+    }
+
+    /// Wires the browser console in ([`crate::web`], `-web <port>`). Gives it
+    /// the wake flag so a browser prompt interrupts a parked terminal prompt,
+    /// and takes over announcing readiness to it.
+    pub async fn set_web(&self, web: Arc<WebConsole>) {
+        web.set_wake(self.wake.clone());
+        *self.web.lock().await = Some(web);
+    }
+
+    /// Pushes the console's state: whether a prompt can be typed right now, and
+    /// the session line the page shows. A no-op when there is no console.
+    pub async fn web_status(&self, waiting: bool, note: &str) {
+        if let Some(web) = self.web.lock().await.as_ref() {
+            web.set_waiting(waiting, note);
+        }
+    }
+
+    /// One iteration's worth of the console's prompt queue, non-blocking: the
+    /// loop drains it at the same points it drains `/watchfile` triggers, so a
+    /// browser prompt never preempts a turn in flight.
+    async fn take_web_prompt(&self) -> Option<String> {
+        let web = self.web.lock().await;
+        let web = web.as_ref()?;
+        web.take_prompt_now()
+    }
+
+    /// Waits for a browser prompt. Only reached once stdin has closed, which is
+    /// when the console is the only way left to talk to the session.
+    async fn wait_web_prompt(&self) -> Option<String> {
+        let web = self.web.lock().await;
+        let web = web.as_ref()?;
+        web.next_prompt().await
+    }
+
+    /// The console, if this session has one.
+    async fn web(&self) -> Option<Arc<WebConsole>> {
+        self.web.lock().await.clone()
     }
 
     /// Reads prompts from stdin until `/exit` or EOF (Ctrl-D). Ctrl-C cancels
@@ -189,6 +236,7 @@ impl Repl {
             }
         });
 
+        let mut headless = false;
         loop {
             let model = self.cfg.lock().await.model.clone();
             if model.is_empty() {
@@ -196,6 +244,9 @@ impl Repl {
                     "model is not set; use /model <name> (only slash commands are accepted until then)",
                 );
             }
+            // Waiting for a prompt, with the model as the console knows it:
+            // the browser textarea is enabled only while this holds.
+            self.web_status(!model.is_empty(), "jonnyq is waiting for a prompt").await;
 
             // A trigger is drained here, never by cancelling the prompt.
             //
@@ -211,6 +262,33 @@ impl Repl {
                 self.handle_trigger(&model, t).await;
             }
 
+            // Browser prompts are drained at the same point, for the same
+            // reason: they nudge the prompt rather than preempt it.
+            while let Some(text) = self.take_web_prompt().await {
+                if self.run_web_prompt(&model, &text).await {
+                    return self.finish(Ok(())).await;
+                }
+            }
+
+            // A session with no terminal left reads only the browser, and
+            // waits on it rather than spinning: there is nothing to prompt.
+            if headless {
+                let text = match self.wait_web_prompt().await {
+                    Some(text) => text,
+                    // The console went away with no REPL of its own; nothing
+                    // can ask anything of the session now.
+                    None => return self.finish(Ok(())).await,
+                };
+                // Run it the same way the drain above does, rather than falling
+                // through to the typed-prompt path below: that one assumes the
+                // terminal already echoed what was typed (a person pressed the
+                // keys), and with no terminal the console would show an answer
+                // with no question above it.
+                if self.run_web_prompt(&model, &text).await {
+                    return self.finish(Ok(())).await;
+                }
+                continue;
+            }
             let typed = match self.prompt().await {
                 // Ctrl-C: the editor already drew the `^C` and cleared the line,
                 // and the draft is already reset. Prompt again.
@@ -218,8 +296,19 @@ impl Repl {
                 // Ctrl-D, or stdin closed.
                 input::Prompt::Eof => {
                     self.ui.plainln("");
-                    self.stop_watcher().await;
-                    return Ok(());
+                    // With a browser console open there is still somebody to
+                    // talk to: keep serving prompts from there instead of
+                    // exiting, which is the point of a headless `-web`.
+                    if self.web().await.is_some() {
+                        if !headless {
+                            headless = true;
+                            self.ui.plainln(
+                                "[web] stdin closed; prompts now come from the browser console",
+                            );
+                        }
+                        continue;
+                    }
+                    return self.finish(Ok(())).await;
                 }
                 // A trigger arrived while the line was being typed. The draft
                 // kept the unfinished text, so all that is left is to loop round
@@ -247,8 +336,7 @@ impl Repl {
                     .run_cancellable(move |ctx| async move { self.handle_slash(ctx, &line).await })
                     .await;
                 if exit {
-                    self.stop_watcher().await;
-                    return Ok(());
+                    return self.finish(Ok(())).await;
                 }
                 continue;
             }
@@ -344,6 +432,40 @@ so it doesn't fire again.",
         .await;
     }
 
+    /// Runs one prompt typed in the browser console.
+    ///
+    /// Identical in effect to typing the same line at the `> ` prompt - slash
+    /// command or model turn - and it runs here, on the loop's own task, so the
+    /// loop is never handling two turns at once. The prompt is echoed through
+    /// the writer, which is what makes it appear in the console and in the
+    /// transcript log: nothing else echoes text nobody typed on a keyboard.
+    /// Returns the slash command's exit flag (true when `/exit` was typed).
+    async fn run_web_prompt(&self, model: &str, text: &str) -> bool {
+        let line = text.trim().to_string();
+        if line.is_empty() {
+            return false;
+        }
+        self.ui.blank_line();
+        self.ui.user_prompt(&line);
+        self.remember(&line).await;
+        if line.starts_with('/') {
+            // `/exit` in a browser tab ends the session: the flag travels back
+            // to the loop, which shuts the console down on its way out.
+            return self
+                .run_cancellable(move |ctx| async move { self.handle_slash(ctx, &line).await })
+                .await;
+        }
+        if model.is_empty() {
+            self.ui.plainln("no model set; type /model <name> first");
+            return false;
+        }
+        self.run_cancellable(move |ctx| async move {
+            (false, self.agent.run_turn(ctx, &line).await)
+        })
+        .await;
+        false
+    }
+
     /// Runs `f` under a fresh cancellable turn token (wired to Ctrl-C),
     /// reports `[cancelled]` or the returned error afterward, and returns
     /// f's exit flag (only meaningful for slash commands; plain turns and
@@ -355,12 +477,20 @@ so it doesn't fire again.",
     {
         let token = CancellationToken::new();
         *self.turn.lock().await = Some(token.clone());
+        // The browser textarea freezes for the duration of a turn: a second
+        // prompt has nowhere to go while one is in flight.
+        if let Some(web) = self.web().await {
+            web.set_busy(true);
+        }
 
         let (exit, err) = f(token.clone()).await;
         let was_cancelled = token.is_cancelled();
 
         *self.turn.lock().await = None;
         token.cancel();
+        if let Some(web) = self.web().await {
+            web.set_busy(false);
+        }
 
         if let Err(e) = err {
             if was_cancelled {
@@ -403,6 +533,17 @@ so it doesn't fire again.",
         if let Some(w) = self.watcher.lock().await.take() {
             w.stop();
         }
+    }
+
+    /// Ends the session: stops the watcher and tells any browser console that
+    /// this session is over, so an open tab says so instead of spinning on a
+    /// socket nobody will answer again. Every exit path goes through here.
+    async fn finish<T>(&self, result: R<T>) -> R<T> {
+        self.stop_watcher().await;
+        if let Some(web) = self.web().await {
+            web.begin_shutdown();
+        }
+        result
     }
 
     /// The `> ` prompt shown before each read, e.g.
@@ -1161,6 +1302,32 @@ mod tests {
             t.repl.watcher.lock().await.is_none(),
             "expected watcher stopped by 'off'"
         );
+    }
+
+    /// A browser prompt has to be echoed into the transcript by the REPL,
+    /// because in a headless `-web` session nothing else ever draws it: the
+    /// terminal echo a typed prompt gets does not exist, so without this the
+    /// console would show an answer with no question above it.
+    #[tokio::test]
+    async fn a_web_prompt_is_echoed_without_a_terminal() {
+        let t = new_test_repl().await;
+        let log = crate::testsupport::TestLog::new("repl-web");
+        let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
+        // The console only needs to exist for this: bind an OS-chosen port and
+        // never start accepting.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let web = crate::web::WebConsole::bind(port, ".", ui, Arc::new(String::new)).unwrap();
+        t.repl.set_web(web).await;
+
+        // A slash command, so no model turn is needed: what is being checked is
+        // what the prompt path prints, not what the agent answers.
+        assert!(!t.repl.run_web_prompt("test-model", "/model other-model").await);
+        // The echo lands in the transcript the web console mirrors (the REPL's
+        // writer), which is what `t.log_contents()` reads.
+        let echoed = t.log_contents();
+        assert!(echoed.contains("/model other-model"), "prompt was not echoed: {echoed:?}");
+        assert_eq!(t.repl.cfg.lock().await.model, "other-model");
+        assert!(!t.repl.run_web_prompt("test-model", "   ").await, "blank prompt is dropped");
     }
 
     #[tokio::test]
