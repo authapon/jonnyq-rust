@@ -55,6 +55,10 @@ fn parse_event(line: &str) -> Option<NtfyMessage> {
 
 pub struct Notifier {
     url: String,
+    /// Looked up from [`crate::net`] (which caches one client per timeout
+    /// profile and applies the session's proxy settings), rather than built
+    /// per Notifier: a Notifier is created fresh for every notification, and
+    /// `/proxy` must be able to switch the transport under a live session.
     client: reqwest::Client,
     /// A client with **no request timeout**, for [`Notifier::stream_messages`]:
     /// a subscription is long-lived by design, so the 10 s budget that keeps a
@@ -75,16 +79,11 @@ impl Notifier {
     /// valid, disabled notifier: `send` is then a no-op, so callers don't
     /// need to check `enabled` before calling it.
     pub fn new(url: &str) -> Self {
+        let secs = std::time::Duration::from_secs(10);
         Self {
             url: url.trim().to_string(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
-            stream_client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            client: crate::net::client(Some(secs), None),
+            stream_client: crate::net::client(None, Some(secs)),
         }
     }
 

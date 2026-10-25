@@ -72,7 +72,6 @@ impl StreamTimer {
 pub struct OpenAiProvider {
     base_url: String,
     key: String,
-    http: reqwest::Client,
 }
 
 fn trim_base(url: &str) -> String {
@@ -81,15 +80,14 @@ fn trim_base(url: &str) -> String {
 
 impl OpenAiProvider {
     pub fn new(base_url: &str, key: &str) -> Self {
-        Self {
-            base_url: trim_base(base_url),
-            key: key.to_string(),
-            http: reqwest::Client::new(),
-        }
+        Self { base_url: trim_base(base_url), key: key.to_string() }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.request(method, format!("{}{}", self.base_url, path));
+        // Per-request lookup so a proxy change applies to the next call (see
+        // ollama.rs); the pooled client makes this as cheap as a field read.
+        let http = crate::net::client(None, None);
+        let mut req = http.request(method, format!("{}{}", self.base_url, path));
         req = req.header("Content-Type", "application/json");
         if !self.key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.key));

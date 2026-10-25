@@ -6,6 +6,7 @@
 //! - [`config`]  — flag + `JONNYQ_*` env + `.env` file parsing
 //!   ([`config::dotenv`]) with `flag > env > file > default` precedence
 //! - [`llm`]     — provider interface + `ollama.rs`, `openai.rs`
+//! - [`net`]     — the shared outbound HTTP clients + the SOCKS proxy setting
 //! - [`tools`]   — read_file, write_file, edit_file, create_folder,
 //!                 web_search, web_fetch, read_pdf, read_pic, run_command,
 //!                 read_skill, ask_user
@@ -24,6 +25,7 @@ pub mod config;
 pub mod error;
 pub mod input;
 pub mod llm;
+pub mod net;
 pub mod notify;
 pub mod repl;
 pub mod skill;

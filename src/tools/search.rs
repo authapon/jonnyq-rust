@@ -23,7 +23,6 @@ pub struct SearxngTool {
     base_url: std::sync::Mutex<String>,
     max_results: AtomicI64,
     timeout_sec: AtomicI64,
-    http: reqwest::Client,
     /// Bounds concurrent searxng requests process-wide (Go: a buffered
     /// channel semaphore).
     sem: ResizeableLimiter,
@@ -35,7 +34,6 @@ impl SearxngTool {
             base_url: std::sync::Mutex::new(normalize_base_url(base_url)),
             max_results: AtomicI64::new(max_results),
             timeout_sec: AtomicI64::new(timeout_sec),
-            http: reqwest::Client::new(),
             sem: ResizeableLimiter::new(concurrency),
         }
     }
@@ -115,7 +113,8 @@ impl Tool for SearxngTool {
             percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC)
         );
 
-        let send = self.http.get(&url).send();
+        // Client looked up per call so a `/proxy` change reaches the next search.
+        let send = crate::net::client(None, None).get(&url).send();
         let resp = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(self.timeout_sec().max(0) as u64), send) => {
                 match r {

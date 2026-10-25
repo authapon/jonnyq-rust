@@ -47,6 +47,8 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /autocoding                       plan if needed, then work through every task in .progress in one run (Ctrl-C cancels)
   /watchfile [<word>|off]           watch the working directory for a magic word (default "AI!") and act on it when found
   /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: /plan and /coding completion notifications (incl. the /plan_for_human verification guide), error alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
+  /proxy [<socks url>|off|auto]     use a SOCKS proxy for every request (model, web_search, web_fetch, ntfy): /proxy socks5h://host:port or /proxy host:port; off = always direct, auto = follow ALL_PROXY/HTTPS_PROXY; no arg shows what is in effect
+  /proxy no-proxy <hosts>           hosts that bypass the proxy (comma-separated; default localhost,127.0.0.1,::1)
   /toolmode [native|prompt]         switch how tools are called: native tool-calling (default) or a plain-text fenced JSON block for models with unreliable native tool-calling
   /env [path|off]                   show the dotenv file settings come from; a path (or off) also reloads it
   /env list                         every setting, its value in effect and which layer supplied it
@@ -456,6 +458,8 @@ so it doesn't fire again.",
 
             "/ntfy" => self.toggle_ntfy(&rest).await,
 
+            "/proxy" => self.set_proxy(&rest).await,
+
             "/toolmode" => self.set_tool_mode(&rest).await,
 
             "/env" => self.cmd_env(&rest).await,
@@ -576,6 +580,80 @@ so it doesn't fire again.",
         cfg.ntfy_url = arg.clone();
         self.agent.tools.configure(&cfg);
         self.ui.plainln(&format!("[ntfy] notifications enabled: {arg}"));
+    }
+
+    /// `/proxy`: report or change the SOCKS proxy of a running session.
+    ///
+    /// * bare - what is in effect right now
+    /// * `off` / `none` / `no` - always connect directly
+    /// * `auto` / `system` / `env` - forget jonnyq's opinion and follow
+    ///   `ALL_PROXY`/`HTTPS_PROXY`/`NO_PROXY` again
+    /// * `socks5h://host:port` (or `socks5`/`socks4a`/`socks4`/`host:port`) -
+    ///   route the model, `web_search`, `web_fetch` and ntfy through it
+    /// * `no-proxy <hosts>` - replace the bypass list (`/proxy no-proxy ""`
+    ///   tunnels everything, loopback included)
+    ///
+    /// The value is validated first, then pushed into [`crate::net`], which
+    /// drops every cached client - the next request (a chat call included, no
+    /// provider rebuild needed) goes out through the new transport. On failure
+    /// nothing changes, which matters because the setting governs the very
+    /// channel the session is talking over.
+    async fn set_proxy(&self, arg: &str) {
+        let arg = arg.trim().to_string();
+
+        // `/proxy no-proxy <hosts>`: only the bypass list changes.
+        if let Some(hosts) = arg
+            .strip_prefix("no-proxy")
+            .or_else(|| arg.strip_prefix("noproxy"))
+            .map(str::trim)
+        {
+            let mut cfg = self.cfg.lock().await;
+            let mut candidate = cfg.clone();
+            candidate.no_proxy = hosts.to_string();
+            let proxy = candidate.proxy_config_or_default();
+            if let Err(e) = crate::net::set_current(proxy.clone()) {
+                self.ui.plainln(&format!("error: {}", e.message));
+                return;
+            }
+            cfg.no_proxy = candidate.no_proxy.clone();
+            let hosts = if hosts.is_empty() { "(none - everything is tunnelled)" } else { hosts };
+            self.ui.plainln(&format!("[proxy] no-proxy list set to {hosts}"));
+            self.ui.plainln(&format!("[proxy] {}", proxy.describe()));
+            return;
+        }
+
+        if arg.is_empty() {
+            let cfg = self.cfg.lock().await;
+            self.ui.plainln(&format!("[proxy] {}", cfg.proxy_config_or_default().describe()));
+            self.ui.plainln(
+                "[proxy] usage: /proxy <socks5h://host:port|host:port|off|auto> · \
+                 /proxy no-proxy <hosts>",
+            );
+            return;
+        }
+
+        let mut cfg = self.cfg.lock().await;
+        // Validate against a copy: a rejected value must leave both the config
+        // and the live transport exactly as they were.
+        let mut candidate = cfg.clone();
+        if let Err(e) = candidate.set_socks_proxy(&arg) {
+            self.ui.plainln(&format!("error: {}", e.message));
+            self.ui.plainln("[proxy] usage: /proxy <socks5h://host:port|host:port|off|auto>");
+            return;
+        }
+        let proxy = match candidate.proxy_config() {
+            Ok(p) => p,
+            Err(e) => {
+                self.ui.plainln(&format!("error: {}", e.message));
+                return;
+            }
+        };
+        if let Err(e) = crate::net::set_current(proxy.clone()) {
+            self.ui.plainln(&format!("error: {}", e.message));
+            return;
+        }
+        cfg.socks_proxy = candidate.socks_proxy.clone();
+        self.ui.plainln(&format!("[proxy] {}", proxy.describe()));
     }
 
     /// `/toolmode`: bare shows the current mode, `native` or `prompt`
@@ -716,6 +794,28 @@ so it doesn't fire again.",
         };
         if provider_changed || key_changed {
             if let Err(e) = self.rebuild_provider(&new_cfg) {
+                self.ui.plainln(&format!("error: {}", e.message));
+                return;
+            }
+        }
+
+        // The transport is installed only when the setting actually changed:
+        // every client (provider, web tools, ntfy) is looked up from
+        // crate::net, so this is what makes a changed `socks-proxy` reach a
+        // session without rebuilding anything - and leaving it alone when
+        // nothing changed means a reload cannot disturb a proxy set by
+        // `/proxy` earlier in the session. A value that cannot be applied
+        // aborts the reload, keeping the settings that work.
+        let old_proxy = self.cfg.lock().await.proxy_config_or_default();
+        let new_proxy = match new_cfg.proxy_config() {
+            Ok(p) => p,
+            Err(e) => {
+                self.ui.plainln(&format!("error: {}", e.message));
+                return;
+            }
+        };
+        if old_proxy != new_proxy {
+            if let Err(e) = crate::net::set_current(new_proxy) {
                 self.ui.plainln(&format!("error: {}", e.message));
                 return;
             }
@@ -905,6 +1005,120 @@ mod tests {
         assert_eq!(t.repl.cfg.lock().await.ntfy_url, "https://ntfy.sh/my-topic");
     }
 
+    // --- /proxy ------------------------------------------------------------
+    //
+    // Two hazards shape these tests: the transport is process-wide state that
+    // tests running in parallel share, and other tests talk to stub servers on
+    // loopback. So the proxy tests take one lock between themselves, and every
+    // URL installed here is a loopback SOCKS stub - the default `no_proxy` list
+    // keeps loopback direct, so no other test's traffic is ever rerouted.
+
+    static PROXY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialises the `/proxy` tests and puts the shared transport back to "no
+    /// opinion" afterwards.
+    struct ProxyReset(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl ProxyReset {
+        fn new() -> Self {
+            let g = PROXY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::net::set_current(crate::net::ProxyConfig::system()).unwrap();
+            Self(g)
+        }
+    }
+    impl Drop for ProxyReset {
+        fn drop(&mut self) {
+            crate::net::set_current(crate::net::ProxyConfig::system()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_bare_reports_and_changes_nothing() {
+        let _p = ProxyReset::new();
+        let t = new_test_repl().await;
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy").await;
+        assert!(res.is_ok());
+        assert_eq!(t.repl.cfg.lock().await.socks_proxy, "");
+        let log = t.log_contents();
+        assert!(log.contains("[proxy] not set"), "{log}");
+        assert!(log.contains("/proxy no-proxy <hosts>"), "usage hint missing: {log}");
+    }
+
+    #[tokio::test]
+    async fn proxy_off_and_auto_move_config_and_transport_together() {
+        let _p = ProxyReset::new();
+        let t = new_test_repl().await;
+
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy off").await;
+        assert!(res.is_ok());
+        assert_eq!(t.repl.cfg.lock().await.socks_proxy, "off");
+        assert_eq!(
+            crate::net::current().mode,
+            crate::net::ProxyMode::Direct,
+            "the live transport must follow the command"
+        );
+        assert!(t.log_contents().contains("[proxy] off (direct connections)"));
+
+        // auto gives the decision back to the environment.
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy auto").await;
+        assert!(res.is_ok());
+        assert_eq!(t.repl.cfg.lock().await.socks_proxy, "");
+        assert_eq!(crate::net::current().mode, crate::net::ProxyMode::System);
+    }
+
+    #[tokio::test]
+    async fn proxy_normalizes_a_bare_host_port_and_installs_it() {
+        let _p = ProxyReset::new();
+        let t = new_test_repl().await;
+        let socks = crate::testsupport::SocksProxy::start().await;
+        let hostport = socks.url.strip_prefix("socks5h://").unwrap();
+
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), &format!("/proxy {hostport}")).await;
+        assert!(res.is_ok());
+        assert_eq!(
+            t.repl.cfg.lock().await.socks_proxy,
+            format!("socks5h://{hostport}"),
+            "a bare host:port means socks5h"
+        );
+        assert_eq!(crate::net::current().url(), format!("socks5h://{hostport}"));
+        // Reported with the bypass list it will honour.
+        assert!(t.log_contents().contains(&format!("socks5h://{hostport} (direct for: localhost")));
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_a_bad_value_without_changing_the_session() {
+        let _p = ProxyReset::new();
+        let t = new_test_repl().await;
+        t.repl.handle_slash(CancellationToken::new(), "/proxy off").await.1.unwrap();
+
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy http://proxy:3128").await;
+        assert!(res.is_ok(), "the command reports its own error");
+        assert_eq!(t.repl.cfg.lock().await.socks_proxy, "off", "config untouched");
+        assert_eq!(crate::net::current().mode, crate::net::ProxyMode::Direct, "transport untouched");
+        assert!(t.log_contents().contains("not a SOCKS proxy"), "{}", t.log_contents());
+    }
+
+    #[tokio::test]
+    async fn proxy_no_proxy_edits_only_the_bypass_list() {
+        let _p = ProxyReset::new();
+        let t = new_test_repl().await;
+        let socks = crate::testsupport::SocksProxy::start().await;
+        let hostport = socks.url.strip_prefix("socks5h://").unwrap();
+        t.repl.handle_slash(CancellationToken::new(), &format!("/proxy {hostport}")).await.1.unwrap();
+
+        t.repl.handle_slash(CancellationToken::new(), "/proxy no-proxy intranet,127.0.0.1").await.1.unwrap();
+        let cfg = t.repl.cfg.lock().await;
+        assert_eq!(cfg.no_proxy, "intranet,127.0.0.1");
+        assert_eq!(cfg.socks_proxy, format!("socks5h://{hostport}"), "the proxy itself is untouched");
+        drop(cfg);
+        assert!(t.log_contents().contains("no-proxy list set to intranet,127.0.0.1"));
+        assert_eq!(
+            t.repl.cfg.lock().await.proxy_config_or_default().describe(),
+            format!("socks5h://{hostport} (direct for: intranet,127.0.0.1)")
+        );
+        // The change reached the live transport, not just the config.
+        assert_eq!(crate::net::current().no_proxy, "intranet,127.0.0.1");
+    }
+
     #[tokio::test]
     async fn set_tool_mode_defaults_to_native() {
         let t = new_test_repl().await;
@@ -1028,6 +1242,55 @@ mod tests {
         assert_eq!(t.repl.agent.skill_paths(), vec!["/x/skills".to_string()]);
         assert_eq!(t.repl.run_command.timeout_sec(), 7);
         assert!(t.log_contents().contains("[env] reloaded"), "got: {}", t.log_contents());
+    }
+
+    /// A reload that switches the SOCKS proxy must move the live transport -
+    /// every client (provider, web tools, ntfy) is looked up from
+    /// [`crate::net`], so nothing else has to be rebuilt for it to take hold.
+    #[tokio::test]
+    async fn env_reload_applies_the_proxy_settings() {
+        let _p = ProxyReset::new();
+        let _env = crate::testsupport::clean_env();
+        let mut t = new_test_repl().await;
+        let log_path = t._log.file.clone();
+        t.repl.cfg.lock().await.startup_args = vec!["-output".to_string(), log_path.clone()];
+        let dir = crate::testsupport::TempDir::new("env-proxy");
+        let file = dir.path().join("p.env");
+        // The bypass list keeps loopback direct on purpose: the transport is
+        // process-wide and tests run in parallel, and every other test talks to
+        // a stub server on loopback - without this they would be rerouted to
+        // this (unlistened) proxy port and fail at random.
+        std::fs::write(
+            &file,
+            "JONNYQ_SOCKS_PROXY=127.0.0.1:1080\nJONNYQ_NO_PROXY=localhost,127.0.0.1,::1,internal.example\n",
+        )
+        .unwrap();
+
+        let arg = format!("/env reload {}", file.to_string_lossy());
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), &arg).await;
+        res.unwrap_or_else(|e| panic!("reload failed: {e}"));
+
+        let cfg = t.repl.cfg.lock().await;
+        assert_eq!(cfg.socks_proxy, "socks5h://127.0.0.1:1080");
+        assert!(cfg.no_proxy.ends_with("internal.example"), "{}", cfg.no_proxy);
+        drop(cfg);
+        // The transport the next request will use, not just the stored value.
+        let live = crate::net::current();
+        assert_eq!(live.url(), "socks5h://127.0.0.1:1080");
+        assert!(live.no_proxy.contains("internal.example"), "{}", live.no_proxy);
+
+        // A file whose proxy value is invalid fails the reload and leaves the
+        // working transport untouched.
+        let bad = dir.path().join("bad.env");
+        std::fs::write(&bad, "JONNYQ_SOCKS_PROXY=http://proxy:3128\n").unwrap();
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), &format!("/env reload {}", bad.to_string_lossy()))
+            .await;
+        res.unwrap();
+        assert_eq!(crate::net::current().url(), "socks5h://127.0.0.1:1080");
+        assert!(t.log_contents().contains("not a SOCKS proxy"), "{}", t.log_contents());
+        t._env_file = Some(dir);
     }
 
     /// A reload that cannot work must leave a usable session behind.

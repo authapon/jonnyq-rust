@@ -46,6 +46,7 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 ### ตัว REPL และ provider
 
 - **ตั้งค่าได้ 3 ทาง** — CLI flag, ไฟล์ **`.env`** และ environment variable `JONNYQ_*` (โหลด `.env` อัตโนมัติ ไม่ต้อง source/export) ตามลำดับ precedence `flag > .env > env > default`; พิมพ์ `/env list` เพื่อดูว่าแต่ละค่ามาจากชั้นไหน และ `/env reload` เพื่อแก้ไฟล์แล้วใช้ค่าใหม่ได้ทันทีโดยไม่ต้อง restart
+- **SOCKS proxy ได้ 4 ทาง** — `-socks-proxy` / `JONNYQ_SOCKS_PROXY` / `.env` / `/proxy` มีผลกับทุก request พร้อมกัน (model, `web_search`, `web_fetch`, ntfy) และ **สลับได้กลาง session** — ดู [หัวข้อ 5.2](#52-socks-proxy)
 - **REPL loop** รับ prompt ต่อเนื่องจนกว่าจะสั่ง `/exit` / `/bye` หรือกด Ctrl-D — กด **Ctrl-C เพื่อยกเลิกรอบที่ทำงานอยู่ได้โดยไม่ปิดโปรแกรม**
 - รองรับ 2 provider:
   - `ollama` — native `/api/chat` (NDJSON streaming) ได้ **metric เวลาจริงจาก server** (load / prompt_eval / generate) พร้อมส่ง `think: true|false` และ `options.num_ctx` ตามการตั้งค่า
@@ -261,6 +262,8 @@ jonnyq **โหลดไฟล์ `.env` ให้เอง** ตั้งแต
 | `-watch-magic-word` | `JONNYQ_WATCH_MAGIC_WORD` | `AI!` | magic word ที่ `/watchfile` ใช้ค้นหา |
 | `-watch-poll-interval-sec` | `JONNYQ_WATCH_POLL_INTERVAL_SEC` | `1` | ความถี่ poll ของ `/watchfile` (วินาที, ขั้นต่ำ 1) |
 | `-ntfy-url` | `JONNYQ_NTFY_URL` | (ว่าง — ปิดการแจ้งเตือน) | ntfy topic URL เต็ม ๆ เช่น `https://ntfy.sh/my-topic` — ใช้ทั้งส่ง notification และ**รับคำตอบของ `ask_user`** จากมือถือ |
+| `-socks-proxy` | `JONNYQ_SOCKS_PROXY` | (ว่าง — ไปอ่าน `ALL_PROXY`/`HTTPS_PROXY` เอง) | SOCKS proxy ของ **ทุก request** (model, `web_search`, `web_fetch`, ntfy): `socks5h://host:port`, `socks5`, `socks4a`, `socks4` หรือ `host:port` (= `socks5h`) · `off` = เชื่อมตรง · `auto` = กลับไปเชื่อ env — ดู [หัวข้อ 5.2](#52-socks-proxy) |
+| `-no-proxy` | `JONNYQ_NO_PROXY` | `localhost,127.0.0.1,::1` | host/domain/CIDR ที่ข้าม proxy (คั่นด้วย `,`) — มีผลเฉพาะตอนตั้ง `-socks-proxy` จริง |
 | `-tool-mode` | `JONNYQ_TOOL_MODE` | `native` | `native` หรือ `prompt` (case-insensitive; ค่าอื่น → error ตอนเริ่ม) |
 | `-skill-path` | `JONNYQ_SKILL_PATH` | (ว่าง) | ไดเรกทอรีของ skill **คั่นด้วย `;`** ได้หลายอัน |
 | `-thinking=true\|false` | `JONNYQ_THINKING` | `true` | เปิด/ปิด model thinking (มีผลกับ Ollama — ดูหมายเหตุด้านล่าง) |
@@ -354,6 +357,59 @@ set -a; . ./.env; set +a; jonnyq
 
 > **หมายเหตุ `-thinking`** — ค่านี้ถูกส่งเฉพาะ Ollama (`{"think": true|false}`) ส่วน provider `openai` jonnyq ไม่ส่ง flag ใดๆ — เพียงแค่แสดงผล field `reasoning_content` (ถ้า endpoint ส่งมา) เป็น section Thinking ให้
 
+### 5.2 SOCKS proxy
+
+jonnyq ทุก request ที่ออกเน็ต — call เข้า model (`ollama` / `openai`), `web_search`, `web_fetch` และ ntfy (ทั้งขา push notification และขา subscribe รับคำตอบ `ask_user`) — วิ่งผ่าน client ตัวกลางใน `src/net.rs` ตัวเดียว การตั้ง proxy จึงมีผลกับ **ทั้งหมดพร้อมกัน** รวมทั้งที่มีผลทันทีระหว่าง session กำลังรันอยู่ (client ถูกดึงจาก cache ใหม่ทุก request และ cache ถูกทิ้งทั้งก้อนเมื่อ proxy เปลี่ยน — ไม่ต้อง rebuild provider/tools/notifier)
+
+| ค่าที่ใส่ | ความหมาย |
+|---|---|
+| (ว่าง — default) | jonnyq ไม่มีความเห็น → reqwest ไปอ่าน `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` ที่ export ไว้เอง |
+| `off` / `none` / `no` | **เชื่อมตรงทุกครั้ง** — ชนะ `ALL_PROXY` ที่ export ไว้ (ใช้ตอน proxy ใน shell กำลังพัง) |
+| `auto` / `system` / `env` / `default` | คืนอำนาจให้ environment variable มาตรฐาน (ย้อน `off`) |
+| `socks5h://host:port` | SOCKS5 โดยให้ **proxy เป็นคน resolve hostname** — DNS ไม่รั่วออกนอก network ที่คุณอยู่ และปลายทางถูกซ่อน (แนะนำ) |
+| `socks5://host:port` | SOCKS5 แต่ resolve ชื่อเองก่อนส่งเข้า tunnel |
+| `socks4a://` / `socks4://` | SOCKS4 ก็รับ (SOCKS4 ไม่รองรับ IPv6) |
+| `host:port` | ย่อจาก `socks5h://host:port` |
+
+ค่าอื่นที่ไม่ใช่ SOCKS (เช่น `http://proxy:3128`) → **config error ตั้งแต่เริ่ม** พร้อมข้อความบอกชัดว่าต้องเป็นรูปไหน (proxy แบบ HTTP เป็นคนละ feature) รวมถึงเคส host กลวง, `socks5://local host:1080` (มี space), port เกิน 65535 — ดีกว่าปล่อยให้เป็น connection fail ลึกลับตอน call model ครั้งแรก
+
+credential ใส่ใน URL ได้ (`socks5h://user:pass@host:1080`) และ **ถูก mask เป็น `user:***` ในทุกสิ่งที่ jonnyq พิมพ์ออกจอ/เขียนลง log** รวมทั้งคอลัมน์ value ของ `/env list`
+
+#### ตั้งผ่าน 4 ทาง
+
+```bash
+# 1) CLI flag — ชนะทุกชั้น
+jonnyq -socks-proxy socks5h://proxy.example:1080 -no-proxy intranet,10.0.0.0/8
+jonnyq -socks-proxy 127.0.0.1:1080          # เท่ากับ socks5h://127.0.0.1:1080
+jonnyq -socks-proxy off                     # ปิดแบบเจาะจง แม้นักพัฒนาเครื่องจะ export ALL_PROXY ไว้
+
+# 2) ไฟล์ .env (คีย์เดียวกันกับ env var — layer ไฟล์ชนะ env var เหมือน setting อื่น)
+#    JONNYQ_SOCKS_PROXY=socks5h://user:pass@proxy.example:1080
+#    JONNYQ_NO_PROXY=intranet,10.0.0.0/8
+jonnyq
+
+# 3) environment variable
+JONNYQ_SOCKS_PROXY=socks5h://127.0.0.1:1080 JONNYQ_NO_PROXY= jonnyq
+
+# 4) slash command ระหว่างรัน — มีผลกับ request ถัดไปทันที
+> /proxy socks5h://proxy.example:1080   # เปลี่ยน proxy
+> /proxy 127.0.0.1:1080                 # shorthand (ค่าถูก normalize เก็บใน config)
+> /proxy off                            # ตรงกลับเป็นเชื่อมตรง
+> /proxy auto                           # กลับไปเชื่อ ALL_PROXY/HTTPS_PROXY
+> /proxy no-proxy intranet,10.0.0.0/8   # แก้เฉพาะ bypass list
+> /proxy                                # ดูว่าอะไรกำลังใช้อยู่ (key ถูก mask)
+```
+
+#### `-no-proxy` (bypass list)
+
+default คือ `localhost,127.0.0.1,::1` เพราะ provider ที่เจอบ่อยที่สุดคือ model server บนเครื่องเดียวกัน (`ollama:http://localhost:11434`) — ส่ง traffic นั้นเข้า SOCKS proxy มีแต่เสีย round trip หรือไปถึงไม่ได้เลย ค่านี้**มีผลเฉพาะตอน `-socks-proxy` เป็น proxy จริง** (ถ้าปล่อยว่างแล้วไปพึ่ง `ALL_PROXY`, reqwest จะอ่าน `NO_PROXY` มาตรฐานเอง); ตั้งเป็นว่าง (`/proxy no-proxy ""` หรือ `JONNYQ_NO_PROXY=`) = tunnel ทุกอย่างรวม loopback
+
+#### สถานะหลัง `/env reload`
+
+proxy เป็น setting ปกติชั้นหนึ่ง จึงถูกอ่านใหม่พร้อมค่าอื่นเมื่อ `/env reload` และ **สลับ transport ของ session ทันที** โดยไม่ต้อง restart — แต่ flag `-socks-proxy` ที่ใส่ตอน start ถูก replay ทุก reload จึงยังชนะค่าในไฟล์เสมอ; ค่าที่เพิ่งตั้งด้วย `/proxy` จะถูกทับถ้าไฟล์/flag พูดถึง key เดียวกัน (เป็นจุดประสงค์ของ reload) ถ้าไฟล์ใหม่ใส่ค่าที่ parse ไม่ผ่าน reload จะ print error และ **transport ที่ใช้อยู่ไม่ถูกแตะ**
+
+---
+
 ### รายละเอียดการ parse flag (เข้ากันกับเวอร์ชัน Go)
 
 - ทุก flag รับ value **ยกเว้น** `-thinking` (รับแบบ inline `-thinking=false` เท่านั้น) และ `-h`/`-help`
@@ -390,6 +446,8 @@ set -a; . ./.env; set +a; jonnyq
 | `/autocoding` | เรียก `/plan` ให้อัตโนมัติถ้าจำเป็น แล้วไล่ทำ **ทุก task** ใน `.progress` รวดเดียว (ล้าง history ก่อนทุก task เพื่อให้ prompt เล็กและเร็วที่สุด) |
 | `/watchfile [<word>\|off]` | ไม่มี arg = toggle เริ่ม/หยุด ด้วย magic word ปัจจุบัน · ใส่ word = ตั้ง/เริ่ม watch (ถ้า watch อยู่จะเปลี่ยนคำแบบ live) · `off`/`stop` = หยุด |
 | `/ntfy [<topic url>\|off]` | ไม่มี arg = แสดงค่าปัจจุบัน · ใส่ URL = ตั้ง/เปิด · `off` = ปิด — มีผลกับ `/plan`/`/coding` รอบถัดไปและกับคำถาม/คำตอบของ `ask_user` ทันที |
+| `/proxy [<socks url>\|off\|auto]` | ไม่มี arg = แสดง proxy ที่ใช้อยู่ (mask password) · `socks5h://host:port` หรือ `host:port` (= `socks5h`; รับ `socks5`/`socks4a`/`socks4`) = ให้ model + `web_search` + `web_fetch` + ntfy วิ่งผ่าน proxy นั้น **ตั้งแต่ request ถัดไป** · `off` = เชื่อมตรง (ชนะ `ALL_PROXY`) · `auto` = กลับไปเชื่อ env — ดู [หัวข้อ 5.2](#52-socks-proxy) |
+| `/proxy no-proxy <hosts>` | เปลี่ยน bypass list ของ proxy (คั่นด้วย `,`; `""` = tunnel ทุกอย่างรวม loopback) — ไม่แตะตัว proxy |
 | `/toolmode [native\|prompt]` | ไม่มี arg = แสดงโหมดปัจจุบัน · `native`/`prompt` = สลับโหมด (มีผลรอบถัดไปทันที) |
 | `/env [path\|off]` | ไม่มี arg = บอกว่า settings มาจากไฟล์ `.env` ไฟล์ไหน · ใส่ path หรือ `off` = เปลี่ยนไฟล์/ปิดแล้ว reload เลย |
 | `/env list` | ตารางทุก setting: ค่าที่ใช้จริง + มาจากชั้นไหน (`flag`/`env`/`file`/`default`) — key ถูก mask เป็น `****` |
@@ -398,7 +456,7 @@ set -a; . ./.env; set +a; jonnyq
 
 - ถ้ายังไม่ได้ตั้ง model จะ **รับเฉพาะ slash command** เท่านั้น (พิมพ์ prompt ปกติจะเตือน `no model set; type /model <name> first`)
 - คำสั่งไม่รู้จัก → `unknown command /xxx; try /help`
-- สถานะที่ `/model`, `/context`, `/think`, `/toolmode`, `/ntfy`, `/run_command_timeout` ตั้งจะถูกบันทึกกลับเข้าสู่ config ด้วย จึงอ่านค่าได้ตรงกันทุกครั้ง
+- สถานะที่ `/model`, `/context`, `/think`, `/toolmode`, `/ntfy`, `/run_command_timeout`, `/proxy` ตั้งจะถูกบันทึกกลับเข้าสู่ config ด้วย จึงอ่านค่าได้ตรงกันทุกครั้ง (รวม `/env list`)
 - `/env reload` จะ **replay flag จาก command line ตอน start** ทำให้ flag ชนะค่าในไฟล์เหมือนตอนเริ่มเสมอ ส่วนค่าที่สั่งเปลี่ยนด้วย slash command ระหว่างรันจะถูกค่าจากไฟล์/flag ทับ (นั่นคือจุดประสงค์ของ reload)
 
 ---
@@ -810,9 +868,9 @@ jonnyq-rust/
 ├── Cargo.toml              name = "jonnyq", edition 2021, [profile.release] strip=true
 ├── Cargo.lock
 └── src/
-    ├── main.rs             entry point: load config → open log → build tool registry
-    │                        (10 tools + install_always(ask_user)) → build Agent →
-    │                        hand control to REPL on the tokio runtime
+    ├── main.rs             entry point: load config → open log → install proxy (net::set_current)
+    │                        → build tool registry (10 tools + install_always(ask_user)) →
+    │                        build Agent → hand control to REPL on the tokio runtime
     ├── lib.rs              crate root (module layout mirrors Go's internal/)
     ├── config.rs           CLI flag + JONNYQ_* env + .env parsing (FlagParser port ของ Go flag)
     │                        → precedence flag > file > env > default, Source provenance,
@@ -822,6 +880,11 @@ jonnyq-rust/
     ├── input.rs            stdin ที่อ่านเป็นบรรทัด — จุดอ่าน input เดียวของทั้งโปรแกรม
     │                        (REPL + ask_user ใช้ stream ร่วมกัน จึงไม่แย่ง type-ahead),
     │                        read_line_cancellable (Ctrl-C), read_input (multi-line)
+    ├── net.rs              HTTP client ส่วนกลาง + SOCKS proxy setting: ProxyConfig
+    │                        (parse/validate/mask credential + bypass list), client cache
+    │                        ต่อ timeout profile, set_current() ทิ้ง client เก่าทั้งก้อน
+    │                        → proxy ที่เปลี่ยนกลาง session มีผลกับ request ถัดไปทันที
+    │                        (provider, web tools, ntfy ใช้ pool นี้ร่วมกัน)
     ├── ui.rs               สี terminal + plain-text log, UiState snapshot, section headers,
     │                        ContextStatus, format helpers (Go Duration.String compatible),
     │                        coloredln/colored_keep/reset_color (สีของ ask_user)
@@ -845,7 +908,9 @@ jonnyq-rust/
     │                        stream_messages() = subscribe topic แบบ JSON stream (ขาลงของ
     │                        ask_user: รับคำตอบจากมือถือ)
     ├── testsupport.rs      [cfg(test)] only: TestServer (HTTP/1.1 on localhost, รวมถึง staged/
-    │                        open chunked stream สำหรับ ntfy), stub providers, temp dirs,
+    │                        open chunked stream สำหรับ ntfy), SocksProxy (SOCKS5 stub บน
+    │                        loopback + บันทึก tunnel ที่ถูกขอ ใช้พิสูจน์ว่า traffic วิ่งผ่าน
+    │                        proxy จริง), stub providers, temp dirs,
     │                        input_lock()/DelayedLines/SilentLines — เทียบเท่า httptest.NewServer ของ Go
     ├── llm/
     │   ├── mod.rs
@@ -880,7 +945,7 @@ jonnyq-rust/
 |---|---|---|
 | `tokio` (features: rt-multi-thread, macros, sync, time, process, io-util, signal, fs, io-std) | 1.54 | async runtime, subprocess, signal handling |
 | `tokio-util` | 0.7 | `CancellationToken` (Ctrl-C / repeat cutoff) |
-| `reqwest` (default-features = false; features: rustls-tls, stream, json) | 0.12 | HTTP client — TLS แบบ pure Rust (rustls 0.23) ไม่ใช้ cgo/OpenSSL |
+| `reqwest` (default-features = false; features: rustls-tls, stream, json, socks) | 0.12 | HTTP client — TLS แบบ pure Rust (rustls 0.23) ไม่ใช้ cgo/OpenSSL; feature `socks` รองรับ `socks5h`/`socks5`/`socks4a`/`socks4` |
 | `serde` + derive, `serde_json` | 1.0 / 1.0 | config & JSON wire format, tool parameter schemas |
 | `regex` | 1.13 | denylist, HTML-to-text, checkbox parsing, phase headings, ANSI strip |
 | `futures-util` | 0.3 | อ่าน byte stream แบบ async |
@@ -912,13 +977,16 @@ Repeat loop detected → cancels chat_cancel (child ONLY)
 
 ```bash
 cd jonnyq-rust
-cargo test --release          # 242 tests (แนะนำ --release เพราะบาง test จับเวลา timeout)
+cargo test --release          # 284 tests (แนะนำ --release เพราะบาง test จับเวลา timeout)
 cargo test                     # debug build
 cargo test -- --nocapture      # ดู stdout
 cargo test repl::              # รันเฉพาะ module ใด module หนึ่ง
 cargo test --lib               # lib tests เท่านั้น
 cargo test -- --test-threads=1 # ถ้า test ที่แก้ env var รบกวนกัน (test ที่ต้องใช้ env สะอาดล็อกผ่าน crate::testsupport::clean_env();
-                               # test ที่ swap stdin stream ของ ask_user ล็อกผ่าน input_lock() เช่นกัน)
+                               # test ที่ swap stdin stream ของ ask_user ล็อกผ่าน input_lock() เช่นกัน;
+                               # test ที่แตะ transport ของ net.rs ต้องล็อกข้าม test เช่นกัน เพราะ proxy เป็น
+                               # process-wide state — ทุก URL ที่ test เหล่านี้ใส่ลงไปเป็น loopback stub
+                               # และ bypass list ครอบคลุม loopback เพื่อไม่ไปดึง traffic ของ test อื่น)
 ```
 
 สิ่งที่ test ครอบคลุม (ไม่ต้องมี network หรือ model จริง):
@@ -926,7 +994,9 @@ cargo test -- --test-threads=1 # ถ้า test ที่แก้ env var ร�
 - **config** — default, flag ชนะ .env/env var, parse `-thinking`, provider validation, unknown flag, case-insensitive `tool-mode`
 - **dotenv** (`config::dotenv`) — comment/inline comment, `export`, single/double quotes (+escape, multi-line), `$VAR`/`${VAR}`/`${VAR:-x}`/`$$` (key ในไฟล์ชนะ env var ตอน expand), key ซ้ำ, CRLF, `~` ใน path, บรรทัดพัง → warning, quote ปิดไม่ครบ → error
 - **config precedence / provenance** — `flag > file > env var > default` ทุกชั้น (รวมเคส `KEY=` ว่างในไฟล์ที่ชนะ env var และ env var ที่ยังใช้ได้กับ key ที่ไฟล์ไม่กำหนด), `-env-file off|none|no`, เลือกไฟล์ผ่าน `JONNYQ_ENV_FILE`, path ที่ไม่มี → error, `Source` ที่ `/env list` แสดง (mask `JONNYQ_KEY`), snapshot ตาราง flag/env ที่ตรงกับเอกสาร
-- **repl `/env`** — report/list/reload (model, context, thinking, tool-mode, run_command timeout, max tool calls, skill path, magic word), file ที่หาย→คงของเดิม, `off`→ยกเลิกค่าจากไฟล์, flag ตอน start ชนะหลัง reload
+- **repl `/env`** — report/list/reload (model, context, thinking, tool-mode, run_command timeout, max tool calls, skill path, magic word, **socks-proxy/no-proxy — สลับ transport ของ session จริง**), file ที่หาย→คงของเดิม, `off`→ยกเลิกค่าจากไฟล์, flag ตอน start ชนะหลัง reload
+- **SOCKS proxy** (`net`) — parse ทุก spelling (`off`/`auto`/`host:port`/4 schemes), reject `http://` proxy + host กลวง + port เพี้ยน (พร้อมข้อความชี้ทาง), mask password ในทุก output, client pool ต่อ timeout + ถูกทิ้งทั้งก้อนเมื่อ proxy เปลี่ยน, config ที่ apply ไม่ผ่านถูกปฏิเสธโดยไม่เปลี่ยนของเดิม, และ **e2e ผ่าน SOCKS5 stub on loopback**: traffic วิ่งผ่าน proxy จริง (proxy รายงานปลายทางที่ถูกขอ) และ bypass list ทำให้ host ที่ระบุข้าม proxy จริง
+- **`/proxy`** — bare report, `off`/`auto` ขยับ config + live transport พร้อมกัน, normalize `host:port` → `socks5h://…`, ค่าผิด→error โดย config/transport ไม่เปลี่ยน, `/proxy no-proxy` แก้เฉพาะ bypass list
 - **tools** — `Registry::configure` reach ทุก tool, `ask_user` ถูก `install_always` เข้า registry ที่ว่างเปล่าและ dispatch ได้จริง, `ResizeableLimiter` cap concurrency + grow แล้วปล่อย waiter ทันที + cancel ได้
 - **providers** — `TestServer` จำลอง `/api/chat`, `/chat/completions`, `/api/tags`, `/models`; ยืนยัน path/body ที่ส่ง, client-side timing, cancellation
 - **coding** — generate/reconcile `.progress`, stall/`MAX_NO_PROGRESS_ROUNDS`, ntfy payloads (ผ่าน stub server), phase selection
@@ -984,6 +1054,9 @@ repo ยังมี **`.env.example`** เป็น template ของ `JONNYQ_
 | `warning: <file> defines no JONNYQ_* settings` | ไฟล์ที่ระบุไม่มี key ของ jonnyq เลย (มักสะกดผิด เช่น `MODEL=` ต้องเป็น `JONNYQ_MODEL=`) |
 | ค่าในไฟล์ถูก expand เพี้ยน | `$VAR` ถูก expand เสมอใน unquoted/double-quoted value — ใช้ `'single quotes'` ให้เป็น literal หรือ `$$` สำหรับ `$` หนึ่งตัว |
 | `connection refused` | LLM server ยังไม่ได้รัน หรือ host/port ใน `-provider`/`/provider`ผิด — `/list_model` ช่วยตรวจได้ |
+| `connection refused` ทั้งที่ server ทำงานอยู่ (และเครื่องมี proxy) | traffic ถูกส่งเข้า proxy — ตรวจ `/proxy` (loopback ควรอยู่ใน `-no-proxy`; ค่า default ครอบคลุมแล้ว ยกเว้นตั้ง `JONNYQ_NO_PROXY=` ว่าง หรือ proxy ผิด port) |
+| `config error: socks-proxy "http://..." is not a SOCKS proxy` | jonnyq รับเฉพาะ SOCKS (`socks5h`/`socks5`/`socks4a`/`socks4` หรือ `host:port`) — HTTP proxy เป็นคนละ feature; ถ้าอยากพึ่ง HTTP proxy ที่ export ไว้ ให้ตั้ง `-socks-proxy auto` แล้ว export `HTTPS_PROXY` ตามปกติ |
+| ตั้ง proxy แล้ว `web_search`/`web_fetch`/ntfy ไปไม่รอด | proxy ทั้งหมดเป็น policy เดียวกัน (model + web tools + ntfy) — `/proxy` ดูค่าปัจจุบัน, `/proxy no-proxy <hosts>` เพิ่ม host ที่ต้องข้าม, `/proxy off` เพื่อทดสอบว่า proxy คือตัวปัญหาจริง |
 | `unexpected status 404` / `model not found` | ชื่อ model ผิดหรือไม่ถูก pull — เช็คด้วย `/list_model` |
 | `unexpected status 400` / `context length` | บทสนทนาเกิน context ของ model — `/context` ให้เล็กลง หรือเริ่ม session ใหม่ |
 | `unexpected status 401/403` | API key หาย/ผิด/หมดอายุ — ตั้งด้วย `/key` หรือ `-key` |
@@ -1017,6 +1090,7 @@ Repo นี้เป็น **Rust port** ของ `jonnyq` (Go) — โคร�
 | cancellation | `context.Context` | `tokio_util::sync::CancellationToken` (child token ต่อ request) |
 | CLI parsing | `flag` package | `FlagParser` ใน `config.rs` ที่ port พฤติกรรมมาแบบ 1:1 (bool flag inline-only, หยุดที่ positional, exit 1 เมื่อ `-h`) |
 | HTTP | `net/http` stdlib | `reqwest` + rustls |
+| SOCKS proxy | ตั้งผ่าน `ALL_PROXY` ของ environment เท่านั้น | `-socks-proxy` / `JONNYQ_SOCKS_PROXY` / `.env` / `/proxy` — policy เดียวกันครอบคลุม model + `web_search` + `web_fetch` + ntfy, `off` ชนะ `ALL_PROXY`, เปลี่ยนกลาง session ได้ (`src/net.rs` เป็น client pool กลาง) |
 | tests | `httptest.NewServer` | `src/testsupport.rs` — HTTP/1.1 server บน tokio (no extra deps) |
 | fs events | ไม่ใช้ (stdlib poll) | ไม่ใช้ (walk + mtime poll ด้วย `std::fs`) — เหมือนกัน |
 | การตั้งค่า | flag + env var เท่านั้น | เหมือนเดิม **บวก** ชั้น dotenv (`.env` โหลดอัตโนมัติ, `-env-file`, `/env list`, `/env reload`) ซึ่งแทรกขึ้น**เหนือ** env var → `flag > .env > env var > default`; parser เขียนเองใน `config/dotenv.rs` ไม่เพิ่ม dependency |

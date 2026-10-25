@@ -39,6 +39,10 @@ pub const DEFAULT_WATCH_POLL_INTERVAL_SEC: i64 = 1;
 pub const DEFAULT_NTFY_URL: &str = "";
 pub const DEFAULT_TOOL_CALL_MODE: &str = "native";
 
+/// `-no-proxy` / `JONNYQ_NO_PROXY`: the bypass list of an explicitly
+/// configured SOCKS proxy (see [`crate::net::DEFAULT_NO_PROXY`]).
+pub const DEFAULT_NO_PROXY: &str = crate::net::DEFAULT_NO_PROXY;
+
 /// Context-compaction defaults (see `agent::CompactTunables` and the
 /// `JONNYQ_COMPACT_*` settings): the fraction of the context window at which
 /// history gets summarized, the fraction the summary may occupy, how many
@@ -85,6 +89,12 @@ Flags:
   -watch-magic-word <word>      magic word /watchfile scans for (default \"AI!\")
   -watch-poll-interval-sec <n>  /watchfile polling interval seconds (default 1)
   -ntfy-url <url>               ntfy topic URL for /plan and /coding notifications
+  -socks-proxy <url|off>        SOCKS proxy for every request (model, web_search,
+                                web_fetch, ntfy): socks5h://host:port, socks5,
+                                socks4a, socks4 or bare host:port (= socks5h);
+                                off = always direct; auto = follow ALL_PROXY etc.
+  -no-proxy <hosts>             hosts that bypass -socks-proxy (comma-separated;
+                                default localhost,127.0.0.1,::1)
   -tool-mode native|prompt      tool-calling mode (default native)
   -skill-path <paths>           semicolon-separated skill directories
   -thinking=true|false          enable model thinking (default true)
@@ -256,6 +266,17 @@ pub struct Config {
     /// notifications.
     pub ntfy_url: String,
 
+    /// SOCKS proxy for every outbound request, as typed: empty = follow the
+    /// usual `ALL_PROXY`/`HTTPS_PROXY` environment variables, `off` = always
+    /// direct, otherwise a `socks5h://host:port` style URL. See [`crate::net`],
+    /// and the `/proxy` slash command for changing it mid-session.
+    pub socks_proxy: String,
+
+    /// Comma-separated hosts that bypass [`Self::socks_proxy`]
+    /// (`-no-proxy` / `JONNYQ_NO_PROXY`). Defaults to loopback, so a local
+    /// model server is never tunnelled by accident.
+    pub no_proxy: String,
+
     /// "native" (default) or "prompt" - see agent::ToolCallMode. Validated in
     /// load/set_tool_call_mode so callers can rely on it being one of the two.
     pub tool_call_mode: String,
@@ -314,6 +335,8 @@ impl Default for Config {
             watch_magic_word: DEFAULT_WATCH_MAGIC_WORD.into(),
             watch_poll_interval_sec: DEFAULT_WATCH_POLL_INTERVAL_SEC,
             ntfy_url: DEFAULT_NTFY_URL.into(),
+            socks_proxy: String::new(),
+            no_proxy: DEFAULT_NO_PROXY.into(),
             tool_call_mode: DEFAULT_TOOL_CALL_MODE.into(),
             skill_paths: Vec::new(),
             thinking: DEFAULT_THINKING,
@@ -360,6 +383,32 @@ impl Config {
         }
         self.tool_call_mode = mode;
         Ok(())
+    }
+
+    /// The proxy settings as [`crate::net`] wants them, validating
+    /// [`Self::socks_proxy`] - so a malformed `-socks-proxy` is a config error
+    /// at startup (and a rejected `/proxy`), never a mysterious failure on the
+    /// first request.
+    pub fn proxy_config(&self) -> R<crate::net::ProxyConfig> {
+        crate::net::ProxyConfig::parse(&self.socks_proxy, &self.no_proxy)
+    }
+
+    /// Validates `s` and stores it as `socks_proxy` (see
+    /// [`crate::net::ProxyConfig::parse`] for the accepted spellings). The
+    /// value is kept normalised (`host:port` -> `socks5h://host:port`) so
+    /// `/env list` and a later reload see what is actually in effect.
+    pub fn set_socks_proxy(&mut self, s: &str) -> R<()> {
+        let p = crate::net::ProxyConfig::parse(s, &self.no_proxy)?;
+        self.socks_proxy = crate::net::setting_value(&p);
+        Ok(())
+    }
+
+    /// The proxy settings of a config that must not fail - for reporting
+    /// (startup chatter, `/proxy` with no argument). An invalid value can only
+    /// have arrived through a mutation that skipped the checks, and is then
+    /// described as unset rather than being silently honoured.
+    pub fn proxy_config_or_default(&self) -> crate::net::ProxyConfig {
+        self.proxy_config().unwrap_or_else(|_| crate::net::ProxyConfig::system())
     }
 
     /// Path of the dotenv file that supplied settings, or `None` when no file
@@ -520,6 +569,14 @@ impl Config {
                 false,
             ),
             ("ntfy-url", "NTFY_URL", self.ntfy_url.clone(), self.src("NTFY_URL"), false),
+            (
+                "socks-proxy",
+                "SOCKS_PROXY",
+                crate::net::redact_url(&self.socks_proxy),
+                self.src("SOCKS_PROXY"),
+                false,
+            ),
+            ("no-proxy", "NO_PROXY", self.no_proxy.clone(), self.src("NO_PROXY"), false),
             ("tool-mode", "TOOL_MODE", self.tool_call_mode.clone(), self.src("TOOL_MODE"), false),
             ("skill-path", "SKILL_PATH", skill_paths, self.src("SKILL_PATH"), false),
             ("env-file", "ENV_FILE", self.env_file.clone(), self.src_env_file(), false),
@@ -589,6 +646,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "watch-magic-word",
     "watch-poll-interval-sec",
     "ntfy-url",
+    "socks-proxy",
+    "no-proxy",
     "tool-mode",
     "skill-path",
     "thinking",
@@ -839,6 +898,17 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     let (v, src) = r.string("ntfy-url", "NTFY_URL", DEFAULT_NTFY_URL);
     sources.insert("NTFY_URL".to_string(), src);
     c.ntfy_url = v;
+    // The proxy pair: `no-proxy` is stored as given (its own default lists the
+    // loopback hosts) and `socks-proxy` is validated + normalised through
+    // ProxyConfig, so a bad URL is a config error here rather than a failed
+    // model request later.
+    let (v, src) = r.string("no-proxy", "NO_PROXY", DEFAULT_NO_PROXY);
+    sources.insert("NO_PROXY".to_string(), src);
+    c.no_proxy = v.trim().to_string();
+    let (v, src) = r.string("socks-proxy", "SOCKS_PROXY", "");
+    sources.insert("SOCKS_PROXY".to_string(), src);
+    let proxy = crate::net::ProxyConfig::parse(&v, &c.no_proxy)?;
+    c.socks_proxy = crate::net::setting_value(&proxy);
     let (v, src) = r.string("tool-mode", "TOOL_MODE", DEFAULT_TOOL_CALL_MODE);
     sources.insert("TOOL_MODE".to_string(), src);
     c.set_tool_call_mode(&v)?;
@@ -1044,6 +1114,99 @@ mod tests {
     #[test]
     fn tool_mode_defaults_native() {
         assert_eq!(load_clean(&[]).tool_call_mode, DEFAULT_TOOL_CALL_MODE);
+    }
+
+    // --- SOCKS proxy -------------------------------------------------------
+
+    #[test]
+    fn proxy_defaults_to_unset_with_a_loopback_bypass() {
+        let cfg = load_clean(&[]);
+        // Unset = "let the environment decide", not "connect directly".
+        assert_eq!(cfg.socks_proxy, "");
+        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::System);
+        // Loopback is bypassed by default so a local model server is never
+        // tunnelled by accident.
+        assert_eq!(cfg.no_proxy, DEFAULT_NO_PROXY);
+        assert_eq!(cfg.proxy_config_or_default().no_proxy, DEFAULT_NO_PROXY);
+    }
+
+    #[test]
+    fn socks_proxy_flag_normalizes_and_applies_to_every_layer() {
+        // A bare host:port is shorthand for socks5h (remote DNS), stored
+        // normalised so /env list and a reload show what is in effect.
+        let cfg = load_clean(&["-socks-proxy".to_string(), "127.0.0.1:1080".to_string()]);
+        assert_eq!(cfg.socks_proxy, "socks5h://127.0.0.1:1080");
+        assert!(cfg.proxy_config_or_default().enabled());
+        assert_eq!(cfg.proxy_config_or_default().no_proxy, DEFAULT_NO_PROXY);
+
+        // The bypass list is a setting of its own.
+        let cfg = load_clean(&[
+            "-socks-proxy".to_string(),
+            "socks5://proxy:1080".to_string(),
+            "-no-proxy".to_string(),
+            "intranet,10.0.0.0/8".to_string(),
+        ]);
+        assert_eq!(cfg.socks_proxy, "socks5://proxy:1080");
+        assert_eq!(cfg.no_proxy, "intranet,10.0.0.0/8");
+        assert_eq!(cfg.proxy_config_or_default().describe(), "socks5://proxy:1080 (direct for: intranet,10.0.0.0/8)");
+
+        // off means off, and it survives the round trip through the stored value.
+        let cfg = load_clean(&["-socks-proxy".to_string(), "off".to_string()]);
+        assert_eq!(cfg.socks_proxy, "off");
+        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::Direct);
+        // ...as does auto/system, which hands the decision back to env vars.
+        let cfg = load_clean(&["-socks-proxy".to_string(), "auto".to_string()]);
+        assert_eq!(cfg.socks_proxy, "");
+        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::System);
+    }
+
+    #[test]
+    fn socks_proxy_env_and_dotenv() {
+        let _g = clean_env();
+        _g.set("JONNYQ_SOCKS_PROXY", "socks5h://env-proxy:1080");
+        _g.set("JONNYQ_NO_PROXY", "internal.example");
+        let cfg = load(&with_off(&[])).unwrap();
+        assert_eq!(cfg.socks_proxy, "socks5h://env-proxy:1080");
+        assert_eq!(cfg.no_proxy, "internal.example");
+        // The flag still wins.
+        let cfg = load(&with_off(&["-socks-proxy".to_string(), "off".to_string()])).unwrap();
+        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::Direct);
+
+        let (_d, path) = temp_dotenv("proxy", "JONNYQ_SOCKS_PROXY=socks4a://file-proxy:1080\nJONNYQ_NO_PROXY=\n");
+        let cfg = load(&["-env-file".to_string(), path]).unwrap();
+        assert_eq!(cfg.socks_proxy, "socks4a://file-proxy:1080");
+        // An empty bypass list in the file is a decision, not a default: with a
+        // proxy set, everything (loopback included) is tunnelled.
+        assert_eq!(cfg.no_proxy, "");
+        assert!(!cfg.proxy_config_or_default().describe().contains("direct for"));
+    }
+
+    #[test]
+    fn invalid_socks_proxy_is_a_config_error() {
+        // Same class of failure as a malformed -provider: refuse at startup
+        // rather than failing the first model request.
+        for bad in ["http://proxy:3128", "ftp://x:21", "socks5://proxy:99999", "socks5://"] {
+            let e = load(&with_off(&["-socks-proxy".to_string(), bad.to_string()])).unwrap_err();
+            assert!(
+                e.message.contains("SOCKS") || e.message.contains("scheme") || e.message.contains("port")
+                    || e.message.contains("host"),
+                "{bad}: {}",
+                e.message
+            );
+        }
+        // A bad value in the file fails the same way.
+        let (_d, path) = temp_dotenv("bad-proxy", "JONNYQ_SOCKS_PROXY=http://proxy:3128\n");
+        let e = load_dotenv_off_err(&path);
+        assert!(e.message.contains("not a SOCKS proxy"), "{}", e.message);
+    }
+
+    #[test]
+    fn proxy_credentials_never_reach_the_settings_table() {
+        // /env list prints values, so the row must not carry a password.
+        let cfg = load_clean(&["-socks-proxy".to_string(), "socks5h://u:sup3rs3cr3t@proxy:1080".to_string()]);
+        assert_eq!(cfg.socks_proxy, "socks5h://u:sup3rs3cr3t@proxy:1080", "the value itself is kept");
+        let row = cfg.settings().into_iter().find(|s| s.flag == "socks-proxy").unwrap();
+        assert_eq!(row.display(), "socks5h://u:***@proxy:1080");
     }
 
     #[test]
@@ -1376,6 +1539,8 @@ mod tests {
             "watch-magic-word JONNYQ_WATCH_MAGIC_WORD",
             "watch-poll-interval-sec JONNYQ_WATCH_POLL_INTERVAL_SEC",
             "ntfy-url JONNYQ_NTFY_URL",
+            "socks-proxy JONNYQ_SOCKS_PROXY",
+            "no-proxy JONNYQ_NO_PROXY",
             "tool-mode JONNYQ_TOOL_MODE",
             "skill-path JONNYQ_SKILL_PATH",
             "env-file JONNYQ_ENV_FILE",

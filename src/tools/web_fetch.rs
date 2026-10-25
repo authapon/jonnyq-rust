@@ -20,7 +20,6 @@ const MAX_FETCH_BYTES: usize = 3 * 1024 * 1024; // cap response body so one fetc
 
 pub struct FetchTool {
     timeout_sec: AtomicI64,
-    http: reqwest::Client,
     sem: ResizeableLimiter,
 }
 
@@ -28,7 +27,6 @@ impl FetchTool {
     pub fn new(concurrency: i64, timeout_sec: i64) -> Self {
         Self {
             timeout_sec: AtomicI64::new(timeout_sec),
-            http: reqwest::Client::new(),
             sem: ResizeableLimiter::new(concurrency),
         }
     }
@@ -68,7 +66,8 @@ impl Tool for FetchTool {
 
         let _permit = self.sem.acquire(&ctx.cancel).await?;
 
-        let send = self.http.get(raw_url).header("User-Agent", "jonnyq/1.0").send();
+        // Client looked up per call so a `/proxy` change reaches the next fetch.
+        let send = crate::net::client(None, None).get(raw_url).header("User-Agent", "jonnyq/1.0").send();
         let resp = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(self.timeout_sec().max(0) as u64), send) => {
                 match r {

@@ -289,6 +289,126 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
+// --- SOCKS5 proxy stub -----------------------------------------------------
+
+/// A minimal SOCKS5 server: it completes the no-auth handshake, answers every
+/// CONNECT with "granted", then pipes bytes both ways to the destination it was
+/// asked for - enough to prove that a client really routes its traffic through
+/// a proxy, and to observe *which* destinations it asked for.
+///
+/// Deliberally dumb: any command is treated as a CONNECT, and the reply's bound
+/// address is a placeholder nobody reads. Only `ATYP` domain/IPv4 are handled
+/// (what `socks5h`/`socks5` produce for a URL host).
+pub struct SocksProxy {
+    pub url: String,
+    tunnels: Arc<Mutex<Vec<String>>>,
+}
+
+impl SocksProxy {
+    pub async fn start() -> SocksProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks stub");
+        let addr = listener.local_addr().unwrap();
+        let tunnels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = tunnels.clone();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    Self::handshake(sock, seen).await;
+                });
+            }
+        });
+        SocksProxy { url: format!("socks5h://127.0.0.1:{}", addr.port()), tunnels }
+    }
+
+    /// `host:port` of every CONNECT accepted, in order.
+    pub fn tunnels(&self) -> Vec<String> {
+        self.tunnels.lock().unwrap().clone()
+    }
+
+    /// The tunnels asked for a particular destination - how a test asserts
+    /// "this request went through the proxy" (or, when empty, that it did not)
+    /// without caring what other traffic the stub served.
+    pub fn tunnels_to(&self, hostport: &str) -> Vec<String> {
+        self.tunnels().into_iter().filter(|t| t == hostport).collect()
+    }
+
+    /// Runs one request through the handshake, records the destination, then
+    /// pumps the tunnel until either side closes.
+    async fn handshake(mut sock: tokio::net::TcpStream, seen: Arc<Mutex<Vec<String>>>) {
+        // Greeting: VER, NMETHODS, METHODS -> pick no-auth.
+        let mut head = [0u8; 2];
+        if sock.read_exact(&mut head).await.is_err() || head[0] != 5 {
+            return;
+        }
+        let mut methods = vec![0u8; head[1] as usize];
+        if sock.read_exact(&mut methods).await.is_err() {
+            return;
+        }
+        let chosen = if methods.contains(&0) { 0 } else { 0xFF };
+        if sock.write_all(&[5, chosen]).await.is_err() || chosen != 0 {
+            return; // no credentials offered - the test never asks for any
+        }
+
+        // REQUEST: VER CMD RSV ATYP ADDR PORT (read whole, in one read at most
+        // a handshake message ever needs).
+        let mut req = [0u8; 262];
+        let mut pos = 0;
+        while pos < 4 {
+            match sock.read(&mut req[pos..]).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => pos += n,
+            }
+        }
+        let (atyp, cmd) = (req[3], req[1]);
+        let addr_len = match atyp {
+            1 => 4,
+            3 => req[4] as usize + 1,
+            4 => 16,
+            _ => return,
+        };
+        let want = 4 + addr_len + 2;
+        while pos < want {
+            match sock.read(&mut req[pos..]).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => pos += n,
+            }
+        }
+        let host = match atyp {
+            1 => std::net::Ipv4Addr::new(req[4], req[5], req[6], req[7]).to_string(),
+            3 => String::from_utf8_lossy(&req[5..5 + req[4] as usize]).into_owned(),
+            4 => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&req[4..20]).unwrap()).to_string(),
+            _ => return,
+        };
+        let port = u16::from_be_bytes([req[want - 2], req[want - 1]]);
+        if cmd != 1 {
+            // CONNECT only: "command not supported" and hang up.
+            let _ = sock.write_all(&[5, 0x07, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+            return;
+        }
+
+        let mut target = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = sock.write_all(&[5, 0x05, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                return;
+            }
+        };
+        // REP=0, ATYP=IPv4, BND=0.0.0.0:0 - the client only needs the success.
+        if sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {
+            return;
+        }
+        // Recorded as soon as the tunnel opens (not when it closes), so a test
+        // asserting right after its request sees it.
+        seen.lock().unwrap().push(format!("{}:{}", host, port));
+        let _ = tokio::io::copy_bidirectional(&mut sock, &mut target).await;
+    }
+}
+
 /// Writes a scratch working directory (removed on drop).
 pub struct TempDir(pub std::path::PathBuf);
 
@@ -761,10 +881,19 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub struct CleanEnv {
     _guard: std::sync::MutexGuard<'static, ()>,
     saved: Vec<(String, std::ffi::OsString)>,
+    /// Variables [`CleanEnv::set`] introduced: their value before the call
+    /// (`None` = it was not set), restored on drop.
+    touched: std::sync::Mutex<Vec<(String, Option<std::ffi::OsString>)>>,
 }
 
 impl Drop for CleanEnv {
     fn drop(&mut self) {
+        for (k, v) in self.touched.lock().unwrap().drain(..) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
         for (k, v) in &self.saved {
             unsafe { std::env::set_var(k, v) };
         }
@@ -774,8 +903,20 @@ impl Drop for CleanEnv {
 impl CleanEnv {
     /// Sets one variable for the duration of the guard (restores/clears it on
     /// drop, so it never leaks into another test).
+    ///
+    /// Any variable name is fair game, not just `JONNYQ_*` - a test that needs
+    /// e.g. `ALL_PROXY` to see what a client does with the environment gets
+    /// the same rollback guarantee. (While held, the value is visible to every
+    /// other test in the process, so such a test must keep its effect narrow.)
     pub fn set(&self, name: &str, value: &str) {
+        let previous = std::env::var_os(name);
         unsafe { std::env::set_var(name, value) };
+        // First write wins: the value to restore is the one from before the
+        // guard existed, not from an earlier set() of the same name.
+        let mut touched = self.touched.lock().unwrap();
+        if !touched.iter().any(|(k, _)| k == name) {
+            touched.push((name.to_string(), previous));
+        }
     }
 }
 
@@ -788,7 +929,7 @@ pub fn clean_env() -> CleanEnv {
     for (k, _) in &saved {
         unsafe { std::env::remove_var(k) };
     }
-    CleanEnv { _guard: guard, saved }
+    CleanEnv { _guard: guard, saved, touched: std::sync::Mutex::new(Vec::new()) }
 }
 
 // --- input isolation -------------------------------------------------------

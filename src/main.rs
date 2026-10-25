@@ -42,6 +42,14 @@ async fn main() {
         }
     };
 
+    // Install the proxy before anything talks HTTP: `-socks-proxy` was
+    // validated during config loading, and the value is what every client
+    // built from here on (provider, web tools, ntfy) is constructed from.
+    if let Err(e) = jonnyq::net::set_current(cfg.proxy_config_or_default()) {
+        eprintln!("config error: {e}");
+        std::process::exit(1);
+    }
+
     let provider = match llm::new_provider(&cfg.provider_name, &cfg.provider_url, &cfg.key) {
         Ok(p) => p,
         Err(e) => {

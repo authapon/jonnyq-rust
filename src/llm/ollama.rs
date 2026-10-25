@@ -18,7 +18,6 @@ use crate::error::AgentError;
 pub struct OllamaProvider {
     base_url: String,
     key: String,
-    http: reqwest::Client,
 }
 
 /// Trailing slash trimmed, like Go's strings.TrimRight(baseURL, "/").
@@ -28,15 +27,15 @@ fn trim_base(url: &str) -> String {
 
 impl OllamaProvider {
     pub fn new(base_url: &str, key: &str) -> Self {
-        Self {
-            base_url: trim_base(base_url),
-            key: key.to_string(),
-            http: reqwest::Client::new(),
-        }
+        Self { base_url: trim_base(base_url), key: key.to_string() }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.request(method, format!("{}{}", self.base_url, path));
+        // The client is looked up per request rather than stored, so `/proxy`
+        // and `/env reload` change the transport of the next call without
+        // rebuilding the provider (the pooled client itself is cached).
+        let http = crate::net::client(None, None);
+        let mut req = http.request(method, format!("{}{}", self.base_url, path));
         req = req.header("Content-Type", "application/json");
         if !self.key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.key));
