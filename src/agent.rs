@@ -8,7 +8,9 @@
 mod prompttools;
 mod repeat;
 
-pub use prompttools::{build_prompt_tool_call_section, parse_error_tool_name, parse_prompt_tool_calls};
+pub use prompttools::{
+    build_prompt_tool_call_section, parse_error_tool_name, parse_prompt_tool_calls,
+};
 pub use repeat::RepeatDetector;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -93,14 +95,14 @@ const USER_ANCHOR_TOKENS: i64 = 200;
 
 /// The stand-in `user` turn for a request that has none at all and no real
 /// task to carry (see [`ensure_user_turn`]).
-const USER_TURN_STAND_IN: &str = "[the earlier conversation was summarized to fit the context window; \
+const USER_TURN_STAND_IN: &str =
+    "[the earlier conversation was summarized to fit the context window; \
 continue from where it left off]";
 
 /// A provider-reported prompt size at or below this, while our own estimate
 /// is much higher, means the server is almost certainly trimming the prompt
 /// from the front instead of using the window we asked for.
 const SUSPICIOUS_SMALL_WINDOW_TOKENS: i64 = 4_200;
-
 
 /// The character-budget basis used when context_size is left unset (<= 0),
 /// so proactive compaction still has something to measure against.
@@ -303,7 +305,6 @@ pub struct Agent {
     /// that need to tell "no turn happened" apart from "a turn happened with
     /// zero usage" must track that separately.
     pub last_usage: std::sync::Mutex<UsageTotals>,
-
     // Context tracking. real_prompt_tokens is the provider's reported prompt
     // size for the most recent request (0 when unknown or invalidated by
     // compaction/reset); real_base_chars is how many characters (system
@@ -436,7 +437,8 @@ impl Agent {
     }
 
     pub fn set_coding_mode(&self, on: bool) {
-        self.coding_mode.store(on, std::sync::atomic::Ordering::SeqCst);
+        self.coding_mode
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn coding_mode(&self) -> bool {
@@ -517,7 +519,9 @@ impl Agent {
     fn history_content_for(role: Role, content: String) -> String {
         // Short enough that no oversized payload can be hiding in it, and
         // the model may genuinely still want the (small) bytes.
-        if role == Role::System || role == Role::Assistant || content.len() <= crate::tools::KEPT_DATA_URI_BYTES
+        if role == Role::System
+            || role == Role::Assistant
+            || content.len() <= crate::tools::KEPT_DATA_URI_BYTES
         {
             return content;
         }
@@ -541,7 +545,9 @@ impl Agent {
     }
 
     fn build_system_message(&self) -> Message {
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
+        let now = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string();
         let mut sb = String::new();
         sb.push_str("You are jonnyq, a coding agent with tool access. Current date and time: ");
         sb.push_str(&now);
@@ -561,7 +567,9 @@ it, inspect it, or take its contents into account for any task.\n",
         }
         let skills = skill::discover(&self.skill_paths());
         if !skills.is_empty() {
-            sb.push_str("Available skills (use read_skill with a name below to load its full content):\n");
+            sb.push_str(
+                "Available skills (use read_skill with a name below to load its full content):\n",
+            );
             for s in &skills {
                 sb.push_str(&format!("- {}: {}\n", s.name, s.description));
             }
@@ -569,7 +577,62 @@ it, inspect it, or take its contents into account for any task.\n",
         if self.coding_mode() {
             sb.push_str(CODING_MODE_PROMPT);
         }
-        Message { role: Role::System, content: sb, ..Default::default() }
+        Message {
+            role: Role::System,
+            content: sb,
+            ..Default::default()
+        }
+    }
+
+    /// The `messages` array to send: exactly one `system` turn, at index 0,
+    /// then history.
+    ///
+    /// Compaction leaves a `system` turn *inside* history - the summary, or the
+    /// note a prune leaves behind - and a request is this turn's system message
+    /// followed by history, so the shape that actually goes out is
+    /// `[system, system(summary), user, …]`: two system turns, the second one
+    /// at index 1. The OpenAI spec allows a `system` turn anywhere, but the
+    /// Qwen3-family chat template shipped in vLLM/llama.cpp/Ollama builds
+    /// validates that `system` appears *only* at index 0 and answers anything
+    /// else with `400 System message must be at the beginning.`
+    /// (vllm-project/vllm#41114) - which killed a session on the first request
+    /// after the compaction that had just reported success, the same way the
+    /// missing-`user`-turn shape used to.
+    ///
+    /// The extra system turns are therefore folded into the leading one, in the
+    /// order they appear in history: nothing is dropped, and the summary still
+    /// reads as context rather than as something the user said. Folding happens
+    /// here rather than in history so the summary stays a message of its own
+    /// for `/history`, and so it is rebuilt from the *current* system prompt -
+    /// a `/prompt` or `/coding` change mid-session must not freeze an old copy
+    /// of the instructions in place.
+    fn request_messages(system: &Message, history: &[Message]) -> Vec<Message> {
+        let mut head = system.clone();
+        let mut rest = Vec::with_capacity(history.len());
+        for m in history {
+            if m.role != Role::System {
+                rest.push(m.clone());
+                continue;
+            }
+            let extra = m.content.trim();
+            if extra.is_empty() {
+                continue;
+            }
+            // A blank line between folded turns, so a summary does not read
+            // as the tail of the instruction it follows.
+            if !head.content.ends_with("\n\n") {
+                if !head.content.ends_with('\n') {
+                    head.content.push('\n');
+                }
+                head.content.push('\n');
+            }
+            head.content.push_str(extra);
+            head.content.push('\n');
+        }
+        let mut out = Vec::with_capacity(rest.len() + 1);
+        out.push(head);
+        out.extend(rest);
+        out
     }
 
     /// Drives one full user prompt through the tool-calling loop to a final
@@ -610,7 +673,11 @@ it, inspect it, or take its contents into account for any task.\n",
         if self.should_compact() {
             self.compact(cancel.clone()).await;
         }
-        self.push_history(Message { role: Role::User, content: user_input.to_string(), ..Default::default() });
+        self.push_history(Message {
+            role: Role::User,
+            content: user_input.to_string(),
+            ..Default::default()
+        });
 
         let max_tool_calls = self.max_tool_calls_per_turn();
 
@@ -621,7 +688,7 @@ it, inspect it, or take its contents into account for any task.\n",
         loop {
             let messages = {
                 let h = self.history.lock().unwrap();
-                std::iter::once(system_msg.clone()).chain(h.iter().cloned()).collect::<Vec<_>>()
+                Self::request_messages(&system_msg, &h)
             };
             // history_tokens() takes the state *write* lock to refresh the
             // shared snapshot, so the read lock must be released first
@@ -647,14 +714,17 @@ it, inspect it, or take its contents into account for any task.\n",
 
             let (mut events, provider_cancel) = self
                 .provider()
-                .chat(chat_cancel.clone(), &ChatRequest {
-                    model: self.model(),
-                    messages,
-                    tools: tool_specs.clone(),
-                    thinking: self.thinking(),
-                    context_size: self.context_size.load(Ordering::SeqCst),
-                    max_output_tokens: None,
-                })
+                .chat(
+                    chat_cancel.clone(),
+                    &ChatRequest {
+                        model: self.model(),
+                        messages,
+                        tools: tool_specs.clone(),
+                        thinking: self.thinking(),
+                        context_size: self.context_size.load(Ordering::SeqCst),
+                        max_output_tokens: None,
+                    },
+                )
                 .await?;
 
             let mut pending_calls: Vec<ToolCall> = Vec::new();
@@ -723,15 +793,15 @@ it, inspect it, or take its contents into account for any task.\n",
                         // letting the agent quietly lose its memory.
                         // (>=512: a provider reporting a couple of tokens is a
                         // stub, not a server with a small default window.)
-                        if usage.prompt_tokens >= 512 && usage.prompt_tokens <= SUSPICIOUS_SMALL_WINDOW_TOKENS {
+                        if usage.prompt_tokens >= 512
+                            && usage.prompt_tokens <= SUSPICIOUS_SMALL_WINDOW_TOKENS
+                        {
                             let est = round_base_tokens as f64;
                             let real = usage.prompt_tokens as f64;
                             // Once per window: a server that trims does it on
                             // every round, and the warning would otherwise
                             // bury the very output it warns about.
-                            if est > real * 1.5
-                                && !self.trim_warned.swap(true, Ordering::SeqCst)
-                            {
+                            if est > real * 1.5 && !self.trim_warned.swap(true, Ordering::SeqCst) {
                                 self.ui.meta_colored(
                                     crate::ui::COLOR_RED,
                                     &format!(
@@ -755,7 +825,8 @@ contains about {} tokens of text - the server is likely dropping the front of th
             provider_cancel.cancel();
 
             if loop_detected {
-                self.ui.meta("[repetitive output detected; response cut short]");
+                self.ui
+                    .meta("[repetitive output detected; response cut short]");
                 self.push_history(Message {
                     role: Role::Assistant,
                     content: "[cut short: this response started repeating the same reasoning without making progress]"
@@ -767,7 +838,9 @@ contains about {} tokens of text - the server is likely dropping the front of th
                 break;
             }
             if !got_done {
-                return Err(AgentError::new("provider stream ended without a completion event"));
+                return Err(AgentError::new(
+                    "provider stream ended without a completion event",
+                ));
             }
             total_usage = sum_usage(total_usage, round_usage);
             last_round_usage = round_usage;
@@ -797,8 +870,11 @@ contains about {} tokens of text - the server is likely dropping the front of th
             }
             remaining_tool_budget -= pending_calls.len() as i64;
 
-            let mut assistant_msg =
-                Message { role: Role::Assistant, content: assistant_content, ..Default::default() };
+            let mut assistant_msg = Message {
+                role: Role::Assistant,
+                content: assistant_content,
+                ..Default::default()
+            };
             if self.tool_call_mode() != ToolCallMode::Prompt {
                 // Only attach native tool_calls when we actually asked for
                 // native tool-calling - in prompt mode the raw ```tool block
@@ -820,11 +896,14 @@ contains about {} tokens of text - the server is likely dropping the front of th
                     // through tools.call (which would just say "unknown
                     // tool"), and skip the sentinel name in anything shown to
                     // the user or fed back to the model.
-                    self.ui.tool_call(&format!("malformed ```tool block: {}", tc.arguments));
+                    self.ui
+                        .tool_call(&format!("malformed ```tool block: {}", tc.arguments));
                     err = Some(AgentError::new(tc.arguments.clone()));
                 } else {
                     self.ui.tool_call(&format!("{}({})", tc.name, tc.arguments));
-                    let call_ctx = CallCtx { cancel: cancel.clone() };
+                    let call_ctx = CallCtx {
+                        cancel: cancel.clone(),
+                    };
                     match self.tools.call(call_ctx, &tc.name, &tc.arguments).await {
                         Ok(r) => result = r,
                         Err(e) => err = Some(e),
@@ -833,7 +912,8 @@ contains about {} tokens of text - the server is likely dropping the front of th
                 if let Some(e) = &err {
                     result = format!("error: {}", e.message);
                     if tc.name != parse_error_tool_name() {
-                        self.ui.tool_call(&format!("{}: error: {}", tc.name, e.message));
+                        self.ui
+                            .tool_call(&format!("{}: error: {}", tc.name, e.message));
                     }
                 }
                 // Bound what a single result can add to history, whatever
@@ -854,7 +934,11 @@ contains about {} tokens of text - the server is likely dropping the front of th
                     } else {
                         format!("Tool result ({}): {}", tc.name, result)
                     };
-                    self.push_history(Message { role: Role::User, content, ..Default::default() });
+                    self.push_history(Message {
+                        role: Role::User,
+                        content,
+                        ..Default::default()
+                    });
                 } else {
                     self.push_history(Message {
                         role: Role::Tool,
@@ -874,16 +958,24 @@ contains about {} tokens of text - the server is likely dropping the front of th
                 self.compact(cancel.clone()).await;
             }
             // Loop again so the model can see the tool results.
-        };
+        }
 
         // A compaction that ran during this turn spent real tokens; the
         // metrics line and /plan//coding's notification must report them.
         total_usage = sum_usage(total_usage, self.take_compaction_usage());
         let elapsed = start.elapsed();
         let cs = self.final_context_status(last_round_usage);
-        let msg = format!("[{} wall={} | {}]", format_usage(total_usage), go_wall(elapsed), cs);
+        let msg = format!(
+            "[{} wall={} | {}]",
+            format_usage(total_usage),
+            go_wall(elapsed),
+            cs
+        );
         self.ui.meta_colored(cs.color(), &msg);
-        *self.last_usage.lock().unwrap() = UsageTotals { usage: total_usage, turn_elapsed: elapsed };
+        *self.last_usage.lock().unwrap() = UsageTotals {
+            usage: total_usage,
+            turn_elapsed: elapsed,
+        };
         {
             let mut s = self.ui.state.write().unwrap();
             s.turn_start = None;
@@ -1045,7 +1137,11 @@ contains about {} tokens of text - the server is likely dropping the front of th
         let at = msgs.iter().take_while(|m| m.role == Role::System).count();
         let mut out = Vec::with_capacity(msgs.len() + 1);
         out.extend(msgs[..at].iter().cloned());
-        out.push(Message { role: Role::User, content: anchor, ..Default::default() });
+        out.push(Message {
+            role: Role::User,
+            content: anchor,
+            ..Default::default()
+        });
         out.extend(msgs[at..].iter().cloned());
         out
     }
@@ -1070,7 +1166,8 @@ contains about {} tokens of text - the server is likely dropping the front of th
         // across the kept messages, with a floor so a kept message can still
         // carry a path and an error, and a ceiling so one bloated result
         // cannot spend the whole tail's budget.
-        let share = (self.summary_target_tokens() / keep.max(1) as i64).clamp(60, KEPT_TOOL_RESULT_TOKENS);
+        let share =
+            (self.summary_target_tokens() / keep.max(1) as i64).clamp(60, KEPT_TOOL_RESULT_TOKENS);
         history
             .iter()
             .map(|m| Message {
@@ -1093,7 +1190,12 @@ contains about {} tokens of text - the server is likely dropping the front of th
     /// only, too short to be worth its salt) - dropping stale middle history
     /// buys back most of the room, and it works even when the provider is
     /// failing, which is precisely when compaction is needed most.
-    fn prune_history(&self, summarized: &[Message], kept: &[Message], dropped: bool) -> Vec<Message> {
+    fn prune_history(
+        &self,
+        summarized: &[Message],
+        kept: &[Message],
+        dropped: bool,
+    ) -> Vec<Message> {
         let note = format!(
             "[{} earlier messages were pruned from history to fit the context window, without a summary \
 (ask the user or re-read files if you need what they contained)]",
@@ -1101,7 +1203,11 @@ contains about {} tokens of text - the server is likely dropping the front of th
         );
         let mut out = Vec::with_capacity(kept.len() + 1);
         if dropped {
-            out.push(Message { role: Role::System, content: note, ..Default::default() });
+            out.push(Message {
+                role: Role::System,
+                content: note,
+                ..Default::default()
+            });
         }
         out.extend(kept.iter().cloned());
         // Pruning drops the oldest messages, which is where the user's turn
@@ -1144,7 +1250,8 @@ contains about {} tokens of text - the server is likely dropping the front of th
             let before = tokens_of(&history);
             let after = tokens_of(&pruned);
             self.replace_history(pruned);
-            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.compact_floor_tokens
+                .store(self.request_tokens(), Ordering::SeqCst);
             self.ui.meta(&format!(
                 "[context] summarizing disabled after {} failed attempts - pruned {} older message(s) instead \
 ({} -> {} tokens); /context <smaller> or a new session will help]",
@@ -1186,7 +1293,8 @@ Reply with only the summary.",
             if tokens_of(&pruned) < tokens_of(&history) {
                 self.replace_history(pruned);
             }
-            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.compact_floor_tokens
+                .store(self.request_tokens(), Ordering::SeqCst);
             self.ui.meta(&format!(
                 "[context] window of {} tokens is too small to summarize ({} tokens are left for the \
 transcript after its instruction, {} needed), so the {} oldest message(s) were dropped instead - \
@@ -1203,8 +1311,16 @@ transcript after its instruction, {} needed), so the {} oldest message(s) were d
         let req = ChatRequest {
             model: self.model(),
             messages: vec![
-                Message { role: Role::System, content: instruction, ..Default::default() },
-                Message { role: Role::User, content: transcript.clone(), ..Default::default() },
+                Message {
+                    role: Role::System,
+                    content: instruction,
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::User,
+                    content: transcript.clone(),
+                    ..Default::default()
+                },
             ],
             tools: Vec::new(),
             thinking: false,
@@ -1216,7 +1332,10 @@ transcript after its instruction, {} needed), so the {} oldest message(s) were d
         let (mut events, provider_cancel) = match self.provider().chat(cancel.clone(), &req).await {
             Ok(v) => v,
             Err(e) => {
-                self.note_compaction_failure(&format!("[context compaction failed: {}; history kept]", e.message));
+                self.note_compaction_failure(&format!(
+                    "[context compaction failed: {}; history kept]",
+                    e.message
+                ));
                 return;
             }
         };
@@ -1260,7 +1379,10 @@ transcript after its instruction, {} needed), so the {} oldest message(s) were d
         drop(events);
         self.record_compaction_usage(summary_usage);
         if let Some(msg) = failed {
-            self.note_compaction_failure(&format!("[context compaction failed: {}; history kept]", msg));
+            self.note_compaction_failure(&format!(
+                "[context compaction failed: {}; history kept]",
+                msg
+            ));
             return;
         }
         if !got_done {
@@ -1273,7 +1395,9 @@ transcript after its instruction, {} needed), so the {} oldest message(s) were d
             return;
         }
         if loop_detected {
-            self.note_compaction_failure("[context compaction stopped: the summary started repeating itself; history kept]");
+            self.note_compaction_failure(
+                "[context compaction stopped: the summary started repeating itself; history kept]",
+            );
             return;
         }
         let summary = summary.trim().to_string();
@@ -1289,7 +1413,9 @@ history kept]",
         // what it would replace means the agent loses more than it keeps.
         let summary_tokens = estimate_tokens(&summary);
         let dropped_tokens = tokens_of(old);
-        if summary_tokens < self.min_summary_tokens() && summary_tokens.saturating_mul(20) < dropped_tokens {
+        if summary_tokens < self.min_summary_tokens()
+            && summary_tokens.saturating_mul(20) < dropped_tokens
+        {
             self.note_compaction_failure(&format!(
                 "[context compaction skipped: an ~{}-token summary would say less than the {} messages \
 (~{} tokens) it replaces; history kept]",
@@ -1310,7 +1436,11 @@ history kept]",
             target,
         );
         let mut next = Vec::with_capacity(tail.len() + 1);
-        next.push(Message { role: Role::System, content, ..Default::default() });
+        next.push(Message {
+            role: Role::System,
+            content,
+            ..Default::default()
+        });
         next.extend(tail.iter().cloned());
         // Belt and braces for the tail boundary (see [`Agent::strip_leading_orphans`]).
         let mut next = Self::strip_leading_orphans(next);
@@ -1329,7 +1459,8 @@ history kept]",
             // Even [summary, newest] is no smaller: there is nothing here
             // worth compacting. Require real regrowth before trying again, so
             // this cannot turn into a summarize request every single round.
-            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.compact_floor_tokens
+                .store(self.request_tokens(), Ordering::SeqCst);
             return;
         }
         // The summary is a system turn and the kept tail of an agent
@@ -1344,7 +1475,8 @@ history kept]",
             // nothing here worth compacting. Require real regrowth before
             // trying again, so this cannot turn into a summarize request every
             // single round.
-            self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+            self.compact_floor_tokens
+                .store(self.request_tokens(), Ordering::SeqCst);
             return;
         }
         let after = tokens_of(&next);
@@ -1352,7 +1484,8 @@ history kept]",
         let kept = next.iter().filter(|m| m.role != Role::System).count() - injected;
         self.replace_history(next);
         self.compact_failures.store(0, Ordering::SeqCst);
-        self.compact_floor_tokens.store(self.request_tokens(), Ordering::SeqCst);
+        self.compact_floor_tokens
+            .store(self.request_tokens(), Ordering::SeqCst);
         self.ui.meta(&format!(
             "[context compacted: {} messages summarized, ~{} -> ~{} tokens (transcript sent ~{} of ~{} tokens, \
 summary ~{} tokens, {} recent messages kept)]",
@@ -1375,7 +1508,9 @@ summary ~{} tokens, {} recent messages kept)]",
     fn summary_target_tokens(&self) -> i64 {
         let frac = self.compact_tunables().target_percent as f64 / 100.0;
         let tokens = (self.token_budget() as f64 * frac) as i64;
-        tokens.clamp(MIN_SUMMARY_TOKENS, MAX_SUMMARY_TOKENS).min(self.token_budget().max(1))
+        tokens
+            .clamp(MIN_SUMMARY_TOKENS, MAX_SUMMARY_TOKENS)
+            .min(self.token_budget().max(1))
     }
 
     /// Below this many tokens a summary is not worth the history it replaced
@@ -1500,8 +1635,6 @@ summary ~{} tokens, {} recent messages kept)]",
         self.compact(cancel).await;
     }
 }
-
-
 
 /// Cuts `s` to at most `max_chars` characters, keeping the beginning (70%)
 /// and the end (30%) with a marker between them.
@@ -1672,7 +1805,10 @@ fn transcript_for_summary(msgs: &[Message], cap_tokens: i64) -> (String, i64) {
         // may still be worth its bytes).
         let owned: Option<String> = match crate::tools::elide_data_uris(&m.content) {
             Some(elided) => Some(elided),
-            None if m.role == Role::Tool => Some(clamp_head_tail_tokens(&m.content, SUMMARY_TOOL_RESULT_TOKENS)),
+            None if m.role == Role::Tool => Some(clamp_head_tail_tokens(
+                &m.content,
+                SUMMARY_TOOL_RESULT_TOKENS,
+            )),
             None => None,
         };
         let body = owned.as_deref().unwrap_or(m.content.as_str());
@@ -1681,7 +1817,11 @@ fn transcript_for_summary(msgs: &[Message], cap_tokens: i64) -> (String, i64) {
         } else {
             format!(
                 " [requested: {}]",
-                m.tool_calls.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                m.tool_calls
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
         out.push_str(&format!("{}: {}{}\n", m.role, body, calls));
@@ -1840,30 +1980,54 @@ mod tests {
             vec![content("all done"), done(8, 2)],
         ];
         let (agent, echo, log) = new_test_agent(responses);
-        agent.run_turn(CancellationToken::new(), "please echo hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "please echo hi")
+            .await
+            .unwrap();
         assert!(echo.was_called());
         let h = agent.history.lock().unwrap();
-        assert!(h.iter().any(|m| m.role == Role::Tool && m.content == "echoed: hi"), "{:?}", h);
-        assert!(h.iter().any(|m| m.role == Role::Assistant && m.content == "all done"));
+        assert!(
+            h.iter()
+                .any(|m| m.role == Role::Tool && m.content == "echoed: hi"),
+            "{:?}",
+            h
+        );
+        assert!(h
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.content == "all done"));
         drop(h);
         let text = std::fs::read_to_string(&log.file).unwrap();
         let re = crate::testsupport::tool_call_header_pattern();
         assert!(re.is_match(&text), "tool call header missing: {text}");
         let re2 = crate::testsupport::answer_header_pattern();
         assert!(re2.is_match(&text), "answer header missing: {text}");
-        assert!(text.contains("token_in=13") && text.contains("token_out=3")
-            && text.contains("total_token=16"), "log: {}", text);
+        assert!(
+            text.contains("token_in=13")
+                && text.contains("token_out=3")
+                && text.contains("total_token=16"),
+            "log: {}",
+            text
+        );
         let lu = agent.last_usage.lock().unwrap();
         assert_eq!(lu.usage.total_tokens, 16);
-        assert_eq!((lu.usage.prompt_tokens, lu.usage.completion_tokens), (13, 3));
-        assert!(!lu.turn_elapsed.is_zero(), "turn_elapsed should be measured");
+        assert_eq!(
+            (lu.usage.prompt_tokens, lu.usage.completion_tokens),
+            (13, 3)
+        );
+        assert!(
+            !lu.turn_elapsed.is_zero(),
+            "turn_elapsed should be measured"
+        );
     }
 
     #[tokio::test]
     async fn no_model_set_errors() {
         let (agent, _echo, _log) = new_test_agent(vec![]);
         agent.set_model("");
-        let err = agent.run_turn(CancellationToken::new(), "hi").await.unwrap_err();
+        let err = agent
+            .run_turn(CancellationToken::new(), "hi")
+            .await
+            .unwrap_err();
         assert!(err.message.contains("no model set"), "got: {}", err.message);
     }
 
@@ -1872,10 +2036,16 @@ mod tests {
         let responses = vec![vec![content("no tool needed"), done(1, 1)]];
         let (agent, _echo, _log, provider) = new_test_agent_with_provider(responses);
         agent.set_tool_call_mode(ToolCallMode::Prompt);
-        agent.run_turn(CancellationToken::new(), "hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "hi")
+            .await
+            .unwrap();
         let reqs = provider.sent_reqs.lock().unwrap();
         assert_eq!(reqs.len(), 1);
-        assert!(!reqs[0].has_tools(), "prompt mode must not send a native tools spec");
+        assert!(
+            !reqs[0].has_tools(),
+            "prompt mode must not send a native tools spec"
+        );
         let sys = &reqs[0].messages[0].content;
         assert!(sys.contains("TOOL CALLING (PROMPT MODE)"), "sys: {sys}");
         assert!(sys.contains("echo: echoes text"), "sys: {sys}");
@@ -1890,10 +2060,15 @@ mod tests {
         ];
         let (agent, echo, _log) = new_test_agent(responses);
         agent.set_tool_call_mode(ToolCallMode::Prompt);
-        agent.run_turn(CancellationToken::new(), "please echo hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "please echo hi")
+            .await
+            .unwrap();
         assert!(!echo.was_called(), "malformed block must not run a tool");
         let h = agent.history.lock().unwrap();
-        let found = h.iter().any(|m| m.role == Role::User && m.content.contains("error: invalid JSON"));
+        let found = h
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains("error: invalid JSON"));
         assert!(found, "expected parse-error tool result: {:?}", h);
     }
 
@@ -1911,14 +2086,24 @@ mod tests {
         ];
         let (agent, echo, _log) = new_test_agent(responses);
         agent.set_tool_call_mode(ToolCallMode::Prompt);
-        agent.run_turn(CancellationToken::new(), "please echo hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "please echo hi")
+            .await
+            .unwrap();
         assert!(echo.was_called(), "fenced block should trigger a real call");
         let h = agent.history.lock().unwrap();
-        assert!(h.iter().any(|m| m.role == Role::User
-            && m.content.contains("Tool result (echo): echoed: hi")), "{:?}", h);
-        assert!(h.iter().all(|m| m.tool_calls.is_empty()), "no native tool_calls in prompt mode");
+        assert!(
+            h.iter()
+                .any(|m| m.role == Role::User
+                    && m.content.contains("Tool result (echo): echoed: hi")),
+            "{:?}",
+            h
+        );
+        assert!(
+            h.iter().all(|m| m.tool_calls.is_empty()),
+            "no native tool_calls in prompt mode"
+        );
     }
-
 
     fn d(ms: u64) -> std::time::Duration {
         std::time::Duration::from_millis(ms)
@@ -1946,7 +2131,6 @@ mod tests {
         assert_eq!(format_usage(Usage::default()), want);
     }
 
-
     #[tokio::test]
     async fn run_turn_detects_repetition_loop_and_cuts_short() {
         let a1 = "Wait, I will try the Dockerfile change to see if it resolves the dependency issue.\n\n";
@@ -1958,7 +2142,10 @@ mod tests {
         }
         events.push(done(1, 1));
         let (agent, _e, log) = new_test_agent(vec![events]);
-        agent.run_turn(CancellationToken::new(), "fix the docker build").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "fix the docker build")
+            .await
+            .unwrap();
         let h = agent.history.lock().unwrap();
         let last = h.last().expect("history");
         assert_eq!(last.role, Role::Assistant);
@@ -1979,7 +2166,11 @@ mod tests {
         let responses = vec![
             vec![
                 ChatEvent::ToolCalls {
-                    tool_calls: vec![ToolCall { id: "call_1".into(), name: "echo".into(), arguments: args }],
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "echo".into(),
+                        arguments: args,
+                    }],
                 },
                 done(1, 1),
             ],
@@ -1988,13 +2179,20 @@ mod tests {
         ];
         let (agent, _e, log) = new_test_agent(responses);
         agent.set_context_size(512); // trigger at ~307 tokens
-        agent.run_turn(CancellationToken::new(), "do the big thing").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "do the big thing")
+            .await
+            .unwrap();
         let h = agent.history.lock().unwrap();
         // The summary now leads the history; the recent messages that follow
         // it are kept verbatim (that is the point - the agent must not forget
         // what it was doing mid-turn), and the final answer lands at the end.
         assert_eq!(h[0].role, Role::System);
-        assert!(h[0].content.contains("Summary of earlier conversation"), "got: {}", h[0].content);
+        assert!(
+            h[0].content.contains("Summary of earlier conversation"),
+            "got: {}",
+            h[0].content
+        );
         let last = h.last().unwrap();
         assert_eq!(last.role, Role::Assistant);
         assert_eq!(last.content, "final answer");
@@ -2014,8 +2212,8 @@ mod tests {
         // compaction really does summarize (a 100-token window cannot, and the
         // assertion below used to pass against an untouched history).
         agent.set_context_size(512); // target = 25% = 128 tokens
-        // History must be worth shrinking: if the summary + kept tail is not
-        // smaller than what it replaces, compaction correctly does nothing.
+                                     // History must be worth shrinking: if the summary + kept tail is not
+                                     // smaller than what it replaces, compaction correctly does nothing.
         let filler = "a long-winded body that summarizing will shrink ".repeat(20);
         for i in 0..8 {
             agent.push_history(Message {
@@ -2028,7 +2226,10 @@ mod tests {
         let h = agent.history.lock().unwrap();
         let target = agent.summary_target_tokens();
         let summary = &h[0].content;
-        assert!(summary.starts_with("Summary of earlier conversation"), "got: {summary}");
+        assert!(
+            summary.starts_with("Summary of earlier conversation"),
+            "got: {summary}"
+        );
         assert!(
             estimate_tokens(summary) <= target,
             "expected <= {} tokens, got {}",
@@ -2050,7 +2251,11 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             }
         }
-        async fn call(&self, _ctx: crate::tools::CallCtx, _args: &serde_json::Value) -> crate::error::R<String> {
+        async fn call(
+            &self,
+            _ctx: crate::tools::CallCtx,
+            _args: &serde_json::Value,
+        ) -> crate::error::R<String> {
             Ok(self.0.clone())
         }
     }
@@ -2061,7 +2266,11 @@ mod tests {
         for max in 1..40usize {
             let out = truncate_bytes(&thai, max);
             assert!(out.is_char_boundary(out.len()), "cut at {max} split a rune");
-            assert!(out.len() <= max, "truncate_bytes(_, {max}) returned {} bytes", out.len());
+            assert!(
+                out.len() <= max,
+                "truncate_bytes(_, {max}) returned {} bytes",
+                out.len()
+            );
         }
         assert_eq!(truncate_bytes("abc", 10), "abc");
     }
@@ -2086,10 +2295,11 @@ mod tests {
             let responses = vec![vec![content(&body), done(1, 1)]];
             let (agent, _e, _log) = new_test_agent(responses);
             agent.set_context_size(512); // target = 25% = 128 tokens
-            // Enough history that a 128-token summary is a real shrink.
+                                         // Enough history that a 128-token summary is a real shrink.
             agent.push_history(Message {
                 role: Role::User,
-                content: "some prior turn with a body long enough to be worth summarizing ".repeat(30),
+                content: "some prior turn with a body long enough to be worth summarizing "
+                    .repeat(30),
                 ..Default::default()
             });
             agent.compact(CancellationToken::new()).await;
@@ -2117,7 +2327,10 @@ mod tests {
     fn thai_history_is_estimated_at_its_real_token_cost() {
         let thai: String = (0..1000).map(|_| char::from_u32(0x0E2A).unwrap()).collect();
         let t = estimate_tokens(&thai);
-        assert!((500..=700).contains(&t), "1000 Thai chars should be ~500-660 tokens, got {t}");
+        assert!(
+            (500..=700).contains(&t),
+            "1000 Thai chars should be ~500-660 tokens, got {t}"
+        );
         // English keeps the old behaviour.
         assert_eq!(estimate_tokens(&"x".repeat(4000)), 1000);
         // And mixed text costs at least as much as either part alone.
@@ -2126,11 +2339,20 @@ mod tests {
 
     #[test]
     fn clamp_head_tail_keeps_both_ends_within_the_char_budget() {
-        let s: String = (0..1000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let s: String = (0..1000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
         let cut = clamp_head_tail_chars(&s, 200);
-        assert!(cut.chars().count() <= 200, "got {} chars", cut.chars().count());
+        assert!(
+            cut.chars().count() <= 200,
+            "got {} chars",
+            cut.chars().count()
+        );
         assert!(cut.starts_with("abcdefghij"), "head dropped: {cut}");
-        assert!(cut.ends_with(&s[s.chars().count() - 30..]), "tail dropped: {cut}");
+        assert!(
+            cut.ends_with(&s[s.chars().count() - 30..]),
+            "tail dropped: {cut}"
+        );
         // Thai (3 bytes/char) must be cut on a boundary and by characters.
         let thai: String = (0..500).map(|_| char::from_u32(0x0E01).unwrap()).collect();
         let cut = clamp_head_tail_chars(&thai, 100);
@@ -2146,7 +2368,12 @@ mod tests {
     async fn empty_or_thinking_only_summary_never_clears_history() {
         for events in [
             vec![done(1, 1)], // Done, no content at all
-            vec![ChatEvent::Thinking { delta: "pondering the transcript".into() }, done(1, 1)],
+            vec![
+                ChatEvent::Thinking {
+                    delta: "pondering the transcript".into(),
+                },
+                done(1, 1),
+            ],
             vec![], // stream ended without a completion event
         ] {
             let (agent, _e, log) = new_test_agent(vec![events]);
@@ -2161,8 +2388,14 @@ mod tests {
             let before = agent.history.lock().unwrap().len();
             agent.compact(CancellationToken::new()).await;
             let h = agent.history.lock().unwrap();
-            assert_eq!(h.len(), before, "history must survive a summary-less compaction");
-            assert!(h.iter().all(|m| !m.content.starts_with("Summary of earlier conversation")));
+            assert_eq!(
+                h.len(),
+                before,
+                "history must survive a summary-less compaction"
+            );
+            assert!(h
+                .iter()
+                .all(|m| !m.content.starts_with("Summary of earlier conversation")));
             drop(h);
             let text = std::fs::read_to_string(&log.file).unwrap();
             assert!(text.contains("history kept"), "log: {text}");
@@ -2178,23 +2411,48 @@ mod tests {
         let blob = "data:image/png;base64,";
         let mut big = String::from(blob);
         big.push_str(&"A".repeat(300_000));
-        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let responses = vec![vec![
+            content("a usable summary of the conversation so far"),
+            done(1, 1),
+        ]];
         let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
         agent.set_context_size(4096);
         for i in 0..10 {
-            let content = if i == 3 { big.clone() } else { format!("ordinary message {i}") };
-            agent.push_history(Message { role: Role::Tool, content, name: "t".into(), ..Default::default() });
+            let content = if i == 3 {
+                big.clone()
+            } else {
+                format!("ordinary message {i}")
+            };
+            agent.push_history(Message {
+                role: Role::Tool,
+                content,
+                name: "t".into(),
+                ..Default::default()
+            });
         }
         agent.compact(CancellationToken::new()).await;
         let reqs = provider.sent_reqs.lock().unwrap();
         let req = reqs.last().expect("a summarize request");
-        assert_eq!(req.context_size, 4096, "num_ctx must be declared, never left at 0");
-        assert!(req.max_output_tokens.unwrap_or(0) > 0, "the reply must be length-capped");
+        assert_eq!(
+            req.context_size, 4096,
+            "num_ctx must be declared, never left at 0"
+        );
+        assert!(
+            req.max_output_tokens.unwrap_or(0) > 0,
+            "the reply must be length-capped"
+        );
         let transcript = estimate_tokens(&req.messages.last().unwrap().content);
         let cap = agent.transcript_cap_tokens();
-        assert!(transcript <= cap, "transcript {transcript} tokens exceeds the cap of {cap}");
         assert!(
-            !req.messages.last().unwrap().content.contains("data:image/png;base64,AAAA"),
+            transcript <= cap,
+            "transcript {transcript} tokens exceeds the cap of {cap}"
+        );
+        assert!(
+            !req.messages
+                .last()
+                .unwrap()
+                .content
+                .contains("data:image/png;base64,AAAA"),
             "the base64 blob must not be sent to the summarizer"
         );
     }
@@ -2206,19 +2464,36 @@ mod tests {
     /// original failure, just only for non-English conversations.
     #[tokio::test]
     async fn a_thai_transcript_cannot_oversize_the_summarize_request() {
-        let thai: String = (0..40_000).map(|_| char::from_u32(0x0E01).unwrap()).collect();
-        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let thai: String = (0..40_000)
+            .map(|_| char::from_u32(0x0E01).unwrap())
+            .collect();
+        let responses = vec![vec![
+            content("a usable summary of the conversation so far"),
+            done(1, 1),
+        ]];
         let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
         agent.set_context_size(4096);
         for i in 0..12 {
-            let body = if i == 1 { thai.clone() } else { format!("ordinary message {i}") };
-            agent.push_history(Message { role: Role::User, content: body, ..Default::default() });
+            let body = if i == 1 {
+                thai.clone()
+            } else {
+                format!("ordinary message {i}")
+            };
+            agent.push_history(Message {
+                role: Role::User,
+                content: body,
+                ..Default::default()
+            });
         }
         let window = 4096;
         agent.compact(CancellationToken::new()).await;
         let reqs = provider.sent_reqs.lock().unwrap();
         let req = reqs.last().expect("a summarize request");
-        let sent: i64 = req.messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+        let sent: i64 = req
+            .messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content))
+            .sum();
         assert!(
             sent < window,
             "the summarize request was ~{sent} tokens against a {window}-token window"
@@ -2246,13 +2521,27 @@ mod tests {
             agent.compact(CancellationToken::new()).await;
         }
         let calls = provider.call_count();
-        assert_eq!(calls as i64, COMPACT_MAX_FAILURES, "expected exactly {COMPACT_MAX_FAILURES} summarize attempts, got {calls}");
+        assert_eq!(
+            calls as i64, COMPACT_MAX_FAILURES,
+            "expected exactly {COMPACT_MAX_FAILURES} summarize attempts, got {calls}"
+        );
         // History was pruned instead of left to grow.
-        let chars: usize = agent.history.lock().unwrap().iter().map(|m| m.content.len()).sum();
+        let chars: usize = agent
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.len())
+            .sum();
         let total: usize = (0..10)
             .map(|i| format!("message {i} with plenty of content to be worth summarizing").len())
             .sum();
-        assert!(chars < total, "history should have shrunk, {} vs {}", chars, total);
+        assert!(
+            chars < total,
+            "history should have shrunk, {} vs {}",
+            chars,
+            total
+        );
     }
 
     /// The messages the agent is working with must survive a compaction:
@@ -2260,13 +2549,18 @@ mod tests {
     /// refill the window immediately.
     #[tokio::test]
     async fn compaction_keeps_recent_messages_verbatim() {
-        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let responses = vec![vec![
+            content("a usable summary of the conversation so far"),
+            done(1, 1),
+        ]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(320);
         for i in 0..10 {
             agent.push_history(Message {
                 role: if i % 2 == 0 { Role::User } else { Role::Tool },
-                content: format!("message number {i} containing src/main.rs and the error about E0382"),
+                content: format!(
+                    "message number {i} containing src/main.rs and the error about E0382"
+                ),
                 ..Default::default()
             });
         }
@@ -2275,9 +2569,16 @@ mod tests {
         assert_eq!(h[0].role, Role::System, "the summary leads");
         assert!(h[0].content.contains("Summary of earlier conversation"));
         let last = h.last().unwrap().content.clone();
-        assert!(last.contains("message number 9"), "recent message not kept verbatim: {last}");
+        assert!(
+            last.contains("message number 9"),
+            "recent message not kept verbatim: {last}"
+        );
         let keep = agent.compact_tunables().keep_recent as usize;
-        assert!(h.len() > keep, "expected the recent tail to survive: {} messages", h.len());
+        assert!(
+            h.len() > keep,
+            "expected the recent tail to survive: {} messages",
+            h.len()
+        );
     }
 
     /// An agent conversation is mostly tool calls and tool results, so the
@@ -2291,7 +2592,8 @@ mod tests {
     #[tokio::test]
     async fn compacted_history_still_carries_a_user_turn() {
         let summary = "decided to route the proxy through a process-wide transport slot; \
-updated config, dotenv and the repl; tests pass; open task is the README wording. ".repeat(4);
+updated config, dotenv and the repl; tests pass; open task is the README wording. "
+            .repeat(4);
         let responses = vec![vec![content(&summary), done(1, 1)]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(2048);
@@ -2299,7 +2601,9 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         // results. The kept tail lands entirely inside the tool rounds.
         agent.push_history(Message {
             role: Role::User,
-            content: "add SOCKS proxy support via argument, .env, environment variable and slash command".into(),
+            content:
+                "add SOCKS proxy support via argument, .env, environment variable and slash command"
+                    .into(),
             ..Default::default()
         });
         for i in 0..10 {
@@ -2315,7 +2619,9 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             });
             agent.push_history(Message {
                 role: Role::Tool,
-                content: format!("test result of step {i}: 284 passed; 0 failed; some more output text here"),
+                content: format!(
+                    "test result of step {i}: 284 passed; 0 failed; some more output text here"
+                ),
                 tool_call_id: format!("call_{i}"),
                 name: "run_command".into(),
                 ..Default::default()
@@ -2341,21 +2647,22 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             task.content
         );
         assert!(
-            h.windows(2).all(|w| w[0].role != Role::System || w[1].role != Role::System),
+            h.windows(2)
+                .all(|w| w[0].role != Role::System || w[1].role != Role::System),
             "the carried task belongs after the summary, not stacked with another system turn"
         );
     }
 
     /// The same failure end-to-end: the request *after* a compaction is the
     /// one the server rejects. Checks the shape a strict OpenAI-compatible
-    /// server needs - a user turn, and no `tool` result whose call was never
-    /// requested in this request.
+    /// server needs - a user turn, no `tool` result whose call was never
+    /// requested in this request, and no `system` turn away from index 0.
     #[tokio::test]
     async fn the_request_after_a_compaction_is_acceptable_to_a_strict_server() {
         let summary = "compacted everything: the proxy lives in a process-wide slot, config and dotenv both feed it. ".repeat(4);
         let responses = vec![
             vec![content(&summary), done(1, 1)], // the summarize request
-            vec![content("done"), done(1, 1)], // the turn's real request
+            vec![content("done"), done(1, 1)],   // the turn's real request
         ];
         let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
         agent.set_context_size(512); // trigger at ~307 tokens
@@ -2377,13 +2684,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             });
             agent.push_history(Message {
                 role: Role::Tool,
-                content: format!("contents of part{i}: a body of text long enough to be worth summarizing here"),
+                content: format!(
+                    "contents of part{i}: a body of text long enough to be worth summarizing here"
+                ),
                 tool_call_id: format!("call_{i}"),
                 name: "read_file".into(),
                 ..Default::default()
             });
         }
-        agent.run_turn(CancellationToken::new(), "rerun the tests and summarize").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "rerun the tests and summarize")
+            .await
+            .unwrap();
 
         let reqs = provider.sent_reqs.lock().unwrap();
         assert_eq!(reqs.len(), 2, "expected a summarize request then the turn");
@@ -2392,6 +2704,28 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             sent.iter().any(|m| m.role == Role::User),
             "no user turn: {:?}",
             sent.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        // Exactly one system turn, and it leads: the Qwen3-family chat
+        // template answers any other arrangement with
+        // `400 System message must be at the beginning.`
+        let systems: Vec<usize> = sent
+            .iter()
+            .enumerate()
+            .filter(|(_i, m)| m.role == Role::System)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            systems,
+            vec![0],
+            "a second/misplaced system turn is a 400: {:?}",
+            sent.iter().map(|m| m.role).collect::<Vec<_>>()
+        );
+        // Folding it into the leading turn must not lose it: the summary is
+        // the only copy of the first 20 rounds the agent has.
+        assert!(
+            sent[0].content.contains("Summary of earlier conversation"),
+            "the summary was dropped on the way to the request: {}",
+            sent[0].content
         );
         // Every tool result must be answering a call present in the request.
         for (i, m) in sent.iter().enumerate() {
@@ -2408,36 +2742,149 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         }
     }
 
+    /// Compaction's summary is a `system` turn living inside history, and a
+    /// request is the turn's own system message followed by history - so
+    /// before folding, the request that goes out after a compaction starts
+    /// `[system, system, …]`. The Qwen3-family chat template (vLLM, llama.cpp,
+    /// Ollama builds; vllm-project/vllm#41114) validates that `system` appears
+    /// only at index 0 and rejects anything else with
+    /// `400 System message must be at the beginning.`, which killed the session
+    /// right after a compaction that had just reported success. The prune note
+    /// is the second shape that puts a `system` turn into history.
+    #[test]
+    fn request_messages_fold_extra_system_turns_into_the_leading_one() {
+        let system = Message {
+            role: Role::System,
+            content: "instructions\n".into(),
+            ..Default::default()
+        };
+        let history = vec![
+            Message {
+                role: Role::System,
+                content: "Summary of earlier conversation:\nthe task".into(),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: "keep going".into(),
+                ..Default::default()
+            },
+            Message {
+                role: Role::System,
+                content: "  ".into(),
+                ..Default::default()
+            }, // empty: dropped
+            Message {
+                role: Role::System,
+                content: "[3 earlier messages were pruned]".into(),
+                ..Default::default()
+            },
+        ];
+        let out = Agent::request_messages(&system, &history);
+        let roles: Vec<Role> = out.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::System, Role::User], "{roles:?}");
+        let head = &out[0].content;
+        assert!(
+            head.starts_with("instructions"),
+            "the system prompt still leads: {head}"
+        );
+        assert!(
+            head.contains("Summary of earlier conversation:\nthe task"),
+            "summary lost: {head}"
+        );
+        assert!(
+            head.contains("[3 earlier messages were pruned]"),
+            "prune note lost: {head}"
+        );
+        assert!(
+            !head.contains("Summary of earlier conversation:\nthe task\n[3"),
+            "turns ran together: {head:?}"
+        );
+        // History itself is untouched - `/history` still shows the summary as
+        // its own message.
+        assert_eq!(history[0].role, Role::System);
+        // A history with no system turn is passed through unchanged.
+        let plain = vec![
+            Message {
+                role: Role::User,
+                content: "a".into(),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: "b".into(),
+                ..Default::default()
+            },
+        ];
+        let out = Agent::request_messages(&system, &plain);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].content, "a");
+        assert_eq!(out[2].content, "b");
+    }
+
     /// A tool result is meaningless without the assistant message that
     /// requested it, so the kept tail must never start mid-round.
     #[test]
     fn tail_start_never_splits_a_tool_round() {
         // [user, assistant+call, tool, assistant+call, tool, tool]
-        let mut msgs = vec![Message { role: Role::User, content: "task".into(), ..Default::default() }];
+        let mut msgs = vec![Message {
+            role: Role::User,
+            content: "task".into(),
+            ..Default::default()
+        }];
         for i in 0..2 {
             msgs.push(Message {
                 role: Role::Assistant,
                 content: String::new(),
-                tool_calls: vec![ToolCall { id: format!("c{i}"), name: "t".into(), arguments: "{}".into() }],
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "t".into(),
+                    arguments: "{}".into(),
+                }],
                 ..Default::default()
             });
-            msgs.push(Message { role: Role::Tool, content: "r".into(), tool_call_id: format!("c{i}"), name: "t".into(), ..Default::default() });
+            msgs.push(Message {
+                role: Role::Tool,
+                content: "r".into(),
+                tool_call_id: format!("c{i}"),
+                name: "t".into(),
+                ..Default::default()
+            });
         }
-        msgs.push(Message { role: Role::Tool, content: "r2".into(), tool_call_id: "c1".into(), name: "t".into(), ..Default::default() });
+        msgs.push(Message {
+            role: Role::Tool,
+            content: "r2".into(),
+            tool_call_id: "c1".into(),
+            name: "t".into(),
+            ..Default::default()
+        });
         // The last message is a tool result: keeping 1 or 2 would start the
         // tail on a result whose call lives behind it.
         for keep in 1..4 {
             let start = Agent::tail_start(&msgs, keep);
-            assert_ne!(msgs[start].role, Role::Tool, "tail starts on an orphan result at keep={keep}");
+            assert_ne!(
+                msgs[start].role,
+                Role::Tool,
+                "tail starts on an orphan result at keep={keep}"
+            );
         }
         // A window holding nothing but tool results cannot be realigned (it
         // would leave nothing to summarize), so the orphans are dropped
         // instead of being kept unpairable.
         let only_tools: Vec<Message> = (0..6)
-            .map(|i| Message { role: Role::Tool, content: "r".into(), tool_call_id: format!("c{i}"), name: "t".into(), ..Default::default() })
+            .map(|i| Message {
+                role: Role::Tool,
+                content: "r".into(),
+                tool_call_id: format!("c{i}"),
+                name: "t".into(),
+                ..Default::default()
+            })
             .collect();
         let start = Agent::tail_start(&only_tools, 4);
-        assert!(start >= only_tools.len() || only_tools[start].role != Role::Tool, "keep={start}");
+        assert!(
+            start >= only_tools.len() || only_tools[start].role != Role::Tool,
+            "keep={start}"
+        );
     }
 
     /// The shrink loop removes the oldest kept message until summary + tail is
@@ -2447,13 +2894,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     /// so they go with it.
     #[tokio::test]
     async fn shrinking_to_really_save_drops_orphaned_tool_results() {
-        let summary = "the proxy lives in one process-wide slot that every client looks up".repeat(2);
+        let summary =
+            "the proxy lives in one process-wide slot that every client looks up".repeat(2);
         let responses = vec![vec![content(summary.as_str()), done(1, 1)]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(512); // summary target = 128 tokens
-        // The summarized part is nearly free next to the tail, so summary +
-        // tail is not yet a shrink and the loop has to remove something.
-        agent.push_history(Message { role: Role::User, content: "ok".into(), ..Default::default() });
+                                     // The summarized part is nearly free next to the tail, so summary +
+                                     // tail is not yet a shrink and the loop has to remove something.
+        agent.push_history(Message {
+            role: Role::User,
+            content: "ok".into(),
+            ..Default::default()
+        });
         // The oldest kept round: a call with a long argument (kept verbatim -
         // only message *content* is clamped) and a result.
         agent.push_history(Message {
@@ -2462,13 +2914,17 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
                 name: "run_command".into(),
-                arguments: format!(r#"{{"command":"{}"}}"#, "cargo test --all-features ".repeat(30)),
+                arguments: format!(
+                    r#"{{"command":"{}"}}"#,
+                    "cargo test --all-features ".repeat(30)
+                ),
             }],
             ..Default::default()
         });
         agent.push_history(Message {
             role: Role::Tool,
-            content: "the result of that long command, with enough text in it to cost a few tokens".into(),
+            content: "the result of that long command, with enough text in it to cost a few tokens"
+                .into(),
             tool_call_id: "c1".into(),
             name: "run_command".into(),
             ..Default::default()
@@ -2502,7 +2958,8 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         // The shrink loop really did run - otherwise the orphan check below is
         // vacuous.
         assert!(
-            h.iter().all(|m| m.tool_calls.iter().all(|tc| tc.id != "c1")),
+            h.iter()
+                .all(|m| m.tool_calls.iter().all(|tc| tc.id != "c1")),
             "the oldest kept round was not dropped, so nothing was orphaned: {:?}",
             h.iter().map(|m| m.role).collect::<Vec<_>>()
         );
@@ -2538,7 +2995,11 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             agent.push_history(Message {
                 role: Role::Assistant,
                 content: String::new(),
-                tool_calls: vec![ToolCall { id: format!("c{i}"), name: "t".into(), arguments: "{}".into() }],
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "t".into(),
+                    arguments: "{}".into(),
+                }],
                 ..Default::default()
             });
             agent.push_history(Message {
@@ -2582,12 +3043,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         let (agent, _e, log, provider) = new_test_agent_with_provider(Vec::new());
         agent.set_context_size(96); // less than the instruction costs
         let original: Vec<Message> = (0..10)
-            .map(|i| {
-                Message {
-                    role: Role::User,
-                    content: format!("message {i} with plenty of content to be worth summarizing"),
-                    ..Default::default()
-                }
+            .map(|i| Message {
+                role: Role::User,
+                content: format!("message {i} with plenty of content to be worth summarizing"),
+                ..Default::default()
             })
             .collect();
         let before = tokens_of(&original);
@@ -2595,11 +3054,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             agent.push_history(m);
         }
         agent.compact(CancellationToken::new()).await;
-        assert_eq!(provider.call_count(), 0, "no summarize request may be sent to this window");
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "no summarize request may be sent to this window"
+        );
         let text = std::fs::read_to_string(&log.file).unwrap();
         assert!(text.contains("too small to summarize"), "log: {text}");
         let after = tokens_of(&agent.history.lock().unwrap());
-        assert!(after < before, "history should have shrunk: {before} -> {after} tokens");
+        assert!(
+            after < before,
+            "history should have shrunk: {before} -> {after} tokens"
+        );
     }
 
     /// A tool result is capped before it can reach history, so one
@@ -2611,17 +3077,38 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         let mut reg = crate::tools::Registry::new();
         reg.register(std::sync::Arc::new(BlobTool(huge.clone())));
         let out = reg
-            .call(crate::tools::CallCtx { cancel: CancellationToken::new() }, "blob", "{}")
+            .call(
+                crate::tools::CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                "blob",
+                "{}",
+            )
             .await
             .unwrap();
         assert!(out.chars().count() <= crate::tools::max_tool_result_chars());
-        assert!(out.contains("omitted to fit"), "expected a truncation marker: {out}");
+        assert!(
+            out.contains("omitted to fit"),
+            "expected a truncation marker: {out}"
+        );
         // The tail is what matters most (exit codes, errors) and must survive.
-        assert!(out.trim_end().ends_with("build output line"), "tail was dropped");
+        assert!(
+            out.trim_end().ends_with("build output line"),
+            "tail was dropped"
+        );
         // And a small result is untouched.
         let mut small = crate::tools::Registry::new();
         small.register(std::sync::Arc::new(BlobTool("short".into())));
-        let out = small.call(crate::tools::CallCtx { cancel: CancellationToken::new() }, "blob", "{}").await.unwrap();
+        let out = small
+            .call(
+                crate::tools::CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                "blob",
+                "{}",
+            )
+            .await
+            .unwrap();
         assert_eq!(out, "short");
     }
 
@@ -2634,12 +3121,23 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         agent.set_context_size(1000); // trigger at 600 tokens
         agent.ui.state.write().unwrap().sys_tokens = 400;
         agent.ui.state.write().unwrap().spec_tokens = 150;
-        agent.push_history(Message { role: Role::User, content: "x".repeat(180), ..Default::default() });
+        agent.push_history(Message {
+            role: Role::User,
+            content: "x".repeat(180),
+            ..Default::default()
+        });
         // 400 + 150 + 45 = 595 - under the trigger...
         assert!(!agent.should_compact());
-        agent.push_history(Message { role: Role::User, content: "y".repeat(80), ..Default::default() });
+        agent.push_history(Message {
+            role: Role::User,
+            content: "y".repeat(80),
+            ..Default::default()
+        });
         // ...and over once the fixed overhead is included (615 > 600).
-        assert!(agent.should_compact(), "fixed overhead must count towards the trigger");
+        assert!(
+            agent.should_compact(),
+            "fixed overhead must count towards the trigger"
+        );
     }
 
     /// After a compaction the request cannot get meaningfully smaller (the
@@ -2647,7 +3145,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     /// window would re-compact on every tool round forever.
     #[tokio::test]
     async fn compaction_does_not_refire_without_regrowth() {
-        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let responses = vec![vec![
+            content("a usable summary of the conversation so far"),
+            done(1, 1),
+        ]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(200); // tiny: even the summary sits over the trigger
         for i in 0..12 {
@@ -2659,20 +3160,28 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         }
         agent.compact(CancellationToken::new()).await;
         assert!(agent.compact_floor_tokens.load(Ordering::SeqCst) > 0);
-        assert!(!agent.should_compact(), "immediately after a compaction the trigger must be off");
+        assert!(
+            !agent.should_compact(),
+            "immediately after a compaction the trigger must be off"
+        );
     }
 
     /// `/history` and `/compact` exist so this subsystem can be inspected and
     /// driven by hand instead of only by a 20-turn session.
     #[tokio::test]
     async fn force_compact_and_history_report_are_available() {
-        let responses = vec![vec![content("a usable summary of the conversation so far"), done(1, 1)]];
+        let responses = vec![vec![
+            content("a usable summary of the conversation so far"),
+            done(1, 1),
+        ]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(8000); // nowhere near the trigger
         for i in 0..10 {
             agent.push_history(Message {
                 role: Role::User,
-                content: format!("message {i} carrying a paragraph of text so summarizing it pays off"),
+                content: format!(
+                    "message {i} carrying a paragraph of text so summarizing it pays off"
+                ),
                 ..Default::default()
             });
         }
@@ -2680,7 +3189,9 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         assert!(report.contains("user"), "{report}");
         assert!(report.contains("total history"), "{report}");
         agent.force_compact(CancellationToken::new()).await;
-        assert!(agent.history.lock().unwrap()[0].content.contains("Summary of earlier conversation"));
+        assert!(agent.history.lock().unwrap()[0]
+            .content
+            .contains("Summary of earlier conversation"));
     }
 
     /// `read_pic` hands back a base64 data URI. The provider only ever gets
@@ -2699,7 +3210,11 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         });
         let h = agent.history.lock().unwrap();
         let content = &h[0].content;
-        assert!(content.len() < 500, "the payload should have been dropped: {} bytes", content.len());
+        assert!(
+            content.len() < 500,
+            "the payload should have been dropped: {} bytes",
+            content.len()
+        );
         assert!(content.contains("image/png"), "{content}");
         assert!(content.contains("bytes omitted"), "{content}");
         assert!(content.contains("read_pic"), "{content}");
@@ -2710,7 +3225,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             content: "data:image/png;base64,AAAA".into(),
             ..Default::default()
         });
-        assert_eq!(agent.history.lock().unwrap()[1].content, "data:image/png;base64,AAAA");
+        assert_eq!(
+            agent.history.lock().unwrap()[1].content,
+            "data:image/png;base64,AAAA"
+        );
     }
 
     /// History can already be too big when a turn starts (the previous turn's
@@ -2721,7 +3239,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     async fn run_turn_compacts_before_its_first_request_when_history_is_big() {
         let responses = vec![
             // #1: the summarize request, issued before anything is sent.
-            vec![content("a usable summary of the conversation so far"), done(1, 1)],
+            vec![
+                content("a usable summary of the conversation so far"),
+                done(1, 1),
+            ],
             // #2: the actual turn.
             vec![content("answer"), done(1, 1)],
         ];
@@ -2730,17 +3251,37 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         for i in 0..12 {
             agent.push_history(Message {
                 role: Role::User,
-                content: format!("earlier message {i} with a body long enough to push history over the trigger"),
+                content: format!(
+                    "earlier message {i} with a body long enough to push history over the trigger"
+                ),
                 ..Default::default()
             });
         }
-        agent.run_turn(CancellationToken::new(), "carry on").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "carry on")
+            .await
+            .unwrap();
         let reqs = provider.sent_reqs.lock().unwrap();
-        assert_eq!(reqs.len(), 2, "expected a summarize request followed by the turn");
-        assert_eq!(reqs[0].messages.len(), 2, "the summarize request is [instruction, transcript]");
-        assert!(reqs[0].messages[0].content.starts_with("Summarize the conversation"));
-        assert!(reqs[1].messages.iter().any(|m| m.content.contains("Summary of earlier conversation")),
-            "the turn's request must carry the summary, not the original history");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected a summarize request followed by the turn"
+        );
+        assert_eq!(
+            reqs[0].messages.len(),
+            2,
+            "the summarize request is [instruction, transcript]"
+        );
+        assert!(reqs[0].messages[0]
+            .content
+            .starts_with("Summarize the conversation"));
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Summary of earlier conversation")),
+            "the turn's request must carry the summary, not the original history"
+        );
     }
 
     // --- ported from Go agent_test.go -------------------------------------
@@ -2759,7 +3300,11 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
 
         agent.set_coding_mode(true);
         let strict = agent.build_system_message();
-        assert!(strict.content.contains("AUTONOMOUS CODING MODE"), "got: {}", strict.content);
+        assert!(
+            strict.content.contains("AUTONOMOUS CODING MODE"),
+            "got: {}",
+            strict.content
+        );
         assert!(
             strict.content.contains("run_command in THIS SAME turn"),
             "verify-before-done rule missing: {}",
@@ -2772,12 +3317,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     fn system_message_always_includes_decisive_thinking_directive() {
         let (agent, _echo, _log) = new_test_agent(Vec::new());
         assert!(
-            agent.build_system_message().content.contains("Think and act decisively"),
+            agent
+                .build_system_message()
+                .content
+                .contains("Think and act decisively"),
             "plain chat mode"
         );
         agent.set_coding_mode(true);
         assert!(
-            agent.build_system_message().content.contains("Think and act decisively"),
+            agent
+                .build_system_message()
+                .content
+                .contains("Think and act decisively"),
             "coding mode"
         );
     }
@@ -2842,7 +3393,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     #[test]
     fn sum_usage_keeps_estimated_flags() {
         let got = sum_usage(
-            Usage { has_timing: true, ..Default::default() },
+            Usage {
+                has_timing: true,
+                ..Default::default()
+            },
             Usage {
                 has_timing: true,
                 estimated: true,
@@ -2899,7 +3453,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             ..Default::default()
         });
         let cs = agent.ui.state.read().unwrap().context_status();
-        assert_eq!(cs.used, 320, "expected real base + 80/4 estimated tokens, got {cs:?}");
+        assert_eq!(
+            cs.used, 320,
+            "expected real base + 80/4 estimated tokens, got {cs:?}"
+        );
         assert!(cs.estimated, "got {cs:?}");
     }
 
@@ -2908,10 +3465,17 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     fn context_tracking_resets_on_reset_history() {
         let (agent, _echo, _log) = new_test_agent(Vec::new());
         agent.ui.state.write().unwrap().real_prompt_tokens = 500;
-        agent.push_history(Message { role: Role::User, content: "hi".into(), ..Default::default() });
+        agent.push_history(Message {
+            role: Role::User,
+            content: "hi".into(),
+            ..Default::default()
+        });
         agent.reset_history();
         let s = agent.ui.state.read().unwrap();
-        assert_eq!(s.real_prompt_tokens, 0, "stale real prompt size must be dropped");
+        assert_eq!(
+            s.real_prompt_tokens, 0,
+            "stale real prompt size must be dropped"
+        );
         assert_eq!(s.history_tokens, 0);
     }
 
@@ -2931,13 +3495,17 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         ]];
         let (agent, _echo, log) = new_test_agent(responses);
         agent.set_context_size(1000);
-        agent.run_turn(CancellationToken::new(), "hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "hi")
+            .await
+            .unwrap();
 
         let text = std::fs::read_to_string(&log.file).unwrap();
-        let re = crate::testsupport::re(
-            r"Answer \([^)]*\) \| ctx ~\d+/1,000 \(~\d+%\) left ~\d+",
+        let re = crate::testsupport::re(r"Answer \([^)]*\) \| ctx ~\d+/1,000 \(~\d+%\) left ~\d+");
+        assert!(
+            re.is_match(&text),
+            "expected an estimated ctx readout, got: {text}"
         );
-        assert!(re.is_match(&text), "expected an estimated ctx readout, got: {text}");
         // Final readout is exact: 700 prompt + 50 completion tokens.
         assert!(
             text.contains("| ctx 750/1,000 (75%) left 250]"),
@@ -2971,7 +3539,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             vec![content("done"), done(1900, 20)],
         ];
         let (agent, _echo, log) = new_test_agent(responses);
-        agent.run_turn(CancellationToken::new(), "go").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "go")
+            .await
+            .unwrap();
         let text = std::fs::read_to_string(&log.file).unwrap();
 
         // The Tool call header follows the request that issued the call
@@ -2979,12 +3550,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         let tool_re = crate::testsupport::re(
             r"Tool call \([^)]*\) \| ctx [^|]*\| \+\d+\.\ds \| req 1,420 in/380 out, 38\.0 tok/s, \d+\.\ds\n",
         );
-        assert!(tool_re.is_match(&text), "expected req stats on the Tool call header, got: {text}");
+        assert!(
+            tool_re.is_match(&text),
+            "expected req stats on the Tool call header, got: {text}"
+        );
         // The next Answer header only knows the previous request.
         let ans_re = crate::testsupport::re(
             r"Answer \([^)]*\) \| ctx [^|]*\| \+\d+\.\ds \| last req 1,420 in/380 out, 38\.0 tok/s, \d+\.\ds\n",
         );
-        assert!(ans_re.is_match(&text), "expected last-req stats on the Answer header, got: {text}");
+        assert!(
+            ans_re.is_match(&text),
+            "expected last-req stats on the Answer header, got: {text}"
+        );
     }
 
     /// Go's TestRunTurnFirstHeaderHasNoRequestStatsAndStatsClearAfterTurn.
@@ -2992,15 +3569,24 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     async fn run_turn_first_header_has_no_request_stats_and_stats_clear_after_turn() {
         let responses = vec![vec![content("hi"), done(5, 1)]];
         let (agent, _echo, log) = new_test_agent(responses);
-        agent.run_turn(CancellationToken::new(), "go").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "go")
+            .await
+            .unwrap();
         let text = std::fs::read_to_string(&log.file).unwrap();
-        assert!(!text.contains(" req "), "first header of a turn must not show request stats: {text}");
+        assert!(
+            !text.contains(" req "),
+            "first header of a turn must not show request stats: {text}"
+        );
         let s = agent.ui.state.read().unwrap();
         // turn_start is what gates the elapsed/req part of a header (Go:
         // turnStats() reporting ok=false once turnStart is zeroed), so stats
         // are unavailable for headers printed outside a turn. last_req itself
         // lingers until the next turn clears it, exactly as in Go.
-        assert!(s.turn_start.is_none(), "turn stats must be unavailable once the turn ends");
+        assert!(
+            s.turn_start.is_none(),
+            "turn stats must be unavailable once the turn ends"
+        );
     }
 
     /// The provider-side usage of the most recent request must survive into
@@ -3009,9 +3595,18 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     async fn run_turn_records_last_usage() {
         let responses = vec![vec![content("ok"), done(7, 3)]];
         let (agent, _echo, _log) = new_test_agent(responses);
-        agent.run_turn(CancellationToken::new(), "hi").await.unwrap();
+        agent
+            .run_turn(CancellationToken::new(), "hi")
+            .await
+            .unwrap();
         let lu = agent.last_usage.lock().unwrap();
-        assert_eq!((lu.usage.prompt_tokens, lu.usage.completion_tokens, lu.usage.total_tokens), (7, 3, 10));
+        assert_eq!(
+            (
+                lu.usage.prompt_tokens,
+                lu.usage.completion_tokens,
+                lu.usage.total_tokens
+            ),
+            (7, 3, 10)
+        );
     }
 }
-

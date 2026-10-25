@@ -12,7 +12,6 @@
 //! without killing the REPL.
 
 use std::future::Future;
-use std::io::Write;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex};
@@ -22,6 +21,7 @@ use crate::agent::{Agent, ToolCallMode};
 use crate::coding::Coding;
 use crate::config::{self, Config};
 use crate::error::{AgentError, R};
+use crate::input::{self, history, history::History, Draft, Wake};
 use crate::llm;
 use crate::notify::Notifier;
 use crate::tools::run_command::RunCommandTool;
@@ -60,6 +60,38 @@ the next line, or type """ alone on a line to start a block that runs
 until a matching closing """ line.
 "#;
 
+/// Every slash command the REPL accepts, in the order `/help` lists them.
+///
+/// The table is what Tab completion at the prompt offers, so a command added to
+/// [`HELP_TEXT`] and to [`Repl::handle_slash` belongs here too — otherwise it
+/// cannot be completed. A test asserts the three agree.
+pub const SLASH_COMMANDS: &[&str] = &[
+    "/?",
+    "/help",
+    "/provider",
+    "/key",
+    "/model",
+    "/list_model",
+    "/context",
+    "/compact",
+    "/history",
+    "/think",
+    "/run_command_timeout",
+    "/prompt",
+    "/plan",
+    "/plan_for_human",
+    "/coding",
+    "/coding_phase",
+    "/autocoding",
+    "/watchfile",
+    "/ntfy",
+    "/proxy",
+    "/toolmode",
+    "/env",
+    "/exit",
+    "/bye",
+];
+
 /// Owns the prompt loop, wiring slash commands to the live config and agent.
 ///
 /// Go mutates a shared `*config.Config` from the command handlers; here the
@@ -82,6 +114,20 @@ pub struct Repl {
     /// taken once by [`Repl::run`].
     trigger_tx: mpsc::Sender<Trigger>,
     trigger_rx: Mutex<Option<mpsc::Receiver<Trigger>>>,
+
+    /// Prompts remembered for ↑/↓ at the `> ` prompt, newest last. A tokio
+    /// mutex so the slash-command handler (`/history`) can read it too. Locked
+    /// only to snapshot or append — never while a keystroke is being waited
+    /// for, which is what keeps a prompt from holding the list hostage.
+    history: Arc<Mutex<History>>,
+
+    /// The nudge that interrupts an editing prompt when a `/watchfile` trigger
+    /// arrives, so a trigger does not have to wait for the user to press Enter.
+    wake: Arc<Wake>,
+
+    /// The multi-line prompt in progress (trailing `\`, or an open `"""`
+    /// block), so a wake can interrupt a prompt without losing it.
+    draft: Mutex<Draft>,
 }
 
 impl Repl {
@@ -93,6 +139,7 @@ impl Repl {
     ) -> Self {
         // Buffered 32, like Go's `make(chan watch.Trigger, 32)`.
         let (trigger_tx, trigger_rx) = mpsc::channel(32);
+        let history_size = cfg.history_size;
         Self {
             cfg: Mutex::new(cfg),
             agent,
@@ -102,6 +149,9 @@ impl Repl {
             watcher: Mutex::new(None),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
+            history: Arc::new(Mutex::new(History::new(history_size))),
+            wake: Wake::new(),
+            draft: Mutex::new(Draft::default()),
         }
     }
 
@@ -115,6 +165,13 @@ impl Repl {
         let Some(mut trigger_rx) = self.trigger_rx.lock().await.take() else {
             return Err(AgentError::new("repl already running"));
         };
+
+        // What the ↑/↓ list remembers from previous sessions. Best-effort: no
+        // home directory, or an unreadable file, leaves the session with recall
+        // of what is typed in it, which is the fallback rather than a failure.
+        if let Some(path) = history::default_path() {
+            self.history.lock().await.load(&path);
+        }
 
         // Ctrl-C cancels the in-flight turn - the equivalent of Go's signal
         // goroutine. Spawned once for the life of the REPL.
@@ -139,43 +196,45 @@ impl Repl {
                     "model is not set; use /model <name> (only slash commands are accepted until then)",
                 );
             }
-            self.ui.plain(&self.prompt_string().await);
-            let _ = std::io::stdout().flush();
 
-            // Both select arms produce the same tagged value; the trigger
-            // arm is handled inline (Go does the same inside its select).
-            enum Input {
-                Line(String),
-                Eof,
+            // A trigger is drained here, never by cancelling the prompt.
+            //
+            // `select!` over the prompt and this channel would *drop* the prompt
+            // future mid-keystroke, and the prompt cannot survive being dropped:
+            // its editor runs on a blocking thread that is busy in `poll`, so it
+            // would keep the terminal in raw mode and keep ownership of stdin
+            // with nobody able to tell it otherwise — the next prompt would then
+            // take the fd over by force while the orphan still owns the keyboard.
+            // Instead, a trigger *nudges* the prompt (see [`Wake`]) and the prompt
+            // returns by itself, having given the terminal and the fd back.
+            while let Ok(t) = trigger_rx.try_recv() {
+                self.handle_trigger(&model, t).await;
             }
-            let input = tokio::select! {
-                raw = crate::input::read_prompt() => match raw {
-                    Some(l) => Input::Line(l),
-                    None => Input::Eof,
-                },
-                trig = trigger_rx.recv() => match trig {
-                    Some(t) => {
-                        self.handle_trigger(&model, t).await;
-                        continue;
-                    }
-                    // All senders gone (can't happen while self is alive -
-                    // it owns one clone): park instead of spinning.
-                    None => std::future::pending::<Input>().await,
-                },
-            };
-            let input = match input {
-                Input::Line(l) => l,
-                Input::Eof => {
+
+            let typed = match self.prompt().await {
+                // Ctrl-C: the editor already drew the `^C` and cleared the line,
+                // and the draft is already reset. Prompt again.
+                input::Prompt::Interrupt => continue,
+                // Ctrl-D, or stdin closed.
+                input::Prompt::Eof => {
                     self.ui.plainln("");
                     self.stop_watcher().await;
                     return Ok(());
                 }
+                // A trigger arrived while the line was being typed. The draft
+                // kept the unfinished text, so all that is left is to loop round
+                // and service it (the drain above does), then resume the prompt.
+                input::Prompt::Wake(_) => continue,
+                // A trailing `\` or an open `"""` block: ask for the next line.
+                input::Prompt::More => continue,
+                input::Prompt::Line(line) => line,
             };
 
-            let line = input.trim().to_string();
+            let line = typed.trim().to_string();
             if line.is_empty() {
                 continue;
             }
+            self.remember(&line).await;
 
             let is_slash = line.starts_with('/');
             if !is_slash && model.is_empty() {
@@ -201,10 +260,70 @@ impl Repl {
         }
     }
 
+    /// The `> ` prompt: history recall, Tab completion, multi-line drafts, and a
+    /// `/watchfile` trigger that can interrupt it.
+    ///
+    /// This is the loop's only reader of stdin. [`input::read_edited_prompt`]
+    /// holds the input stream for the whole prompt so no other reader can be
+    /// waiting to consume the Enter that ends it, and it returns one of five
+    /// outcomes rather than just a line, because a prompt can also end in Ctrl-C,
+    /// Ctrl-D, or a trigger arriving mid-line.
+    async fn prompt(&self) -> input::Prompt {
+        let top = self.prompt_string().await;
+        let mut draft = self.draft.lock().await;
+        // The second line of a `\` or `"""` prompt gets no prompt string of its
+        // own, exactly as the plain reader leaves it when a piped script
+        // continues onto another line.
+        let text = draft.continuation_prompt(&top, "  ").to_string();
+        // The editor prints the prompt itself once the terminal is in raw mode;
+        // printing it here would leave any keystroke typed in between stuck in the
+        // terminal's line buffer. Without a terminal there is no editor, so this is
+        // the only path that can show it.
+        if !input::editing_available() {
+            self.ui.plain(&text);
+        }
+        let dir = self.run_command.work_dir.clone();
+        let hist = self.history.clone();
+        let wake = self.wake.clone();
+        input::read_edited_prompt(text, &mut draft, &hist, &dir, Some(wake)).await
+    }
+
+    /// Records a submitted prompt for ↑/↓ recall and saves the list.
+    ///
+    /// Blank input is not recorded (the store skips it) and an interrupted line
+    /// never reaches here at all. The save is on every submit rather than at exit
+    /// because a session that is killed, or a terminal whose window is simply
+    /// closed, has no exit to save from. `save` writes to a temp file and renames,
+    /// so an interrupt cannot leave a half-written history; its error is ignored
+    /// because losing recall is not worth reporting to someone who just typed.
+    async fn remember(&self, line: &str) {
+        let Some(path) = history::default_path() else {
+            self.history.lock().await.push(line);
+            return;
+        };
+        // The lock covers the push and taking the snapshot, never the file: a slow
+        // or hung filesystem must not keep the next prompt from reading the list,
+        // and must not stop the REPL from prompting again. The snapshot is an owned
+        // copy, so the write below holds nothing while it runs.
+        let snapshot = {
+            let mut hist = self.history.lock().await;
+            hist.push(line);
+            hist.clone()
+        };
+        // Awaited rather than fire-and-forget, so two saves cannot overtake each
+        // other and leave the older list in the file. Merging with the file's
+        // contents (see `History::merged_serialized`) is what keeps a second
+        // session's prompts from being overwritten by this one's save. The error is
+        // ignored: losing recall is not worth reporting to someone who just pressed
+        // Enter.
+        let _ = tokio::task::spawn_blocking(move || snapshot.save_to(&path)).await;
+    }
+
     /// Handles one `/watchfile` trigger: reports it and runs it as a turn.
     async fn handle_trigger(&self, model: &str, t: Trigger) {
         self.ui.plainln("");
-        self.ui.plainln(&format!("[watchfile] {}:{}: {}", t.file, t.line, t.text));
+        self.ui
+            .plainln(&format!("[watchfile] {}:{}: {}", t.file, t.line, t.text));
         if model.is_empty() {
             self.ui.plainln("no model set; skipping watchfile trigger");
             return;
@@ -219,9 +338,9 @@ so it doesn't fire again.",
             line = t.line,
             text = t.text,
         );
-        self.run_cancellable(move |ctx| async move {
-            (false, self.agent.run_turn(ctx, &prompt).await)
-        })
+        self.run_cancellable(
+            move |ctx| async move { (false, self.agent.run_turn(ctx, &prompt).await) },
+        )
         .await;
     }
 
@@ -268,7 +387,8 @@ so it doesn't fire again.",
             return;
         }
         if let Err(e) = n.send_error("jonnyq: error", err, "").await {
-            self.ui.plainln(&format!("warning: ntfy notification failed: {}", e.message));
+            self.ui
+                .plainln(&format!("warning: ntfy notification failed: {}", e.message));
         }
     }
 
@@ -303,7 +423,11 @@ so it doesn't fire again.",
     /// double-report it.
     pub async fn handle_slash(&self, cancel: CancellationToken, line: &str) -> (bool, R<()>) {
         let cmd = line.split_whitespace().next().unwrap_or("").to_string();
-        let rest = line.strip_prefix(cmd.as_str()).unwrap_or("").trim().to_string();
+        let rest = line
+            .strip_prefix(cmd.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         match cmd.as_str() {
             "/?" | "/help" => self.ui.plainln(HELP_TEXT),
@@ -324,8 +448,10 @@ so it doesn't fire again.",
                     self.ui.plainln(&format!("error: {}", e.message));
                     return (false, Ok(()));
                 }
-                self.ui
-                    .plainln(&format!("provider set to {}:{}", cfg.provider_name, cfg.provider_url));
+                self.ui.plainln(&format!(
+                    "provider set to {}:{}",
+                    cfg.provider_name, cfg.provider_url
+                ));
             }
 
             "/key" => {
@@ -391,7 +517,8 @@ so it doesn't fire again.",
             "/run_command_timeout" => {
                 let n = rest.parse::<i64>().ok().filter(|n| *n > 0);
                 let Some(n) = n else {
-                    self.ui.plainln("usage: /run_command_timeout <positive integer seconds>");
+                    self.ui
+                        .plainln("usage: /run_command_timeout <positive integer seconds>");
                     return (false, Ok(()));
                 };
                 self.cfg.lock().await.run_command_timeout_sec = n;
@@ -444,7 +571,10 @@ so it doesn't fire again.",
                 if !self.model_set().await {
                     return (false, Ok(()));
                 }
-                return (false, self.coding().await.coding_phase(&cancel, &rest).await);
+                return (
+                    false,
+                    self.coding().await.coding_phase(&cancel, &rest).await,
+                );
             }
 
             "/autocoding" => {
@@ -464,7 +594,9 @@ so it doesn't fire again.",
 
             "/env" => self.cmd_env(&rest).await,
 
-            other => self.ui.plainln(&format!("unknown command {other}; try /help")),
+            other => self
+                .ui
+                .plainln(&format!("unknown command {other}; try /help")),
         }
         (false, Ok(()))
     }
@@ -490,7 +622,12 @@ so it doesn't fire again.",
     /// `coding.Plan(ctx, ..., notify.New(cfg.NtfyURL))`.
     async fn coding(&self) -> Coding<'static> {
         let ntfy_url = self.cfg.lock().await.ntfy_url.clone();
-        Coding::new(self.agent.clone(), self.ui.clone(), &self.run_command.work_dir, &ntfy_url)
+        Coding::new(
+            self.agent.clone(),
+            self.ui.clone(),
+            &self.run_command.work_dir,
+            &ntfy_url,
+        )
     }
 
     /// `/watchfile`: bare (not watching) starts watching with the current
@@ -527,7 +664,9 @@ so it doesn't fire again.",
 
         if let Some(w) = guard.as_mut() {
             w.set_magic_word(&word);
-            self.ui.plainln(&format!("[watchfile] magic word updated to {word:?} (still watching)"));
+            self.ui.plainln(&format!(
+                "[watchfile] magic word updated to {word:?} (still watching)"
+            ));
             return;
         }
 
@@ -541,9 +680,11 @@ so it doesn't fire again.",
             std::time::Duration::from_secs(secs as u64),
             &[output_file],
         );
-        w.start(self.trigger_tx.clone());
+        w.start(self.trigger_tx.clone(), self.wake.clone());
         *guard = Some(w);
-        self.ui.plainln(&format!("[watchfile] watching the working directory for {word:?}"));
+        self.ui.plainln(&format!(
+            "[watchfile] watching the working directory for {word:?}"
+        ));
     }
 
     /// `/ntfy`: bare shows the current setting, `off` clears it, and a URL
@@ -569,9 +710,11 @@ so it doesn't fire again.",
         if arg.is_empty() {
             let url = self.cfg.lock().await.ntfy_url.clone();
             if url.is_empty() {
-                self.ui.plainln("[ntfy] not configured; usage: /ntfy <topic url>|off");
+                self.ui
+                    .plainln("[ntfy] not configured; usage: /ntfy <topic url>|off");
             } else {
-                self.ui.plainln(&format!("[ntfy] notifications enabled: {url}"));
+                self.ui
+                    .plainln(&format!("[ntfy] notifications enabled: {url}"));
             }
             return;
         }
@@ -579,7 +722,8 @@ so it doesn't fire again.",
         let mut cfg = self.cfg.lock().await;
         cfg.ntfy_url = arg.clone();
         self.agent.tools.configure(&cfg);
-        self.ui.plainln(&format!("[ntfy] notifications enabled: {arg}"));
+        self.ui
+            .plainln(&format!("[ntfy] notifications enabled: {arg}"));
     }
 
     /// `/proxy`: report or change the SOCKS proxy of a running session.
@@ -616,15 +760,23 @@ so it doesn't fire again.",
                 return;
             }
             cfg.no_proxy = candidate.no_proxy.clone();
-            let hosts = if hosts.is_empty() { "(none - everything is tunnelled)" } else { hosts };
-            self.ui.plainln(&format!("[proxy] no-proxy list set to {hosts}"));
+            let hosts = if hosts.is_empty() {
+                "(none - everything is tunnelled)"
+            } else {
+                hosts
+            };
+            self.ui
+                .plainln(&format!("[proxy] no-proxy list set to {hosts}"));
             self.ui.plainln(&format!("[proxy] {}", proxy.describe()));
             return;
         }
 
         if arg.is_empty() {
             let cfg = self.cfg.lock().await;
-            self.ui.plainln(&format!("[proxy] {}", cfg.proxy_config_or_default().describe()));
+            self.ui.plainln(&format!(
+                "[proxy] {}",
+                cfg.proxy_config_or_default().describe()
+            ));
             self.ui.plainln(
                 "[proxy] usage: /proxy <socks5h://host:port|host:port|off|auto> · \
                  /proxy no-proxy <hosts>",
@@ -638,7 +790,8 @@ so it doesn't fire again.",
         let mut candidate = cfg.clone();
         if let Err(e) = candidate.set_socks_proxy(&arg) {
             self.ui.plainln(&format!("error: {}", e.message));
-            self.ui.plainln("[proxy] usage: /proxy <socks5h://host:port|host:port|off|auto>");
+            self.ui
+                .plainln("[proxy] usage: /proxy <socks5h://host:port|host:port|off|auto>");
             return;
         }
         let proxy = match candidate.proxy_config() {
@@ -683,7 +836,9 @@ so it doesn't fire again.",
             ToolCallMode::Prompt => self
                 .ui
                 .plainln("[toolmode] switched to prompt-based tool-calling (```tool JSON blocks)"),
-            ToolCallMode::Native => self.ui.plainln("[toolmode] switched to native tool-calling"),
+            ToolCallMode::Native => self
+                .ui
+                .plainln("[toolmode] switched to native tool-calling"),
         }
     }
 
@@ -777,7 +932,8 @@ so it doesn't fire again.",
         self.agent.set_thinking(new_cfg.thinking);
         self.agent
             .set_tool_call_mode(ToolCallMode::from_config(&new_cfg.tool_call_mode));
-        self.agent.set_max_tool_calls_per_turn(new_cfg.max_tool_calls_per_turn);
+        self.agent
+            .set_max_tool_calls_per_turn(new_cfg.max_tool_calls_per_turn);
         self.agent.set_skill_paths(new_cfg.skill_paths.clone());
         self.agent.set_output_file(&new_cfg.output_file);
         self.agent.tools.configure(&new_cfg);
@@ -788,7 +944,8 @@ so it doesn't fire again.",
         let (provider_changed, key_changed) = {
             let old = self.cfg.lock().await;
             (
-                old.provider_name != new_cfg.provider_name || old.provider_url != new_cfg.provider_url,
+                old.provider_name != new_cfg.provider_name
+                    || old.provider_url != new_cfg.provider_url,
                 old.key != new_cfg.key,
             )
         };
@@ -825,11 +982,19 @@ so it doesn't fire again.",
         // and the new file opens; a failure keeps writing to the old one.
         if !new_cfg.output_file.is_empty() && self.ui.output_file() != new_cfg.output_file {
             if let Err(e) = self.ui.set_output_file(&new_cfg.output_file) {
-                self.ui.plainln(&format!("warning: cannot open output file: {e}"));
+                self.ui
+                    .plainln(&format!("warning: cannot open output file: {e}"));
             }
         }
 
-        self.run_command.set_timeout_sec(new_cfg.run_command_timeout_sec);
+        self.run_command
+            .set_timeout_sec(new_cfg.run_command_timeout_sec);
+
+        // The recall list follows `-history-size`: growing it keeps everything
+        // already remembered, shrinking it drops the oldest prompts. The lock is
+        // held for the `set_limit` call only, never across the file write, so a
+        // reload cannot keep the next prompt from reading the list.
+        self.history.lock().await.set_limit(new_cfg.history_size);
 
         // A running /watchfile picks up the new magic word, interval and log
         // exclusion in place (no restart, so already-seen triggers stay seen).
@@ -869,7 +1034,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::testsupport::new_test_agent;
-    use tokio::io::{AsyncReadExt, BufReader as TokioBufReader};
 
     /// A REPL wired to a no-op provider and a throwaway log, the Rust
     /// equivalent of Go's `newTestREPL`. `rc`'s working dir backs
@@ -917,7 +1081,10 @@ mod tests {
         let t = new_test_repl().await;
         t.repl.cfg.lock().await.model = "ornith-1.5-35b-a3b".into();
         t.repl.cfg.lock().await.context_size = 100000;
-        assert_eq!(t.repl.prompt_string().await, "ornith-1.5-35b-a3b (100000 token) > ");
+        assert_eq!(
+            t.repl.prompt_string().await,
+            "ornith-1.5-35b-a3b (100000 token) > "
+        );
     }
 
     #[tokio::test]
@@ -931,21 +1098,33 @@ mod tests {
     async fn toggle_watch_start_and_stop() {
         let t = new_test_repl().await;
         t.repl.toggle_watch("").await;
-        assert!(t.repl.watcher.lock().await.is_some(), "expected watcher to be started");
+        assert!(
+            t.repl.watcher.lock().await.is_some(),
+            "expected watcher to be started"
+        );
         let word = t.repl.watcher.lock().await.as_ref().unwrap().magic_word();
         assert_eq!(word, t.repl.cfg.lock().await.watch_magic_word);
 
         // A bare command again while already watching toggles it off.
         t.repl.toggle_watch("").await;
-        assert!(t.repl.watcher.lock().await.is_none(), "expected watcher to be stopped");
+        assert!(
+            t.repl.watcher.lock().await.is_none(),
+            "expected watcher to be stopped"
+        );
     }
 
     #[tokio::test]
     async fn toggle_watch_sets_word_and_starts_with_argument() {
         let t = new_test_repl().await;
         t.repl.toggle_watch("TODO!").await;
-        assert!(t.repl.watcher.lock().await.is_some(), "expected watcher to be started");
-        assert_eq!(t.repl.watcher.lock().await.as_ref().unwrap().magic_word(), "TODO!");
+        assert!(
+            t.repl.watcher.lock().await.is_some(),
+            "expected watcher to be started"
+        );
+        assert_eq!(
+            t.repl.watcher.lock().await.as_ref().unwrap().magic_word(),
+            "TODO!"
+        );
         assert_eq!(t.repl.cfg.lock().await.watch_magic_word, "TODO!");
     }
 
@@ -953,12 +1132,18 @@ mod tests {
     async fn toggle_watch_updates_word_live_without_restarting() {
         let t = new_test_repl().await;
         t.repl.toggle_watch("AI!").await;
-        assert!(t.repl.watcher.lock().await.is_some(), "expected watcher to be started");
+        assert!(
+            t.repl.watcher.lock().await.is_some(),
+            "expected watcher to be started"
+        );
 
         t.repl.toggle_watch("FIXME!").await;
         // The live-update path (rather than stop+start) is taken, so the
         // running poll task picks the new word up without a restart.
-        assert_eq!(t.repl.watcher.lock().await.as_ref().unwrap().magic_word(), "FIXME!");
+        assert_eq!(
+            t.repl.watcher.lock().await.as_ref().unwrap().magic_word(),
+            "FIXME!"
+        );
         assert!(
             t.log_contents().contains("magic word updated"),
             "expected the in-place update notice, got: {}",
@@ -972,7 +1157,10 @@ mod tests {
         t.repl.toggle_watch("AI!").await;
         assert!(t.repl.watcher.lock().await.is_some());
         t.repl.toggle_watch("off").await;
-        assert!(t.repl.watcher.lock().await.is_none(), "expected watcher stopped by 'off'");
+        assert!(
+            t.repl.watcher.lock().await.is_none(),
+            "expected watcher stopped by 'off'"
+        );
     }
 
     #[tokio::test]
@@ -1035,12 +1223,18 @@ mod tests {
     async fn proxy_bare_reports_and_changes_nothing() {
         let _p = ProxyReset::new();
         let t = new_test_repl().await;
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/proxy")
+            .await;
         assert!(res.is_ok());
         assert_eq!(t.repl.cfg.lock().await.socks_proxy, "");
         let log = t.log_contents();
         assert!(log.contains("[proxy] not set"), "{log}");
-        assert!(log.contains("/proxy no-proxy <hosts>"), "usage hint missing: {log}");
+        assert!(
+            log.contains("/proxy no-proxy <hosts>"),
+            "usage hint missing: {log}"
+        );
     }
 
     #[tokio::test]
@@ -1048,7 +1242,10 @@ mod tests {
         let _p = ProxyReset::new();
         let t = new_test_repl().await;
 
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy off").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/proxy off")
+            .await;
         assert!(res.is_ok());
         assert_eq!(t.repl.cfg.lock().await.socks_proxy, "off");
         assert_eq!(
@@ -1056,10 +1253,15 @@ mod tests {
             crate::net::ProxyMode::Direct,
             "the live transport must follow the command"
         );
-        assert!(t.log_contents().contains("[proxy] off (direct connections)"));
+        assert!(t
+            .log_contents()
+            .contains("[proxy] off (direct connections)"));
 
         // auto gives the decision back to the environment.
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy auto").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/proxy auto")
+            .await;
         assert!(res.is_ok());
         assert_eq!(t.repl.cfg.lock().await.socks_proxy, "");
         assert_eq!(crate::net::current().mode, crate::net::ProxyMode::System);
@@ -1072,7 +1274,10 @@ mod tests {
         let socks = crate::testsupport::SocksProxy::start().await;
         let hostport = socks.url.strip_prefix("socks5h://").unwrap();
 
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), &format!("/proxy {hostport}")).await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), &format!("/proxy {hostport}"))
+            .await;
         assert!(res.is_ok());
         assert_eq!(
             t.repl.cfg.lock().await.socks_proxy,
@@ -1081,20 +1286,41 @@ mod tests {
         );
         assert_eq!(crate::net::current().url(), format!("socks5h://{hostport}"));
         // Reported with the bypass list it will honour.
-        assert!(t.log_contents().contains(&format!("socks5h://{hostport} (direct for: localhost")));
+        assert!(t
+            .log_contents()
+            .contains(&format!("socks5h://{hostport} (direct for: localhost")));
     }
 
     #[tokio::test]
     async fn proxy_rejects_a_bad_value_without_changing_the_session() {
         let _p = ProxyReset::new();
         let t = new_test_repl().await;
-        t.repl.handle_slash(CancellationToken::new(), "/proxy off").await.1.unwrap();
+        t.repl
+            .handle_slash(CancellationToken::new(), "/proxy off")
+            .await
+            .1
+            .unwrap();
 
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/proxy http://proxy:3128").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/proxy http://proxy:3128")
+            .await;
         assert!(res.is_ok(), "the command reports its own error");
-        assert_eq!(t.repl.cfg.lock().await.socks_proxy, "off", "config untouched");
-        assert_eq!(crate::net::current().mode, crate::net::ProxyMode::Direct, "transport untouched");
-        assert!(t.log_contents().contains("not a SOCKS proxy"), "{}", t.log_contents());
+        assert_eq!(
+            t.repl.cfg.lock().await.socks_proxy,
+            "off",
+            "config untouched"
+        );
+        assert_eq!(
+            crate::net::current().mode,
+            crate::net::ProxyMode::Direct,
+            "transport untouched"
+        );
+        assert!(
+            t.log_contents().contains("not a SOCKS proxy"),
+            "{}",
+            t.log_contents()
+        );
     }
 
     #[tokio::test]
@@ -1103,14 +1329,31 @@ mod tests {
         let t = new_test_repl().await;
         let socks = crate::testsupport::SocksProxy::start().await;
         let hostport = socks.url.strip_prefix("socks5h://").unwrap();
-        t.repl.handle_slash(CancellationToken::new(), &format!("/proxy {hostport}")).await.1.unwrap();
+        t.repl
+            .handle_slash(CancellationToken::new(), &format!("/proxy {hostport}"))
+            .await
+            .1
+            .unwrap();
 
-        t.repl.handle_slash(CancellationToken::new(), "/proxy no-proxy intranet,127.0.0.1").await.1.unwrap();
+        t.repl
+            .handle_slash(
+                CancellationToken::new(),
+                "/proxy no-proxy intranet,127.0.0.1",
+            )
+            .await
+            .1
+            .unwrap();
         let cfg = t.repl.cfg.lock().await;
         assert_eq!(cfg.no_proxy, "intranet,127.0.0.1");
-        assert_eq!(cfg.socks_proxy, format!("socks5h://{hostport}"), "the proxy itself is untouched");
+        assert_eq!(
+            cfg.socks_proxy,
+            format!("socks5h://{hostport}"),
+            "the proxy itself is untouched"
+        );
         drop(cfg);
-        assert!(t.log_contents().contains("no-proxy list set to intranet,127.0.0.1"));
+        assert!(t
+            .log_contents()
+            .contains("no-proxy list set to intranet,127.0.0.1"));
         assert_eq!(
             t.repl.cfg.lock().await.proxy_config_or_default().describe(),
             format!("socks5h://{hostport} (direct for: intranet,127.0.0.1)")
@@ -1176,7 +1419,10 @@ mod tests {
     async fn env_list_shows_values_and_sources() {
         let t = new_test_repl().await;
         t.repl.cfg.lock().await.model = "qwen3:14b".into();
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/env list").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/env list")
+            .await;
         res.unwrap();
         let log = t.log_contents();
         assert!(log.contains("JONNYQ_MODEL"), "got: {log}");
@@ -1199,8 +1445,7 @@ mod tests {
         // re-applies startup flags, so the log stays inside this test's
         // directory instead of a stray ./output.txt.
         let log_path = t._log.file.clone();
-        t.repl.cfg.lock().await.startup_args =
-            vec!["-output".to_string(), log_path.clone()];
+        t.repl.cfg.lock().await.startup_args = vec!["-output".to_string(), log_path.clone()];
         let dir = crate::testsupport::TempDir::new("env-reload");
         dir.write("settings.env", "");
         let file = dir.path().join("settings.env");
@@ -1216,32 +1461,58 @@ mod tests {
                 "JONNYQ_SKILL_PATH=/x/skills\n",
                 "JONNYQ_WATCH_MAGIC_WORD=GO!\n",
                 "JONNYQ_PDF_MAX_PAGES=7\n",
+                "JONNYQ_HISTORY_SIZE=5\n",
             ),
         )
         .unwrap();
 
+        // More remembered prompts than the file's new `history-size`, so the
+        // trim has something to do and the change is observable.
+        for i in 0..8 {
+            t.repl.history.lock().await.push(&format!("prompt {i}"));
+        }
         let arg = format!("/env reload {}", file.to_string_lossy());
         let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), &arg).await;
         res.unwrap_or_else(|e| panic!("reload failed: {e}"));
         t._env_file = Some(dir);
+        // The live recall list follows the new limit: trimmed to 5, keeping the
+        // newest entries rather than the ones pushed first.
+        let hist = t.repl.history.lock().await;
+        assert_eq!(hist.entries().len(), 5);
+        assert_eq!(hist.entries()[4], "prompt 7");
+        assert_eq!(hist.limit(), 5);
+        drop(hist);
 
         let cfg = t.repl.cfg.lock().await;
         assert_eq!(cfg.model, "from-file");
         assert_eq!(cfg.context_size, 40000);
         assert_eq!(cfg.skill_paths, vec!["/x/skills".to_string()]);
         assert_eq!(cfg.watch_magic_word, "GO!");
-        assert_eq!(cfg.dotenv_path().as_deref(), Some(file.to_string_lossy().as_ref()));
+        assert_eq!(
+            cfg.dotenv_path().as_deref(),
+            Some(file.to_string_lossy().as_ref())
+        );
         drop(cfg);
 
         // Live objects followed, not just the stored config.
         assert_eq!(t.repl.agent.model(), "from-file");
-        assert_eq!(t.repl.agent.context_size.load(std::sync::atomic::Ordering::SeqCst), 40000);
+        assert_eq!(
+            t.repl
+                .agent
+                .context_size
+                .load(std::sync::atomic::Ordering::SeqCst),
+            40000
+        );
         assert!(!t.repl.agent.thinking());
         assert_eq!(t.repl.agent.tool_call_mode(), ToolCallMode::Prompt);
         assert_eq!(t.repl.agent.max_tool_calls_per_turn(), 3);
         assert_eq!(t.repl.agent.skill_paths(), vec!["/x/skills".to_string()]);
         assert_eq!(t.repl.run_command.timeout_sec(), 7);
-        assert!(t.log_contents().contains("[env] reloaded"), "got: {}", t.log_contents());
+        assert!(
+            t.log_contents().contains("[env] reloaded"),
+            "got: {}",
+            t.log_contents()
+        );
     }
 
     /// A reload that switches the SOCKS proxy must move the live transport -
@@ -1272,12 +1543,20 @@ mod tests {
 
         let cfg = t.repl.cfg.lock().await;
         assert_eq!(cfg.socks_proxy, "socks5h://127.0.0.1:1080");
-        assert!(cfg.no_proxy.ends_with("internal.example"), "{}", cfg.no_proxy);
+        assert!(
+            cfg.no_proxy.ends_with("internal.example"),
+            "{}",
+            cfg.no_proxy
+        );
         drop(cfg);
         // The transport the next request will use, not just the stored value.
         let live = crate::net::current();
         assert_eq!(live.url(), "socks5h://127.0.0.1:1080");
-        assert!(live.no_proxy.contains("internal.example"), "{}", live.no_proxy);
+        assert!(
+            live.no_proxy.contains("internal.example"),
+            "{}",
+            live.no_proxy
+        );
 
         // A file whose proxy value is invalid fails the reload and leaves the
         // working transport untouched.
@@ -1285,11 +1564,18 @@ mod tests {
         std::fs::write(&bad, "JONNYQ_SOCKS_PROXY=http://proxy:3128\n").unwrap();
         let (_exit, res) = t
             .repl
-            .handle_slash(CancellationToken::new(), &format!("/env reload {}", bad.to_string_lossy()))
+            .handle_slash(
+                CancellationToken::new(),
+                &format!("/env reload {}", bad.to_string_lossy()),
+            )
             .await;
         res.unwrap();
         assert_eq!(crate::net::current().url(), "socks5h://127.0.0.1:1080");
-        assert!(t.log_contents().contains("not a SOCKS proxy"), "{}", t.log_contents());
+        assert!(
+            t.log_contents().contains("not a SOCKS proxy"),
+            "{}",
+            t.log_contents()
+        );
         t._env_file = Some(dir);
     }
 
@@ -1300,12 +1586,23 @@ mod tests {
         let before = t.repl.agent.model();
         let (_exit, res) = t
             .repl
-            .handle_slash(CancellationToken::new(), "/env reload /nope/does-not-exist.env")
+            .handle_slash(
+                CancellationToken::new(),
+                "/env reload /nope/does-not-exist.env",
+            )
             .await;
         res.unwrap();
-        assert_eq!(t.repl.agent.model(), before, "a failed reload must not change anything");
+        assert_eq!(
+            t.repl.agent.model(),
+            before,
+            "a failed reload must not change anything"
+        );
         assert_eq!(t.repl.cfg.lock().await.model, before);
-        assert!(t.log_contents().contains("does not exist"), "got: {}", t.log_contents());
+        assert!(
+            t.log_contents().contains("does not exist"),
+            "got: {}",
+            t.log_contents()
+        );
     }
 
     /// `off` drops back to flags/environment/defaults.
@@ -1319,19 +1616,24 @@ mod tests {
         // re-applies startup flags, so the log stays inside this test's
         // directory instead of a stray ./output.txt.
         let log_path = t._log.file.clone();
-        t.repl.cfg.lock().await.startup_args =
-            vec!["-output".to_string(), log_path.clone()];
+        t.repl.cfg.lock().await.startup_args = vec!["-output".to_string(), log_path.clone()];
         let dir = crate::testsupport::TempDir::new("env-off");
         let file = dir.path().join("s.env");
         std::fs::write(&file, "JONNYQ_MODEL=from-file\n").unwrap();
         let (_exit, res) = t
             .repl
-            .handle_slash(CancellationToken::new(), &format!("/env {}", file.to_string_lossy()))
+            .handle_slash(
+                CancellationToken::new(),
+                &format!("/env {}", file.to_string_lossy()),
+            )
             .await;
         res.unwrap_or_else(|e| panic!("switching files failed: {e}"));
         assert_eq!(t.repl.agent.model(), "from-file");
 
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/env off").await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/env off")
+            .await;
         res.unwrap_or_else(|e| panic!("/env off failed: {e}"));
         t._env_file = Some(dir);
         // Nothing else supplies a model now, so the file's value is simply
@@ -1353,20 +1655,25 @@ mod tests {
         let _env = crate::testsupport::clean_env();
         let mut t = new_test_repl().await;
         // Pretend the session started with -context 4242.
-        t.repl.cfg.lock().await.startup_args =
-            vec!["-context".to_string(), "4242".to_string()];
+        t.repl.cfg.lock().await.startup_args = vec!["-context".to_string(), "4242".to_string()];
         let dir = crate::testsupport::TempDir::new("env-flag");
         let file = dir.path().join("s.env");
         std::fs::write(&file, "JONNYQ_CONTEXT_SIZE=111\nJONNYQ_MODEL=m\n").unwrap();
         let (_exit, res) = t
             .repl
-            .handle_slash(CancellationToken::new(), &format!("/env reload {}", file.to_string_lossy()))
+            .handle_slash(
+                CancellationToken::new(),
+                &format!("/env reload {}", file.to_string_lossy()),
+            )
             .await;
         res.unwrap_or_else(|e| panic!("reload failed: {e}"));
         t._env_file = Some(dir);
         let cfg = t.repl.cfg.lock().await;
         assert_eq!(cfg.model, "m");
-        assert_eq!(cfg.context_size, 4242, "the startup flag must still beat the file");
+        assert_eq!(
+            cfg.context_size, 4242,
+            "the startup flag must still beat the file"
+        );
     }
 
     #[tokio::test]
@@ -1384,28 +1691,41 @@ mod tests {
     #[tokio::test]
     async fn history_and_compact_commands_are_wired_up() {
         let t = new_test_repl().await;
-        let (exit, res) = t.repl.handle_slash(CancellationToken::new(), "/history").await;
+        let (exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/history")
+            .await;
         res.unwrap();
         assert!(!exit);
         let log = t.log_contents();
         assert!(log.contains("total history"), "got: {log}");
 
-        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/compact").await;
-        res.unwrap();
-        assert!(t.log_contents().contains("[compact]"), "got: {}", t.log_contents());
-    }
-
-    #[tokio::test]
-    async fn unknown_slash_command_is_reported_without_error() {
-        let t = new_test_repl().await;
-        let (exit, res) = t.repl.handle_slash(CancellationToken::new(), "/nope arg").await;
-        assert!(!exit);
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/compact")
+            .await;
         res.unwrap();
         assert!(
-            t.log_contents().contains("unknown command /nope; try /help"),
+            t.log_contents().contains("[compact]"),
             "got: {}",
             t.log_contents()
         );
     }
 
+    #[tokio::test]
+    async fn unknown_slash_command_is_reported_without_error() {
+        let t = new_test_repl().await;
+        let (exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/nope arg")
+            .await;
+        assert!(!exit);
+        res.unwrap();
+        assert!(
+            t.log_contents()
+                .contains("unknown command /nope; try /help"),
+            "got: {}",
+            t.log_contents()
+        );
+    }
 }

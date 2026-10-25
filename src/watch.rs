@@ -60,18 +60,25 @@ impl Watcher {
     /// transcript log belongs here, since it echoes fired triggers back into
     /// the working directory and would otherwise re-trigger itself in a
     /// runaway loop.
-    pub fn new(work_dir: &str, magic_word: &str, interval: Duration, exclude_files: &[String]) -> Self {
+    pub fn new(
+        work_dir: &str,
+        magic_word: &str,
+        interval: Duration,
+        exclude_files: &[String],
+    ) -> Self {
         Self {
             work_dir: PathBuf::from(work_dir),
             interval: Arc::new(std::sync::Mutex::new(interval)),
             magic_word: Arc::new(std::sync::Mutex::new(magic_word.to_string())),
             cancel: CancellationToken::new(),
             state: HashMap::new(),
-            exclude: Arc::new(std::sync::Mutex::new(exclude_files
+            exclude: Arc::new(std::sync::Mutex::new(
+                exclude_files
                     .iter()
                     .filter(|f| !f.is_empty())
                     .map(|f| normalize(f))
-                    .collect())),
+                    .collect(),
+            )),
             poll_handle: std::sync::Mutex::new(None),
         }
     }
@@ -112,7 +119,11 @@ impl Watcher {
     /// line stays marked seen so it won't spam retries once the consumer
     /// catches up - the user can re-save the file if a trigger was genuinely
     /// missed.
-    pub fn start(&mut self, triggers: mpsc::Sender<Trigger>) {
+    ///
+    /// `wake` nudges the `> ` prompt when a trigger is queued, so a trigger does
+    /// not sit unnoticed until the user presses Enter. It is a flag rather than a
+    /// channel because the prompt may be busy editing a line at the time.
+    pub fn start(&mut self, triggers: mpsc::Sender<Trigger>, wake: Arc<crate::input::Wake>) {
         let cancel = self.cancel.clone();
         // The poll loop owns the walking state, so it runs as one task that
         // can hold &mut self.state between awaits. Cadence and exclusions are
@@ -135,7 +146,7 @@ impl Watcher {
                     continue;
                 }
                 let exclude = exclude_src.lock().unwrap().clone();
-                poll_once(&work_dir, &word, &exclude, &mut state, &triggers).await;
+                poll_once(&work_dir, &word, &exclude, &mut state, &triggers, &wake).await;
             }
         });
         *self.poll_handle.lock().unwrap() = Some(handle);
@@ -159,6 +170,7 @@ async fn poll_once(
     exclude: &HashSet<String>,
     state: &mut HashMap<String, FileState>,
     triggers: &mpsc::Sender<Trigger>,
+    wake: &Arc<crate::input::Wake>,
 ) {
     let mut seen_this_poll: HashSet<String> = HashSet::new();
     let skip = skip_dir_names();
@@ -203,7 +215,8 @@ async fn poll_once(
                 mtime: SystemTime::UNIX_EPOCH,
                 seen: HashSet::new(),
             });
-            let tracked = !(entry_state.mtime == SystemTime::UNIX_EPOCH && entry_state.seen.is_empty());
+            let tracked =
+                !(entry_state.mtime == SystemTime::UNIX_EPOCH && entry_state.seen.is_empty());
             if tracked && mtime <= entry_state.mtime {
                 continue; // unchanged since last poll
             }
@@ -221,9 +234,17 @@ async fn poll_once(
                     continue;
                 }
                 entry_state.seen.insert(trimmed.clone());
-                let t = Trigger { file: rel.clone(), line: i + 1, text: trimmed };
+                let t = Trigger {
+                    file: rel.clone(),
+                    line: i + 1,
+                    text: trimmed,
+                };
                 // Non-blocking send: drop rather than stalling the loop.
-                let _ = triggers.try_send(t);
+                if triggers.try_send(t).is_ok() {
+                    // Only when it actually landed: a dropped trigger has nobody
+                    // waiting for it, and a nudge would be a lie.
+                    wake.notify();
+                }
             }
         }
     }
@@ -253,7 +274,7 @@ mod tests {
             &["log.txt".to_string()],
         );
         let (tx, mut rx) = mpsc::channel(32);
-        w.start(tx);
+        w.start(tx, crate::input::Wake::new());
 
         // Add a magic-word line.
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -270,7 +291,9 @@ mod tests {
         // Same content again -> no re-trigger even after touch.
         tokio::time::sleep(Duration::from_millis(150)).await;
         std::fs::write(&file, "fn main() {}\n// AI! add error handling\n").unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err());
 
         // Changed line text -> triggers again.
         std::fs::write(&file, "fn main() {}\n// AI! add error handling NOW\n").unwrap();
@@ -301,8 +324,10 @@ mod tests {
             &["log.txt".to_string()],
         );
         let (tx, mut rx) = mpsc::channel(32);
-        w.start(tx);
-        assert!(tokio::time::timeout(Duration::from_millis(400), rx.recv()).await.is_err());
+        w.start(tx, crate::input::Wake::new());
+        assert!(tokio::time::timeout(Duration::from_millis(400), rx.recv())
+            .await
+            .is_err());
         w.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -314,13 +339,15 @@ mod tests {
         let tmp = crate::testsupport::TempDir::new("watch-dot");
         let mut w = Watcher::new(&tmp.str(), "AI!", Duration::from_millis(20), &[]);
         let (tx, mut rx) = mpsc::channel(8);
-        w.start(tx);
+        w.start(tx, crate::input::Wake::new());
 
         tmp.write(".env", "AI! secret instruction\n");
         tmp.write(".git/COMMIT_EDITMSG", "AI! git internals\n");
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(400), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
             "dotfiles and dot-dirs must be skipped"
         );
         w.stop();
@@ -332,13 +359,15 @@ mod tests {
         let tmp = crate::testsupport::TempDir::new("watch-deps");
         let mut w = Watcher::new(&tmp.str(), "AI!", Duration::from_millis(20), &[]);
         let (tx, mut rx) = mpsc::channel(8);
-        w.start(tx);
+        w.start(tx, crate::input::Wake::new());
 
         tmp.write("node_modules/lib.js", "AI! ignore me\n");
         tmp.write("vendor/lib.go", "AI! ignore me\n");
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(400), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
             "dependency directories must be skipped"
         );
         w.stop();
@@ -351,11 +380,13 @@ mod tests {
         let tmp = crate::testsupport::TempDir::new("watch-word");
         let mut w = Watcher::new(&tmp.str(), "AI!", Duration::from_millis(20), &[]);
         let (tx, mut rx) = mpsc::channel(8);
-        w.start(tx);
+        w.start(tx, crate::input::Wake::new());
 
         tmp.write("note.txt", "TODO! change the word\n");
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
             "the old word must not fire"
         );
 
@@ -388,7 +419,7 @@ mod tests {
         let tmp2 = crate::testsupport::TempDir::new("watch-stop2");
         let mut w2 = Watcher::new(&tmp2.str(), "AI!", Duration::from_millis(20), &[]);
         let (tx, _rx) = mpsc::channel(1);
-        w2.start(tx);
+        w2.start(tx, crate::input::Wake::new());
         w2.stop();
         w2.stop(); // idempotent after a real start/stop
     }
@@ -405,11 +436,16 @@ mod tests {
             &["output.txt".to_string()],
         );
         let (tx, mut rx) = mpsc::channel(8);
-        w.start(tx);
+        w.start(tx, crate::input::Wake::new());
 
-        tmp.write("output.txt", "[watchfile] hello.go:3: // AI! add a comment here\n");
+        tmp.write(
+            "output.txt",
+            "[watchfile] hello.go:3: // AI! add a comment here\n",
+        );
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
             "the excluded log must not fire"
         );
 
@@ -419,10 +455,14 @@ mod tests {
             .append(true)
             .open(tmp.path().join("output.txt"))
             .unwrap()
-            .write_all(b"[watchfile] output.txt:1: [watchfile] hello.go:3: // AI! add a comment here\n")
+            .write_all(
+                b"[watchfile] output.txt:1: [watchfile] hello.go:3: // AI! add a comment here\n",
+            )
             .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
             "appended echo lines must not re-trigger"
         );
         w.stop();

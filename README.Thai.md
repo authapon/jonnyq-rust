@@ -1,0 +1,342 @@
+# jonnyq
+
+**Interactive coding agent CLI** — REPL ที่เขียนด้วย Rust ซึ่งคุยกับ LLM (เครื่องตัวเองหรือ remote) ให้ model เรียก tool (อ่าน/เขียนไฟล์, รันคำสั่ง, ค้นเว็บ) วนซ้ำจนงานเสร็จ และ automate การสร้างโปรเจกต์ทั้งชิ้นจากไฟล์ `requirements.md` ได้
+
+ภาษา: [English](README.md) · **ไทย**
+
+```
+~/dev/my-project$ jonnyq -model qwen3:14b
+qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
+Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
+...
+Tool call (2026-10-24 10:23:45) | ctx ~2,140/32,768 (~6%) left ~30,628 | +4.1s | req 2,010 in/96 out, 24.1 tok/s, 4.0s
+read_file({"path": "src/main.rs"})
+Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | last req 2,480 in/410 out, 23.7 tok/s, 7.3s
+...
+[preload=n/a prompt_eval=1.2s generate=41.6s token_in=8210 token_out=1042 total_token=9252 tok/s=25.05 wall=52.8s | ctx 3,020/32,768 (9%) left 29,748]
+```
+
+---
+
+## สารบัญ
+
+1. [แอปนี้คืออะไร](#แอปนี้คืออะไร)
+2. [หลักการการทำงาน](#หลักการการทำงาน)
+3. [ความต้องการของระบบ](#ความต้องการของระบบ)
+4. [การติดตั้ง](#การติดตั้ง)
+5. [เริ่มต้นใช้งาน](#เริ่มต้นใช้งาน)
+6. [การตั้งค่า](#การตั้งค่า)
+7. [Slash commands](#slash-commands)
+8. [Tools](#tools)
+9. [การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`](#การทำงานอัตโนมัติ-plan--progress--coding)
+10. [Skills](#skills)
+11. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
+12. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
+13. [ความปลอดภัย](#ความปลอดภัย)
+14. [License](#license)
+
+---
+
+## แอปนี้คืออะไร
+
+- Agent บน terminal แบบโต้ตอบ: พิมพ์คำสั่ง → model คิด → เรียก tool → ตอบ โดยวนซ้ำจนงานเสร็จ
+- รองรับ **Ollama** (native API) และ endpoint ที่เป็น **OpenAI-compatible** (OpenAI, LM Studio, llama.cpp server, vLLM, OpenRouter, …)
+- automate งานเขียนโค้ดด้วยคำสั่ง `/plan`, `/plan_for_human`, `/coding`, `/coding_phase`, `/autocoding`
+- รันบน [`tokio`](https://tokio.rs/) เป็น pure Rust ไม่ต้องมี C toolchain
+
+## หลักการการทำงาน
+
+**agent loop** — ทุก turn จะส่งบทสนทนา + tool spec ไปให้ provider → stream thinking/answer ออกจอ → รัน tool ที่ model เรียก → ส่งผลลัพธ์กลับ → วนซ้ำจนได้คำตอบสุดท้าย
+
+**context compaction** — เมื่อ request โตเกิน ~60% ของ context window จะสรุปช่วงเก่าของบทสนทนาเป็น summary แล้วเก็บข้อความท้ายสุดไว้ทั้งดุ้น (default 6 ข้อความ) เพื่อให้ agent ยังเห็น file path / error / output ที่กำลังทำงานอยู่จริง การตรวจจะเกิดต้นทุก turn, หลังทุกรอบ tool call และท้าย turn summary ที่ใช้ไม่ได้ (ว่าง, มีแต่ thinking, ตัดห้วน) จะ**ไม่มีทาง**แทนที่ history — jonnyq จะคงของเดิมไว้พร้อมพิมพ์เหตุผลออกจอ
+
+**2 โหมด tool**
+
+| โหมด | พฤติกรรม |
+|---|---|
+| `native` (default) | ส่ง tool spec ตาม protocol ของ provider และรับ tool calls แบบ structured ผล tool ถูกส่งกลับด้วย `role: "tool"` |
+| `prompt` | ไม่ส่ง tool spec เลย — ยัดรายชื่อ tool + JSON schema เข้า system prompt แล้วให้ model ตอบเป็น fenced block ` ```tool ``` ` ใช้เมื่อ function calling ของ backend ไม่เสถียร |
+
+**ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
+
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `output.txt`)
+
+## ความต้องการของระบบ
+
+| รายการ | จำเป็น? | หมายเหตุ |
+|---|---|---|
+| Rust toolchain | ตอน build | ต้องมี `cargo`; พัฒนา/ทดสอบบน rustc 1.99 (แนะนำ 1.85 ขึ้นไป) |
+| LLM server | ตอนใช้งาน | [Ollama](https://ollama.com) หรือ server แบบ OpenAI-compatible |
+| poppler-utils | เฉพาะ `read_pdf` | `pdftotext` + `pdftoppm` ต้องอยู่บน `PATH` |
+| bash | เฉพาะ `run_command` | รันคำสั่งผ่าน `bash -c` (Windows ใช้ WSL/Git Bash) |
+| searxng instance | ไม่บังคับ | ถ้าไม่ตั้ง URL จะปิด `web_search` อัตโนมัติ |
+| C compiler | ไม่จำเป็น | TLS ใช้ rustls (pure Rust) |
+
+```bash
+sudo apt install poppler-utils     # Debian/Ubuntu
+sudo dnf install poppler-utils     # Fedora
+brew install poppler               # macOS
+```
+
+## การติดตั้ง
+
+```bash
+cd jonnyq-rust
+cargo build --release
+./target/release/jonnyq -h
+```
+
+รันโดยไม่ต้อง build เอง หรือติดตั้งเข้า `PATH`:
+
+```bash
+cargo run --release -- -model qwen3:14b
+cargo install --path .                     # → ~/.cargo/bin/jonnyq
+cp target/release/jonnyq ~/.local/bin/     # หรือคัดลอก binary เอง
+```
+
+`[profile.release]` ตั้ง `strip = true` release binary จึงมีขนาดประมาณ **7 MB**
+
+cross-compile ได้ทันที (ไม่มี C binding) ขอแค่มี linker ของแพลตฟอร์มปลายทาง หรือใช้ [`cross`](https://github.com/cross-rs/cross):
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-gnu
+cargo build --release --target aarch64-apple-darwin
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
+ผลลัพธ์อยู่ที่ `target/<triple>/release/jonnyq`
+
+## เริ่มต้นใช้งาน
+
+```bash
+# 1) เปิด model server
+ollama pull qwen3:14b && ollama serve
+
+# 2) รัน jonnyq จากโฟลเดอร์ project
+cd ~/dev/my-project
+jonnyq -model qwen3:14b -context 32768
+```
+
+หรือเก็บการตั้งค่าไว้ในไฟล์:
+
+```bash
+cp .env.example .env     # template ที่มีทุก key พร้อมคำอธิบาย
+$EDITOR .env             # JONNYQ_MODEL, JONNYQ_CONTEXT_SIZE, ...
+jonnyq                   # เทียบเท่า: jonnyq -model ... -context ...
+```
+
+ฝั่ง OpenAI-compatible:
+
+```bash
+jonnyq -provider openai:http://localhost:1234/v1 -model qwen3-14b          # LM Studio
+jonnyq -provider openai:https://api.openai.com/v1 -key sk-... -model gpt-4o-mini
+```
+
+รูปแบบ provider string คือ `name:url` โดย `name` เป็น `ollama` หรือ `openai` เท่านั้น
+
+ถ้ายังไม่ตั้ง model โปรแกรมจะรับเฉพาะ slash command:
+
+```
+> /list_model          # ดูรายชื่อ model ที่ provider มี
+> /model qwen3:14b
+> /context 32768
+> ช่วยอธิบายโครงสร้างโปรเจกต์นี้
+> /exit
+```
+
+**พิมพ์หลายบรรทัด** — จบบรรทัดด้วย `\` เพื่อต่อบรรทัด หรือพิมพ์ `"""` บรรทัดเดียวเพื่อเปิด/ปิดบล็อก ส่วน `/prompt <file>` ใช้ส่งเนื้อหาไฟล์เป็น prompt
+
+**คีย์แก้ไข** — พรอมป์เป็น line-editor เต็มตัว: ↑/↓ เรียกคำสั่งเก่า (เก็บที่ `$HOME/.jonnyq_history` ใช้ร่วมกันข้าม session ได้), `Tab` autocomplete slash command / ค่าของอาร์กิวเมนต์ / ชื่อไฟล์, `Ctrl-A/E/W/U` ตามสไตล์ readline, `Ctrl-Z` suspend
+
+**Ctrl-C ยกเลิกรอบปัจจุบัน** (agent turn, คำสั่งที่กำลังรัน, หรือการรอคำตอบของ `ask_user`) โดยไม่ปิดโปรแกรม — `Ctrl-D` ตอนบรรทัดว่าง, `/exit` หรือ `/bye` ใช้ ออกจากโปรแกรม
+
+**ตัวอย่าง workflow:**
+
+```bash
+$EDITOR requirements.md
+jonnyq -model qwen3:14b -ntfy-url https://ntfy.sh/my-secret-topic
+# > /plan_for_human     # สร้าง .progress พร้อมคู่มือตรวจทีละ phase สำหรับคน
+# > /coding_phase       # ทำ 1 phase แล้วหยุด + ส่งวิธีตรวจ
+# > /coding_phase       # phase ถัดไป
+# > /autocoding         # หรือให้ทำรวดเดียวจบ
+```
+
+## การตั้งค่า
+
+ลำดับความสำคัญ: **CLI flag > ไฟล์ `.env` > environment variable (`JONNYQ_*`) > ค่า default**
+
+jonnyq อ่านไฟล์ `.env` ในโฟลเดอร์ที่รันให้อัตโนมัติตอน start (และเมื่อ `/env reload`) ชั้นไฟล์จะชนะ env var ที่ export ไว้ เพราะค่าในไฟล์คือการตั้งค่าที่ตั้งใจไว้สำหรับ project นั้น ส่วน env var เป็นค่าสำรองของ key ที่ไฟล์ไม่ได้กำหนด ชื่อ env var = ชื่อ flag พิมพ์ใหญ่เติม prefix `JONNYQ_` (`-context` → `JONNYQ_CONTEXT_SIZE`)
+
+syntax ของไฟล์รองรับ comment, `export KEY=value`, single/double quotes (escape `\n`, `\t`), `$VAR` / `${VAR:-fallback}`, `$$` สำหรับ `$` หนึ่งตัว และ key ซ้ำ = ค่าสุดท้ายชนะ บรรทัดที่พังเป็นแค่ warning ส่วน quote ปิดไม่ครบเป็น error ตอนเริ่ม
+
+| Flag | Env var / key ใน `.env` | Default | ความหมาย |
+|---|---|---|---|
+| `-provider` | `JONNYQ_PROVIDER` | `ollama:http://localhost:11434` | provider รูปแบบ `name:url` (`ollama` หรือ `openai`) |
+| `-key` | `JONNYQ_KEY` | (ว่าง) | API key ส่งเป็น `Authorization: Bearer` |
+| `-model` | `JONNYQ_MODEL` | (ว่าง — **ต้องตั้ง**) | ชื่อ model |
+| `-context` | `JONNYQ_CONTEXT_SIZE` | `16348` | ขนาด context window (Ollama รับต่อเป็น `num_ctx`) |
+| `-output` | `JONNYQ_OUTPUT_FILE` | `output.txt` | ไฟล์ transcript log (append, ข้อความล้วน) |
+| `-searxng-url` | `JONNYQ_SEARXNG_URL` | (ว่าง — ปิด `web_search`) | URL ของ searxng instance |
+| `-searxng-max-results` | `JONNYQ_SEARXNG_MAX_RESULTS` | `10` | จำนวนผลลัพธ์สูงสุด |
+| `-searxng-concurrency` | `JONNYQ_SEARXNG_CONCURRENCY` | `4` | จำนวนการค้นหาพร้อมกัน |
+| `-searxng-timeout-sec` | `JONNYQ_SEARXNG_TIMEOUT_SEC` | `30` | timeout การค้นหา (วินาที) |
+| `-fetch-concurrency` | `JONNYQ_FETCH_CONCURRENCY` | `5` | จำนวน `web_fetch` พร้อมกัน |
+| `-fetch-timeout-sec` | `JONNYQ_FETCH_TIMEOUT_SEC` | `30` | timeout การโหลดเว็บ (วินาที) |
+| `-pdf-max-pages` | `JONNYQ_PDF_MAX_PAGES` | `50` | จำนวนหน้า PDF สูงสุดที่ `read_pdf` อ่าน |
+| `-pdf-dpi` | `JONNYQ_PDF_DPI` | `150` | DPI ตอน render หน้า PDF เป็น PNG |
+| `-run-command-timeout-sec` | `JONNYQ_RUN_COMMAND_TIMEOUT_SEC` | `300` | timeout ของ `run_command` (วินาที) |
+| `-history-size` | `JONNYQ_HISTORY_SIZE` | `200` | จำนวน prompt ที่จำไว้ให้ ↑/↓ |
+| `-compact-headroom-percent` | `JONNYQ_COMPACT_HEADROOM_PERCENT` | `60` | % ของ window ที่จะ trigger compact |
+| `-compact-target-percent` | `JONNYQ_COMPACT_TARGET_PERCENT` | `25` | % ของ window ที่ summary ใช้ได้ (เพดาน 1,000 tokens) |
+| `-compact-keep-recent` | `JONNYQ_COMPACT_KEEP_RECENT` | `6` | จำนวนข้อความท้ายที่เก็บไว้ทั้งดุ้นหลัง compact |
+| `-summary-transcript-cap` | `JONNYQ_SUMMARY_TRANSCRIPT_CAP` | `48000` | เพดาน transcript ที่ส่งไปขอสรุป |
+| `-max-tool-result-chars` | `JONNYQ_MAX_TOOL_RESULT_CHARS` | `64000` | เพดานขนาดผล tool หนึ่งตัวก่อนเข้า history |
+| `-max-tool-calls-per-turn` | `JONNYQ_MAX_TOOL_CALLS_PER_TURN` | `50` | budget tool call ต่อ turn |
+| `-watch-magic-word` | `JONNYQ_WATCH_MAGIC_WORD` | `AI!` | magic word ของ `/watchfile` |
+| `-watch-poll-interval-sec` | `JONNYQ_WATCH_POLL_INTERVAL_SEC` | `1` | ความถี่ poll ของ `/watchfile` (วินาที) |
+| `-ntfy-url` | `JONNYQ_NTFY_URL` | (ว่าง — ไม่แจ้งเตือน) | ntfy topic URL เต็ม ๆ ใช้ทั้งส่ง notification และ**รับคำตอบ `ask_user`** |
+| `-socks-proxy` | `JONNYQ_SOCKS_PROXY` | (ว่าง — ไปอ่าน `ALL_PROXY`/`HTTPS_PROXY`) | SOCKS proxy ของทุก request (model, web tools, ntfy): `socks5h://host:port`, `socks5`, `socks4a`, `socks4` หรือ `host:port`; `off` = เชื่อมตรง; `auto` = เชื่อ env |
+| `-no-proxy` | `JONNYQ_NO_PROXY` | `localhost,127.0.0.1,::1` | host/CIDR ที่ข้าม proxy (คั่นด้วย `,`) |
+| `-tool-mode` | `JONNYQ_TOOL_MODE` | `native` | `native` หรือ `prompt` |
+| `-skill-path` | `JONNYQ_SKILL_PATH` | (ว่าง) | ไดเรกทอรีของ skill คั่นด้วย `;` |
+| `-thinking=true\|false` | `JONNYQ_THINKING` | `true` | เปิด/ปิด thinking (ส่งเฉพาะ Ollama) |
+| `-env-file` | `JONNYQ_ENV_FILE` | (ว่าง = `./.env`) | เลือกไฟล์ dotenv อื่น หรือ `off`/`none`/`no` เพื่อปิด — ตั้งผ่าน flag/env เท่านั้น ตั้งในไฟล์ไม่ได้ |
+
+หมายเหตุ:
+
+- ทุก flag รับ value ยกเว้น `-thinking` (รับแบบ inline `-thinking=false` เท่านั้น) และ `-h`/`-help` — การ parse หยุดที่ argument แรกที่ไม่ใช่ flag หรือที่ `--`; ตั้ง flag ซ้ำ = ค่าสุดท้ายชนะ; `-h` พิมพ์ usage แล้วออกด้วย exit code 1
+- `-thinking` ถูกส่งเฉพาะ Ollama (`{"think": true|false}`) — ฝั่ง `openai` jonnyq แค่แสดงผล `reasoning_content` ถ้า server ส่งมา จึงต้องปิดที่ฝั่ง server
+- credential ใน proxy URL ถูก mask เป็น `user:***` ในทุก output และ log
+- `-skill-path` คั่นด้วย `;` เท่านั้น (ไม่ใช่ `:`) และต้อง escape เป็น `\;` หรือครอบ single quotes ใน shell
+
+## Slash commands
+
+พิมพ์ `/help` (หรือ `/?`) เพื่อดูรายการนี้ในโปรแกรม
+
+| คำสั่ง | ความหมาย |
+|---|---|
+| `/?`, `/help` | แสดงคำสั่งทั้งหมด |
+| `/provider <name>:<url>` | เปลี่ยน provider (มีผลทันที) |
+| `/key <key>` | ตั้ง API key |
+| `/model <model>` | ตั้ง model |
+| `/list_model` | แสดงรายชื่อ model ที่ provider มี |
+| `/context <size>` | ตั้ง context size |
+| `/think <true\|false>` | เปิด/ปิด thinking |
+| `/compact` | สรุป history ทันที ไม่ต้องรอให้ถึง trigger |
+| `/history` | ดู context usage รายข้อความและยอดรวม |
+| `/run_command_timeout <seconds>` | เปลี่ยน timeout ของ `run_command` ระหว่างรัน |
+| `/prompt <file>` | ส่งเนื้อหาไฟล์เป็น prompt |
+| `/plan` | สร้าง `.progress` จาก `requirements.md` หรือ reconcile เมื่อ requirement เปลี่ยน — ไม่เขียนโค้ด |
+| `/plan_for_human` | เหมือน `/plan` แต่เขียน `> How to run:` / `> Human check:` เพิ่ม เพื่อให้คนตรวจงานจริงได้ทีละ phase |
+| `/coding` | ทำ task ถัดไปที่ยังไม่เสร็จใน `.progress` 1 ข้อแล้วหยุด |
+| `/coding_phase [<เลข>]` | ทำทุก task ของ 1 phase (ล้าง history ก่อนทุก task) แล้วหยุด; เช่น `/coding_phase 3` |
+| `/autocoding` | เรียก `/plan` ถ้าจำเป็น แล้วทำทุก task ที่เหลือรวดเดียว |
+| `/watchfile [<คำ>\|off]` | จับตาโฟลเดอร์หา magic word แล้วส่งบรรทัดนั้นเป็น prompt |
+| `/ntfy [<topic url>\|off]` | ดู/ตั้ง/ปิด ntfy topic |
+| `/proxy [<socks url>\|off\|auto]` | ดู/ตั้ง proxy ของ traffic ทั้งหมด มีผลตั้งแต่ request ถัดไป |
+| `/proxy no-proxy <hosts>` | แก้เฉพาะ bypass list |
+| `/toolmode [native\|prompt]` | ดู/สลับโหมด tool |
+| `/env [path\|off]` | ดูว่า `.env` ไฟล์ไหนถูกใช้ หรือเปลี่ยน/ปิดไฟล์ |
+| `/env list` | ตารางทุก setting: ค่าที่ใช้จริง + ที่มา (`flag`/`file`/`env`/`default`) |
+| `/env reload [path\|off]` | อ่านไฟล์ `.env` ใหม่แล้ว apply เข้า session ที่กำลังรัน |
+
+`/env reload` apply model, context, thinking, tool mode, ไฟล์ output, provider/key, proxy, timeout ของ searxng/fetch/pdf, tool-call budget, skill path, ntfy topic และ watch settings โดยไม่ต้อง restart — flag ที่ใส่ตอน start ถูก replay จึงยังชนะเสมอ
+
+## Tools
+
+| Tool | Parameters | หมายเหตุ |
+|---|---|---|
+| `read_file` | `path` | อ่านไฟล์ text ใน working dir เท่านั้น cap 2 MB |
+| `write_file` | `path`, `content` | สร้าง/เขียนทับ สร้างโฟลเดอร์ parents ให้เอง |
+| `edit_file` | `path`, `old_string`, `new_string`, `replace_all?` | แทนที่แบบ exact match — error เมื่อไม่พบหรือพบซ้ำโดยไม่ตั้ง `replace_all` |
+| `create_folder` | `path` | สร้างไดเรกทอรีพร้อม parents |
+| `run_command` | `command` | รัน `bash -c` ใน working dir รวม stdout+stderr, timeout ฆ่าทั้ง process group |
+| `web_search` | `query` | ค้นผ่าน searxng JSON API — ปิดอยู่จนกว่าจะตั้ง URL |
+| `web_fetch` | `url` | โหลด URL แล้ว strip HTML เหลือ text cap 3 MB |
+| `read_pdf` | `path` | ใช้ `pdftotext`; PDF ที่ไม่มี text จะ render เป็น PNG ให้ `read_pic` ต่อ |
+| `read_pic` | `path` | อ่าน image → base64 data URI cap 10 MB |
+| `read_skill` | `name` | อ่านเนื้อหาเต็มของ skill ที่อยู่ใน system prompt |
+| `ask_user` | `prompt` | ถามมนุษย์แล้วรอคำตอบ — บน terminal (คำถามสีฟ้า คำตอบขาวสว่าง) และผ่าน notification ถ้าตั้ง ntfy โดยตอบด้วย `answer: <ข้อความ>` |
+
+ทุก path tool ถูก confine ให้อยู่ใน working directory (กันทั้ง `../` traversal และ symlink escape)
+
+## การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`
+
+เขียน `requirements.md` เอง แล้ว:
+
+| | `/plan` | `/coding` | `/coding_phase` | `/autocoding` |
+|---|---|---|---|---|
+| สร้าง `.progress` | ได้ | ไม่ได้ | ไม่ได้ | ได้ (เรียก `/plan`) |
+| ขอบเขตที่ทำ | ไม่เขียนโค้ด | 1 task | 1 phase | ทุก task |
+| ล้าง history ต่อ task | – | ไม่ได้ | ได้ | ได้ |
+| หยุดเมื่อ | เขียน plan เสร็จ | จบ 1 task | จบ phase | ครบทุก task |
+
+`.progress` คือ checklist แบบ GitHub checkbox จัดกลุ่มเป็น phase และถูก sync กับ `requirements.md` ด้วย SHA-256 ใน `.progress.hash` — ถ้า requirement เปลี่ยน jonnyq จะ **reconcile** plan เดิมแทนการ generate ใหม่ทั้งหมด:
+
+```markdown
+# Project Title
+
+> How to run: `cargo run` → http://localhost:3000, login with demo/demo123
+
+## Phase 1: Scaffolding & config
+
+> Human check: รัน `cargo build` -> ต้องไม่มี error, เห็น binary ใน target/debug
+
+- [ ] Init Cargo.toml with tokio + serde dependencies (REQ-001)
+- [x] Implement the tool registry
+```
+
+ระหว่างเขียนโค้ด system prompt จะเข้าโหมด autonomous ซึ่งห้ามติ๊ก task ว่าเสร็จถ้าไม่ได้รัน build/test จริงในรอบนั้น และการตรวจความคืบหน้าดูจากเนื้อหาจริงในไฟล์ ทำให้การอ้างสำเร็จแบบไม่แก้ไฟล์ถูกจับได้และจบด้วย error
+
+`/watchfile` คือ pair programming โดยไม่ต้องออกจาก editor — เริ่มด้วย `/watchfile` แล้วพิมพ์ magic word ลงในโค้ด:
+
+```rust
+// AI! เพิ่ม error handling กรณีหาไฟล์ไม่เจอ พร้อมเขียน test
+let data = std::fs::read(path).unwrap();
+```
+
+watcher (poll mtime ไม่ใช้ fsnotify) จะจับบรรทัดนั้น ส่งเป็น prompt และ agent จะลบบรรทัด trigger ทิ้งเมื่อทำงานเสร็จ
+
+## Skills
+
+Skill คือความรู้ที่เขียนเป็น markdown ให้ model ดึงมาใช้เมื่อจำเป็น ระบบ discover skill ใหม่ทุก turn และสรุป (ชื่อ + บรรทัดแรก) เข้า system prompt model จะเรียก `read_skill` เมื่อต้องการเนื้อหาเต็ม
+
+```
+~/my-skills/
+├── react/
+│   └── SKILL.md        ← skill "react"
+└── postgres.md         ← skill "postgres" (ไฟล์เดี่ยว)
+```
+
+```bash
+jonnyq -skill-path '~/my-skills;~/shared-skills'
+# หรือ JONNYQ_SKILL_PATH=$HOME/my-skills;$HOME/shared-skills   (ใน .env)
+```
+
+## การแจ้งเตือน (ntfy)
+
+ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจากไฟล์ `.progress` โดยตรง (ไม่เรียก model เพิ่ม)
+
+topic เดียวกันใช้เป็นขากลับได้ด้วย: `ask_user` จะ push คำถามออกไปแล้ว subscribe รอคำตอบ จึงตอบจากมือถือได้ (`answer: <ข้อความ>` หรือ quick reply) — ใครตอบก่อนได้ก่อน سواءพิมพ์ที่ keyboard หรือจากมือถือ
+
+## ไฟล์ที่โปรแกรมสร้างระหว่างรัน
+
+| ไฟล์ | เมื่อไร | หมายเหตุ |
+|---|---|---|
+| `output.txt` | เสมอ (`-output`) | transcript log แบบข้อความล้วน append — มีใน .gitignore แล้ว |
+| `.env` | เมื่อคุณสร้าง | settings ของ project — ถูก ignore ไว้ เริ่มจาก `.env.example` |
+| `$HOME/.jonnyq_history` | ทุกครั้งที่กด Enter ส่ง prompt | ใช้ร่วมกันข้าม session ได้ ย้ายที่ด้วยการเปลี่ยน `HOME` |
+| `.progress`, `.progress.hash`, `.progress.retry` | คำสั่งกลุ่ม coding | `.progress` ควร commit ส่วนอีกสองไฟล์เป็น state local — ถูก ignore |
+| `.jonnyq/pdf_pages/**.png` | `read_pdf` เจอ PDF ที่ไม่มี text | cache ลบได้เสมอ |
+
+## ความปลอดภัย
+
+- **path confinement** — tool กลุ่มไฟล์ resolve ทีละ component พร้อม symlink ทุกขั้น จึงอ่าน/เขียนภายนอก working directory ไม่ได้เลย
+- **`run_command` รันด้วยสิทธิ์เต็มของคุณและไม่ถามก่อน** — มี denylist กันคำสั่งทำลายล้าง ~20 pattern (`rm -rf /`, fork bomb, `mkfs`, เขียนลง `/dev/sd*`, `curl … | sh`, …) ซึ่งเป็น best-effort **ไม่ใช่ sandbox**
+- **ntfy ไม่มีการยืนยันตัวตน** — ใครที่รู้ topic ก็ตอบ `ask_user` ได้ จึงควรใช้ชื่อ topic สุ่มยาว ๆ และไม่ใส่ secret ลงใน prompt
+- **resource caps** — อ่านไฟล์ 2 MB · `web_fetch` 3 MB · `read_pic` 10 MB · จำกัดจำนวนหน้า PDF และ tool call ต่อ turn
+- **API key** ถูกส่งเฉพาะ header `Authorization` และไม่เคยถูกพิมพ์ออกจอหรือลง log
+
+## License
+
+ยังไม่ระบุใน repo (`Cargo.toml` ไม่มี field `license`) — ติดต่อผู้ดูแลโปรเจกต์ก่อนนำไปเผยแพร่

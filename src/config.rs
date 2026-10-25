@@ -33,6 +33,9 @@ pub const DEFAULT_PDF_MAX_PAGES: i64 = 50;
 pub const DEFAULT_PDF_DPI: i64 = 150;
 pub const DEFAULT_THINKING: bool = true;
 pub const DEFAULT_RUN_COMMAND_TIMEOUT_SEC: i64 = 300;
+/// `-history-size` / `JONNYQ_HISTORY_SIZE`: how many prompts the `> ` prompt
+/// keeps for ↑/↓ recall.
+pub const DEFAULT_HISTORY_SIZE: i64 = 200;
 pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: i64 = 50;
 pub const DEFAULT_WATCH_MAGIC_WORD: &str = "AI!";
 pub const DEFAULT_WATCH_POLL_INTERVAL_SEC: i64 = 1;
@@ -75,6 +78,8 @@ Flags:
   -pdf-max-pages <n>            max PDF pages to read (default 50)
   -pdf-dpi <n>                  PDF render DPI (default 150)
   -run-command-timeout-sec <n>  run_command timeout seconds (default 300)
+  -history-size <n>             prompts kept for up/down recall at the prompt
+                                (default 200)
   -max-tool-calls-per-turn <n>  max tool calls per turn (default 50)
   -compact-headroom-percent <n> percent of the context window that triggers
                                 compaction (default 60)
@@ -159,7 +164,11 @@ impl Setting {
     /// still distinguishable from "unset".
     pub fn display(&self) -> String {
         if self.secret {
-            return if self.value.is_empty() { "(unset)".into() } else { "****" .into() };
+            return if self.value.is_empty() {
+                "(unset)".into()
+            } else {
+                "****".into()
+            };
         }
         if self.value.is_empty() {
             "(unset)".to_string()
@@ -200,7 +209,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn string(&self, flag: &str, env: &str, def: &str) -> (String, Source) {
-        self.raw(flag, env).unwrap_or_else(|| (def.to_string(), Source::Default))
+        self.raw(flag, env)
+            .unwrap_or_else(|| (def.to_string(), Source::Default))
     }
 
     fn int(&self, flag: &str, env: &str, def: i64) -> (i64, Source) {
@@ -247,6 +257,8 @@ pub struct Config {
     pub pdf_dpi: i64,
 
     pub run_command_timeout_sec: i64,
+    /// How many submitted prompts the `> ` prompt remembers for ↑/↓.
+    pub history_size: i64,
     pub max_tool_calls_per_turn: i64,
 
     /// Context-compaction tuning, applied to the agent at startup and by
@@ -326,6 +338,7 @@ impl Default for Config {
             pdf_max_pages: DEFAULT_PDF_MAX_PAGES,
             pdf_dpi: DEFAULT_PDF_DPI,
             run_command_timeout_sec: DEFAULT_RUN_COMMAND_TIMEOUT_SEC,
+            history_size: DEFAULT_HISTORY_SIZE,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
             compact_headroom_percent: DEFAULT_COMPACT_HEADROOM_PERCENT,
             compact_target_percent: DEFAULT_COMPACT_TARGET_PERCENT,
@@ -408,7 +421,8 @@ impl Config {
     /// have arrived through a mutation that skipped the checks, and is then
     /// described as unset rather than being silently honoured.
     pub fn proxy_config_or_default(&self) -> crate::net::ProxyConfig {
-        self.proxy_config().unwrap_or_else(|_| crate::net::ProxyConfig::system())
+        self.proxy_config()
+            .unwrap_or_else(|_| crate::net::ProxyConfig::system())
     }
 
     /// Path of the dotenv file that supplied settings, or `None` when no file
@@ -438,12 +452,19 @@ impl Config {
                 "{} ({} JONNYQ_* setting{}) from this file",
                 p,
                 self.dotenv_setting_count(),
-                if self.dotenv_setting_count() == 1 { "" } else { "s" }
+                if self.dotenv_setting_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ),
             None if is_disabled_selector(&self.env_file) => {
                 "dotenv file disabled (-env-file off)".to_string()
             }
-            None => format!("no {} file found; using environment variables only", dotenv::DEFAULT_ENV_FILE),
+            None => format!(
+                "no {} file found; using environment variables only",
+                dotenv::DEFAULT_ENV_FILE
+            ),
         }
     }
 
@@ -463,11 +484,41 @@ impl Config {
                 false,
             ),
             ("key", "KEY", self.key.clone(), self.src("KEY"), true),
-            ("model", "MODEL", self.model.clone(), self.src("MODEL"), false),
-            ("context", "CONTEXT_SIZE", self.context_size.to_string(), self.src("CONTEXT_SIZE"), false),
-            ("output", "OUTPUT_FILE", self.output_file.clone(), self.src("OUTPUT_FILE"), false),
-            ("thinking", "THINKING", self.thinking.to_string(), self.src("THINKING"), false),
-            ("searxng-url", "SEARXNG_URL", self.searxng_url.clone(), self.src("SEARXNG_URL"), false),
+            (
+                "model",
+                "MODEL",
+                self.model.clone(),
+                self.src("MODEL"),
+                false,
+            ),
+            (
+                "context",
+                "CONTEXT_SIZE",
+                self.context_size.to_string(),
+                self.src("CONTEXT_SIZE"),
+                false,
+            ),
+            (
+                "output",
+                "OUTPUT_FILE",
+                self.output_file.clone(),
+                self.src("OUTPUT_FILE"),
+                false,
+            ),
+            (
+                "thinking",
+                "THINKING",
+                self.thinking.to_string(),
+                self.src("THINKING"),
+                false,
+            ),
+            (
+                "searxng-url",
+                "SEARXNG_URL",
+                self.searxng_url.clone(),
+                self.src("SEARXNG_URL"),
+                false,
+            ),
             (
                 "searxng-max-results",
                 "SEARXNG_MAX_RESULTS",
@@ -503,13 +554,32 @@ impl Config {
                 self.src("FETCH_TIMEOUT_SEC"),
                 false,
             ),
-            ("pdf-max-pages", "PDF_MAX_PAGES", self.pdf_max_pages.to_string(), self.src("PDF_MAX_PAGES"), false),
-            ("pdf-dpi", "PDF_DPI", self.pdf_dpi.to_string(), self.src("PDF_DPI"), false),
+            (
+                "pdf-max-pages",
+                "PDF_MAX_PAGES",
+                self.pdf_max_pages.to_string(),
+                self.src("PDF_MAX_PAGES"),
+                false,
+            ),
+            (
+                "pdf-dpi",
+                "PDF_DPI",
+                self.pdf_dpi.to_string(),
+                self.src("PDF_DPI"),
+                false,
+            ),
             (
                 "run-command-timeout-sec",
                 "RUN_COMMAND_TIMEOUT_SEC",
                 self.run_command_timeout_sec.to_string(),
                 self.src("RUN_COMMAND_TIMEOUT_SEC"),
+                false,
+            ),
+            (
+                "history-size",
+                "HISTORY_SIZE",
+                self.history_size.to_string(),
+                self.src("HISTORY_SIZE"),
                 false,
             ),
             (
@@ -568,7 +638,13 @@ impl Config {
                 self.src("WATCH_POLL_INTERVAL_SEC"),
                 false,
             ),
-            ("ntfy-url", "NTFY_URL", self.ntfy_url.clone(), self.src("NTFY_URL"), false),
+            (
+                "ntfy-url",
+                "NTFY_URL",
+                self.ntfy_url.clone(),
+                self.src("NTFY_URL"),
+                false,
+            ),
             (
                 "socks-proxy",
                 "SOCKS_PROXY",
@@ -576,10 +652,34 @@ impl Config {
                 self.src("SOCKS_PROXY"),
                 false,
             ),
-            ("no-proxy", "NO_PROXY", self.no_proxy.clone(), self.src("NO_PROXY"), false),
-            ("tool-mode", "TOOL_MODE", self.tool_call_mode.clone(), self.src("TOOL_MODE"), false),
-            ("skill-path", "SKILL_PATH", skill_paths, self.src("SKILL_PATH"), false),
-            ("env-file", "ENV_FILE", self.env_file.clone(), self.src_env_file(), false),
+            (
+                "no-proxy",
+                "NO_PROXY",
+                self.no_proxy.clone(),
+                self.src("NO_PROXY"),
+                false,
+            ),
+            (
+                "tool-mode",
+                "TOOL_MODE",
+                self.tool_call_mode.clone(),
+                self.src("TOOL_MODE"),
+                false,
+            ),
+            (
+                "skill-path",
+                "SKILL_PATH",
+                skill_paths,
+                self.src("SKILL_PATH"),
+                false,
+            ),
+            (
+                "env-file",
+                "ENV_FILE",
+                self.env_file.clone(),
+                self.src_env_file(),
+                false,
+            ),
         ];
         rows.into_iter()
             .map(|(flag, env, value, source, secret)| Setting {
@@ -612,7 +712,9 @@ impl Config {
 
 /// True when a selector turns dotenv loading off.
 fn is_disabled_selector(sel: &str) -> bool {
-    dotenv::DISABLE_VALUES.iter().any(|v| v.eq_ignore_ascii_case(sel.trim()))
+    dotenv::DISABLE_VALUES
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(sel.trim()))
 }
 
 /// Sentinel error message meaning "-h/-help was requested" (Go's
@@ -637,6 +739,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "pdf-max-pages",
     "pdf-dpi",
     "run-command-timeout-sec",
+    "history-size",
     "compact-headroom-percent",
     "compact-target-percent",
     "compact-keep-recent",
@@ -667,7 +770,12 @@ struct FlagParser<'a> {
 
 impl<'a> FlagParser<'a> {
     fn new(args: &'a [String], bool_flags: &'a [&'a str]) -> Self {
-        Self { args, i: 0, given: Vec::new(), bool_flags }
+        Self {
+            args,
+            i: 0,
+            given: Vec::new(),
+            bool_flags,
+        }
     }
 
     fn take_value(&mut self, name: &str, inline: Option<&str>) -> Result<String, AgentError> {
@@ -678,7 +786,10 @@ impl<'a> FlagParser<'a> {
             self.i += 1;
             Ok(self.args[self.i].clone())
         } else {
-            Err(AgentError::new(format!("flag needs an argument: -{}", name)))
+            Err(AgentError::new(format!(
+                "flag needs an argument: -{}",
+                name
+            )))
         }
     }
 
@@ -811,7 +922,10 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     c.env_file = selector;
     c.startup_args = args.to_vec();
 
-    let r = Resolver { given: &given, dot: dotenv.as_ref() };
+    let r = Resolver {
+        given: &given,
+        dot: dotenv.as_ref(),
+    };
     // Where each setting's value came from, filled in alongside the
     // assignments below and stored on the config at the end (a closure
     // capturing `c` mutably would fight every `c.x = ...` for the borrow).
@@ -835,19 +949,39 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     let (v, src) = r.string("searxng-url", "SEARXNG_URL", "");
     sources.insert("SEARXNG_URL".to_string(), src);
     c.searxng_url = v;
-    let (n, src) = r.int("searxng-max-results", "SEARXNG_MAX_RESULTS", DEFAULT_SEARXNG_MAX_RESULTS);
+    let (n, src) = r.int(
+        "searxng-max-results",
+        "SEARXNG_MAX_RESULTS",
+        DEFAULT_SEARXNG_MAX_RESULTS,
+    );
     sources.insert("SEARXNG_MAX_RESULTS".to_string(), src);
     c.searxng_max_results = n;
-    let (n, src) = r.int("searxng-concurrency", "SEARXNG_CONCURRENCY", DEFAULT_SEARXNG_CONCURRENCY);
+    let (n, src) = r.int(
+        "searxng-concurrency",
+        "SEARXNG_CONCURRENCY",
+        DEFAULT_SEARXNG_CONCURRENCY,
+    );
     sources.insert("SEARXNG_CONCURRENCY".to_string(), src);
     c.searxng_concurrency = n;
-    let (n, src) = r.int("searxng-timeout-sec", "SEARXNG_TIMEOUT_SEC", DEFAULT_SEARXNG_TIMEOUT_SEC);
+    let (n, src) = r.int(
+        "searxng-timeout-sec",
+        "SEARXNG_TIMEOUT_SEC",
+        DEFAULT_SEARXNG_TIMEOUT_SEC,
+    );
     sources.insert("SEARXNG_TIMEOUT_SEC".to_string(), src);
     c.searxng_timeout_sec = n;
-    let (n, src) = r.int("fetch-concurrency", "FETCH_CONCURRENCY", DEFAULT_FETCH_CONCURRENCY);
+    let (n, src) = r.int(
+        "fetch-concurrency",
+        "FETCH_CONCURRENCY",
+        DEFAULT_FETCH_CONCURRENCY,
+    );
     sources.insert("FETCH_CONCURRENCY".to_string(), src);
     c.fetch_concurrency = n;
-    let (n, src) = r.int("fetch-timeout-sec", "FETCH_TIMEOUT_SEC", DEFAULT_FETCH_TIMEOUT_SEC);
+    let (n, src) = r.int(
+        "fetch-timeout-sec",
+        "FETCH_TIMEOUT_SEC",
+        DEFAULT_FETCH_TIMEOUT_SEC,
+    );
     sources.insert("FETCH_TIMEOUT_SEC".to_string(), src);
     c.fetch_timeout_sec = n;
     let (n, src) = r.int("pdf-max-pages", "PDF_MAX_PAGES", DEFAULT_PDF_MAX_PAGES);
@@ -863,19 +997,42 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     );
     sources.insert("RUN_COMMAND_TIMEOUT_SEC".to_string(), src);
     c.run_command_timeout_sec = n;
-    let (n, src) = r.int("compact-headroom-percent", "COMPACT_HEADROOM_PERCENT", DEFAULT_COMPACT_HEADROOM_PERCENT);
+    let (n, src) = r.int("history-size", "HISTORY_SIZE", DEFAULT_HISTORY_SIZE);
+    sources.insert("HISTORY_SIZE".to_string(), src);
+    c.history_size = n;
+    let (n, src) = r.int(
+        "compact-headroom-percent",
+        "COMPACT_HEADROOM_PERCENT",
+        DEFAULT_COMPACT_HEADROOM_PERCENT,
+    );
     sources.insert("COMPACT_HEADROOM_PERCENT".to_string(), src);
     c.compact_headroom_percent = n;
-    let (n, src) = r.int("compact-target-percent", "COMPACT_TARGET_PERCENT", DEFAULT_COMPACT_TARGET_PERCENT);
+    let (n, src) = r.int(
+        "compact-target-percent",
+        "COMPACT_TARGET_PERCENT",
+        DEFAULT_COMPACT_TARGET_PERCENT,
+    );
     sources.insert("COMPACT_TARGET_PERCENT".to_string(), src);
     c.compact_target_percent = n;
-    let (n, src) = r.int("compact-keep-recent", "COMPACT_KEEP_RECENT", DEFAULT_COMPACT_KEEP_RECENT);
+    let (n, src) = r.int(
+        "compact-keep-recent",
+        "COMPACT_KEEP_RECENT",
+        DEFAULT_COMPACT_KEEP_RECENT,
+    );
     sources.insert("COMPACT_KEEP_RECENT".to_string(), src);
     c.compact_keep_recent = n;
-    let (n, src) = r.int("summary-transcript-cap", "SUMMARY_TRANSCRIPT_CAP", DEFAULT_SUMMARY_TRANSCRIPT_CAP);
+    let (n, src) = r.int(
+        "summary-transcript-cap",
+        "SUMMARY_TRANSCRIPT_CAP",
+        DEFAULT_SUMMARY_TRANSCRIPT_CAP,
+    );
     sources.insert("SUMMARY_TRANSCRIPT_CAP".to_string(), src);
     c.summary_transcript_cap = n;
-    let (n, src) = r.int("max-tool-result-chars", "MAX_TOOL_RESULT_CHARS", DEFAULT_MAX_TOOL_RESULT_CHARS);
+    let (n, src) = r.int(
+        "max-tool-result-chars",
+        "MAX_TOOL_RESULT_CHARS",
+        DEFAULT_MAX_TOOL_RESULT_CHARS,
+    );
     sources.insert("MAX_TOOL_RESULT_CHARS".to_string(), src);
     c.max_tool_result_chars = n;
     let (n, src) = r.int(
@@ -885,7 +1042,11 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     );
     sources.insert("MAX_TOOL_CALLS_PER_TURN".to_string(), src);
     c.max_tool_calls_per_turn = n;
-    let (v, src) = r.string("watch-magic-word", "WATCH_MAGIC_WORD", DEFAULT_WATCH_MAGIC_WORD);
+    let (v, src) = r.string(
+        "watch-magic-word",
+        "WATCH_MAGIC_WORD",
+        DEFAULT_WATCH_MAGIC_WORD,
+    );
     sources.insert("WATCH_MAGIC_WORD".to_string(), src);
     c.watch_magic_word = v;
     let (n, src) = r.int(
@@ -936,7 +1097,10 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
 /// form), trimming blanks and dropping empty entries. `;` is the only
 /// separator on purpose: `:` would mangle `C:\skills` style Windows paths.
 fn split_paths(s: &str) -> Vec<String> {
-    s.split(';').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+    s.split(';')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Builds a Config from CLI args, the dotenv file the selector names and the
@@ -1040,7 +1204,10 @@ mod tests {
 
     #[test]
     fn max_tool_calls_flag_and_env() {
-        let cfg = load_dotenv_off(&["-max-tool-calls-per-turn".to_string(), "10".to_string()], "off");
+        let cfg = load_dotenv_off(
+            &["-max-tool-calls-per-turn".to_string(), "10".to_string()],
+            "off",
+        );
         assert_eq!(cfg.max_tool_calls_per_turn, 10);
 
         let _g = clean_env();
@@ -1070,8 +1237,14 @@ mod tests {
     #[test]
     fn skill_path_splitting() {
         let cfg = load_clean(&["-skill-path".to_string(), "/a/skills;/b/skills".to_string()]);
-        assert_eq!(cfg.skill_paths, vec!["/a/skills".to_string(), "/b/skills".to_string()]);
-        assert_eq!(split_paths(" /a ;; /b ;"), vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(
+            cfg.skill_paths,
+            vec!["/a/skills".to_string(), "/b/skills".to_string()]
+        );
+        assert_eq!(
+            split_paths(" /a ;; /b ;"),
+            vec!["/a".to_string(), "/b".to_string()]
+        );
         // ';' only: ':' must survive inside a path (Windows drive letters).
         assert_eq!(split_paths("C:/skills"), vec!["C:/skills".to_string()]);
     }
@@ -1084,7 +1257,11 @@ mod tests {
             "azure:http://x".to_string()
         ]))
         .is_err());
-        assert!(load(&with_off(&["-provider".to_string(), "http://x".to_string()])).is_err());
+        assert!(load(&with_off(&[
+            "-provider".to_string(),
+            "http://x".to_string()
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -1123,7 +1300,10 @@ mod tests {
         let cfg = load_clean(&[]);
         // Unset = "let the environment decide", not "connect directly".
         assert_eq!(cfg.socks_proxy, "");
-        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::System);
+        assert_eq!(
+            cfg.proxy_config_or_default().mode,
+            crate::net::ProxyMode::System
+        );
         // Loopback is bypassed by default so a local model server is never
         // tunnelled by accident.
         assert_eq!(cfg.no_proxy, DEFAULT_NO_PROXY);
@@ -1148,16 +1328,25 @@ mod tests {
         ]);
         assert_eq!(cfg.socks_proxy, "socks5://proxy:1080");
         assert_eq!(cfg.no_proxy, "intranet,10.0.0.0/8");
-        assert_eq!(cfg.proxy_config_or_default().describe(), "socks5://proxy:1080 (direct for: intranet,10.0.0.0/8)");
+        assert_eq!(
+            cfg.proxy_config_or_default().describe(),
+            "socks5://proxy:1080 (direct for: intranet,10.0.0.0/8)"
+        );
 
         // off means off, and it survives the round trip through the stored value.
         let cfg = load_clean(&["-socks-proxy".to_string(), "off".to_string()]);
         assert_eq!(cfg.socks_proxy, "off");
-        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::Direct);
+        assert_eq!(
+            cfg.proxy_config_or_default().mode,
+            crate::net::ProxyMode::Direct
+        );
         // ...as does auto/system, which hands the decision back to env vars.
         let cfg = load_clean(&["-socks-proxy".to_string(), "auto".to_string()]);
         assert_eq!(cfg.socks_proxy, "");
-        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::System);
+        assert_eq!(
+            cfg.proxy_config_or_default().mode,
+            crate::net::ProxyMode::System
+        );
     }
 
     #[test]
@@ -1170,25 +1359,41 @@ mod tests {
         assert_eq!(cfg.no_proxy, "internal.example");
         // The flag still wins.
         let cfg = load(&with_off(&["-socks-proxy".to_string(), "off".to_string()])).unwrap();
-        assert_eq!(cfg.proxy_config_or_default().mode, crate::net::ProxyMode::Direct);
+        assert_eq!(
+            cfg.proxy_config_or_default().mode,
+            crate::net::ProxyMode::Direct
+        );
 
-        let (_d, path) = temp_dotenv("proxy", "JONNYQ_SOCKS_PROXY=socks4a://file-proxy:1080\nJONNYQ_NO_PROXY=\n");
+        let (_d, path) = temp_dotenv(
+            "proxy",
+            "JONNYQ_SOCKS_PROXY=socks4a://file-proxy:1080\nJONNYQ_NO_PROXY=\n",
+        );
         let cfg = load(&["-env-file".to_string(), path]).unwrap();
         assert_eq!(cfg.socks_proxy, "socks4a://file-proxy:1080");
         // An empty bypass list in the file is a decision, not a default: with a
         // proxy set, everything (loopback included) is tunnelled.
         assert_eq!(cfg.no_proxy, "");
-        assert!(!cfg.proxy_config_or_default().describe().contains("direct for"));
+        assert!(!cfg
+            .proxy_config_or_default()
+            .describe()
+            .contains("direct for"));
     }
 
     #[test]
     fn invalid_socks_proxy_is_a_config_error() {
         // Same class of failure as a malformed -provider: refuse at startup
         // rather than failing the first model request.
-        for bad in ["http://proxy:3128", "ftp://x:21", "socks5://proxy:99999", "socks5://"] {
+        for bad in [
+            "http://proxy:3128",
+            "ftp://x:21",
+            "socks5://proxy:99999",
+            "socks5://",
+        ] {
             let e = load(&with_off(&["-socks-proxy".to_string(), bad.to_string()])).unwrap_err();
             assert!(
-                e.message.contains("SOCKS") || e.message.contains("scheme") || e.message.contains("port")
+                e.message.contains("SOCKS")
+                    || e.message.contains("scheme")
+                    || e.message.contains("port")
                     || e.message.contains("host"),
                 "{bad}: {}",
                 e.message
@@ -1203,9 +1408,19 @@ mod tests {
     #[test]
     fn proxy_credentials_never_reach_the_settings_table() {
         // /env list prints values, so the row must not carry a password.
-        let cfg = load_clean(&["-socks-proxy".to_string(), "socks5h://u:sup3rs3cr3t@proxy:1080".to_string()]);
-        assert_eq!(cfg.socks_proxy, "socks5h://u:sup3rs3cr3t@proxy:1080", "the value itself is kept");
-        let row = cfg.settings().into_iter().find(|s| s.flag == "socks-proxy").unwrap();
+        let cfg = load_clean(&[
+            "-socks-proxy".to_string(),
+            "socks5h://u:sup3rs3cr3t@proxy:1080".to_string(),
+        ]);
+        assert_eq!(
+            cfg.socks_proxy, "socks5h://u:sup3rs3cr3t@proxy:1080",
+            "the value itself is kept"
+        );
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|s| s.flag == "socks-proxy")
+            .unwrap();
         assert_eq!(row.display(), "socks5h://u:***@proxy:1080");
     }
 
@@ -1219,7 +1434,9 @@ mod tests {
         assert_eq!(load(&with_off(&[])).unwrap().tool_call_mode, "prompt");
         // flag beats env
         assert_eq!(
-            load(&with_off(&["-tool-mode".to_string(), "native".to_string()])).unwrap().tool_call_mode,
+            load(&with_off(&["-tool-mode".to_string(), "native".to_string()]))
+                .unwrap()
+                .tool_call_mode,
             "native"
         );
     }
@@ -1278,12 +1495,19 @@ mod tests {
         assert_eq!(cfg.context_size, 32768);
         assert!(!cfg.thinking);
         assert_eq!(cfg.tool_call_mode, "prompt");
-        assert_eq!(cfg.skill_paths, vec!["/a/skills".to_string(), "/b/skills".to_string()]);
+        assert_eq!(
+            cfg.skill_paths,
+            vec!["/a/skills".to_string(), "/b/skills".to_string()]
+        );
         // Only JONNYQ_* keys count towards the summary.
         assert_eq!(cfg.dotenv_setting_count(), 5);
         assert_eq!(cfg.dotenv_path().as_deref(), Some(path.as_str()));
         assert_eq!(cfg.env_file, path);
-        assert!(cfg.dotenv_summary().contains("settings.env"), "{}", cfg.dotenv_summary());
+        assert!(
+            cfg.dotenv_summary().contains("settings.env"),
+            "{}",
+            cfg.dotenv_summary()
+        );
     }
 
     #[test]
@@ -1301,10 +1525,16 @@ mod tests {
         // source layer for that row (which is exactly the precedence this test
         // is about, and the fixture does not set it).
         let _g = clean_env();
-        let (_d, path) = temp_dotenv("precedence", "JONNYQ_MODEL=from-file\nJONNYQ_CONTEXT_SIZE=111\n");
+        let (_d, path) = temp_dotenv(
+            "precedence",
+            "JONNYQ_MODEL=from-file\nJONNYQ_CONTEXT_SIZE=111\n",
+        );
         _g.set("JONNYQ_MODEL", "from-env");
         let cfg = load(&["-env-file".to_string(), path.clone()]).unwrap();
-        assert_eq!(cfg.model, "from-file", "the file must win over the process env");
+        assert_eq!(
+            cfg.model, "from-file",
+            "the file must win over the process env"
+        );
         // ...and the environment still fills in what the file does not set.
         _g.set("JONNYQ_NTFY_URL", "https://env-only/x");
         let cfg = load(&["-env-file".to_string(), path]).unwrap();
@@ -1322,7 +1552,11 @@ mod tests {
         _g.set("JONNYQ_MODEL", "from-env");
         let cfg = load(&["-env-file".to_string(), path]).unwrap();
         assert_eq!(cfg.model, "");
-        let row = cfg.settings().into_iter().find(|s| s.flag == "model").unwrap();
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|s| s.flag == "model")
+            .unwrap();
         assert_eq!(row.source, Source::File);
     }
 
@@ -1336,7 +1570,11 @@ mod tests {
         let cfg = load(&["-env-file".to_string(), path]).unwrap();
         assert_eq!(cfg.model, "from-file");
         assert_eq!(cfg.context_size, 222);
-        let row = cfg.settings().into_iter().find(|s| s.flag == "context").unwrap();
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|s| s.flag == "context")
+            .unwrap();
         assert_eq!(row.source, Source::Env);
     }
 
@@ -1375,7 +1613,11 @@ mod tests {
         assert_eq!(load_dotenv_off(&[], "NONE").model, "");
         assert_eq!(load_dotenv_off(&[], "no").model, "");
         let cfg = load_dotenv_off(&[], "off");
-        assert!(cfg.dotenv_summary().contains("disabled"), "{}", cfg.dotenv_summary());
+        assert!(
+            cfg.dotenv_summary().contains("disabled"),
+            "{}",
+            cfg.dotenv_summary()
+        );
     }
 
     #[test]
@@ -1403,7 +1645,9 @@ mod tests {
         let (_d2, p2) = temp_dotenv("warn2", "OTHER_APP=1\n");
         let (_, warnings) = load_with(&["-env-file".to_string(), p2]).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("defines no JONNYQ_* settings")),
+            warnings
+                .iter()
+                .any(|w| w.contains("defines no JONNYQ_* settings")),
             "{warnings:?}"
         );
         // ...while a disabled selector with no file at all stays quiet.
@@ -1479,14 +1723,23 @@ mod tests {
         );
         _g.set("JONNYQ_MODEL", "from-env");
         _g.set("JONNYQ_WATCH_MAGIC_WORD", "ENV!");
-        let cfg = load(&["-env-file".to_string(), path, "-ntfy-url".to_string(), "https://flag/z".to_string()])
-            .unwrap();
+        let cfg = load(&[
+            "-env-file".to_string(),
+            path,
+            "-ntfy-url".to_string(),
+            "https://flag/z".to_string(),
+        ])
+        .unwrap();
 
         let src = |env: &str| cfg.src(env);
         assert_eq!(src("MODEL"), Source::File, "the file outranks an env var");
         assert_eq!(src("CONTEXT_SIZE"), Source::File);
         assert_eq!(src("NTFY_URL"), Source::Flag);
-        assert_eq!(src("WATCH_MAGIC_WORD"), Source::Env, "a key the file omits comes from env");
+        assert_eq!(
+            src("WATCH_MAGIC_WORD"),
+            Source::Env,
+            "a key the file omits comes from env"
+        );
         assert_eq!(src("PDF_DPI"), Source::Default);
         assert_eq!(src("ENV_FILE"), Source::Flag);
 
@@ -1498,11 +1751,19 @@ mod tests {
         let (_d2, p2) = temp_dotenv("src-key", "JONNYQ_KEY=sk-super-secret\n");
         let cfg2 = build(&["-env-file".to_string(), p2], None).unwrap().0;
         assert_eq!(cfg2.key, "sk-super-secret");
-        let key_row = cfg2.settings().into_iter().find(|s| s.flag == "key").unwrap();
+        let key_row = cfg2
+            .settings()
+            .into_iter()
+            .find(|s| s.flag == "key")
+            .unwrap();
         assert_eq!(key_row.display(), "****");
         assert_eq!(key_row.source, Source::File);
         // Unset strings show as "(unset)" rather than a blank cell.
-        let out_row = cfg.settings().into_iter().find(|s| s.flag == "key").unwrap();
+        let out_row = cfg
+            .settings()
+            .into_iter()
+            .find(|s| s.flag == "key")
+            .unwrap();
         assert_eq!(out_row.display(), "(unset)");
     }
 
@@ -1513,7 +1774,10 @@ mod tests {
         let rows = cfg.settings();
         // Snapshot of the documented flag/env/meaning table (README section 5)
         // - catches a row being dropped or an env var name drifting.
-        let got: Vec<String> = rows.iter().map(|r| format!("{} {}", r.flag, r.env)).collect();
+        let got: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{} {}", r.flag, r.env))
+            .collect();
         let want = vec![
             "provider JONNYQ_PROVIDER",
             "key JONNYQ_KEY",
@@ -1530,6 +1794,7 @@ mod tests {
             "pdf-max-pages JONNYQ_PDF_MAX_PAGES",
             "pdf-dpi JONNYQ_PDF_DPI",
             "run-command-timeout-sec JONNYQ_RUN_COMMAND_TIMEOUT_SEC",
+            "history-size JONNYQ_HISTORY_SIZE",
             "compact-headroom-percent JONNYQ_COMPACT_HEADROOM_PERCENT",
             "compact-target-percent JONNYQ_COMPACT_TARGET_PERCENT",
             "compact-keep-recent JONNYQ_COMPACT_KEEP_RECENT",
@@ -1550,7 +1815,11 @@ mod tests {
         // Every flag in the table is accepted on the command line, and every
         // env name is the prefix plus a valid dotenv key.
         for r in &rows {
-            assert!(KNOWN_FLAGS.contains(&r.flag), "-{} not accepted as a flag", r.flag);
+            assert!(
+                KNOWN_FLAGS.contains(&r.flag),
+                "-{} not accepted as a flag",
+                r.flag
+            );
             assert!(
                 dotenv::valid_key(r.env.strip_prefix(ENV_PREFIX).unwrap()),
                 "bad env name {}",
@@ -1569,23 +1838,39 @@ mod tests {
         let (_d, path) = temp_dotenv("envrow", "JONNYQ_MODEL=x\n");
         // Via the flag -> "flag".
         let (cfg, _) = build(&["-env-file".to_string(), path.clone()], None).unwrap();
-        let row = cfg.settings().into_iter().find(|r| r.flag == "env-file").unwrap();
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|r| r.flag == "env-file")
+            .unwrap();
         assert_eq!(row.env, "JONNYQ_ENV_FILE");
         assert_eq!(row.source, Source::Flag);
         assert_eq!(row.display(), path);
         // Via the environment variable -> "env".
         _g.set("JONNYQ_ENV_FILE", &path);
         let (cfg, _) = build(&[], None).unwrap();
-        let row = cfg.settings().into_iter().find(|r| r.flag == "env-file").unwrap();
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|r| r.flag == "env-file")
+            .unwrap();
         assert_eq!(row.source, Source::Env);
         // A selector that disables dotenv is still a deliberate choice, so it
         // is reported like a flag rather than a default.
         let (cfg, _) = build(&[], Some("off")).unwrap();
-        let row = cfg.settings().into_iter().find(|r| r.flag == "env-file").unwrap();
+        let row = cfg
+            .settings()
+            .into_iter()
+            .find(|r| r.flag == "env-file")
+            .unwrap();
         assert_eq!(row.source, Source::Flag);
         assert_eq!(row.display(), "off");
         // A plain default Config (nothing named a file) is "default".
-        let row = Config::default().settings().into_iter().find(|r| r.flag == "env-file").unwrap();
+        let row = Config::default()
+            .settings()
+            .into_iter()
+            .find(|r| r.flag == "env-file")
+            .unwrap();
         assert_eq!(row.source, Source::Default);
     }
 }

@@ -40,7 +40,10 @@ pub struct RunCommandTool {
 
 impl RunCommandTool {
     pub fn new(work_dir: &str, timeout_sec: i64) -> Self {
-        Self { work_dir: work_dir.to_string(), timeout_sec: Arc::new(std::sync::Mutex::new(timeout_sec)) }
+        Self {
+            work_dir: work_dir.to_string(),
+            timeout_sec: Arc::new(std::sync::Mutex::new(timeout_sec)),
+        }
     }
 
     pub fn set_timeout_sec(&self, n: i64) {
@@ -51,7 +54,6 @@ impl RunCommandTool {
         *self.timeout_sec.lock().unwrap()
     }
 }
-
 
 /// Copies a pipe into the shared buffer in chunks, so stdout and stderr
 /// interleave roughly in arrival order (Go merged both into one buffer via
@@ -96,17 +98,32 @@ impl Tool for RunCommandTool {
             return Err(AgentError::new("command is required"));
         }
         if let Some(reason) = super::denylist::check_denylist(command) {
-            return Err(AgentError::new(format!("refused to run: command {}", reason)));
+            return Err(AgentError::new(format!(
+                "refused to run: command {}",
+                reason
+            )));
         }
 
         let timeout_sec = *self.timeout_sec.lock().unwrap();
-        let timeout_sec = if timeout_sec <= 0 { DEFAULT_COMMAND_TIMEOUT_SEC } else { timeout_sec };
+        let timeout_sec = if timeout_sec <= 0 {
+            DEFAULT_COMMAND_TIMEOUT_SEC
+        } else {
+            timeout_sec
+        };
         let timeout = Duration::from_secs(timeout_sec as u64);
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(command);
         cmd.current_dir(&self.work_dir);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // stdin comes from /dev/null rather than from ours. There is no way to give
+        // a command input here, so an inherited stdin would be the user's terminal:
+        // `cat`, `ssh`, `git rebase -i`, `python` would sit reading it for the whole
+        // timeout, and every keystroke typed meanwhile would go to the command
+        // instead of to the prompt — which looks exactly like jonnyq eating what was
+        // typed. With /dev/null such a command sees end-of-input at once and either
+        // does something sensible or fails immediately.
+        cmd.stdin(Stdio::null());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| AgentError::new(e.to_string()))?;
@@ -177,14 +194,21 @@ impl Tool for RunCommandTool {
                 } else {
                     // Go: a non-zero exit code comes back as output, not an
                     // error, so the model can see and react to it.
-                    Ok(format!("{}\n[exit code: {}]", result, status.code().unwrap_or(-1)))
+                    Ok(format!(
+                        "{}\n[exit code: {}]",
+                        result,
+                        status.code().unwrap_or(-1)
+                    ))
                 }
             }
         }
     }
 }
 
-async fn drain_owned(pipe: impl tokio::io::AsyncRead + Unpin + Send, buf: Arc<std::sync::Mutex<Vec<u8>>>) {
+async fn drain_owned(
+    pipe: impl tokio::io::AsyncRead + Unpin + Send,
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+) {
     drain(pipe, buf).await
 }
 
@@ -236,17 +260,48 @@ mod tests {
     }
 
     fn ctx() -> CallCtx {
-        CallCtx { cancel: CancellationToken::new() }
+        CallCtx {
+            cancel: CancellationToken::new(),
+        }
     }
 
     #[tokio::test]
     async fn timeout_kills_the_command() {
         let rc = RunCommandTool::new(&tmpdir("to"), 1);
         let start = std::time::Instant::now();
-        let err = rc.call(ctx(), &json!({"command": "sleep 3"})).await.unwrap_err();
+        let err = rc
+            .call(ctx(), &json!({"command": "sleep 3"}))
+            .await
+            .unwrap_err();
         let elapsed = start.elapsed();
         assert!(err.message.contains("timed out"), "got: {}", err.message);
-        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
+    }
+
+    /// stdin must never be the user's terminal.
+    #[tokio::test]
+    async fn a_command_cannot_read_the_users_terminal() {
+        let rc = RunCommandTool::new(&tmpdir("stdin"), 5);
+        // `cat` with no arguments is the classic hang: with an inherited terminal
+        // stdin it would sit there for the whole timeout, stealing every keystroke.
+        let start = std::time::Instant::now();
+        let out = rc.call(ctx(), &json!({"command": "cat"})).await.unwrap();
+        assert_eq!(out.trim(), "", "cat must see end-of-input at once");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "cat blocked: {:?}",
+            start.elapsed()
+        );
+
+        // And the descriptor really is /dev/null rather than a closed or inherited one.
+        let out = rc
+            .call(ctx(), &json!({"command": "readlink /proc/self/fd/0"}))
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "/dev/null", "stdin is {:?}", out.trim());
     }
 
     #[tokio::test]
@@ -254,7 +309,10 @@ mod tests {
         // timeout_sec left unset (0) must fall back to DEFAULT_COMMAND_TIMEOUT_SEC
         // rather than expiring immediately.
         let rc = RunCommandTool::new(&tmpdir("dflt"), 0);
-        let out = rc.call(ctx(), &json!({"command": "echo ok"})).await.unwrap();
+        let out = rc
+            .call(ctx(), &json!({"command": "echo ok"}))
+            .await
+            .unwrap();
         assert_eq!(out.trim(), "ok");
     }
 
@@ -264,10 +322,16 @@ mod tests {
         // bash child would leave the wait hanging on the grandchild.
         let rc = RunCommandTool::new(&tmpdir("bg"), 1);
         let start = std::time::Instant::now();
-        let err = rc.call(ctx(), &json!({"command": "sleep 10 & sleep 10"})).await.unwrap_err();
+        let err = rc
+            .call(ctx(), &json!({"command": "sleep 10 & sleep 10"}))
+            .await
+            .unwrap_err();
         let elapsed = start.elapsed();
         assert!(err.message.contains("timed out"), "got: {}", err.message);
-        assert!(elapsed < std::time::Duration::from_secs(4), "took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -276,14 +340,20 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let ctx = CallCtx { cancel };
-        let err = rc.call(ctx, &json!({"command": "sleep 1"})).await.unwrap_err();
+        let err = rc
+            .call(ctx, &json!({"command": "sleep 1"}))
+            .await
+            .unwrap_err();
         assert!(!err.message.contains("timed out"), "got: {}", err.message);
     }
 
     #[tokio::test]
     async fn nonzero_exit_is_output_not_error() {
         let rc = RunCommandTool::new(&tmpdir("exit"), 10);
-        let out = rc.call(ctx(), &json!({"command": "echo boom; exit 3"})).await.unwrap();
+        let out = rc
+            .call(ctx(), &json!({"command": "echo boom; exit 3"}))
+            .await
+            .unwrap();
         assert!(out.contains("boom"));
         assert!(out.contains("[exit code: 3]"), "got: {out}");
     }
@@ -291,7 +361,14 @@ mod tests {
     #[tokio::test]
     async fn denylisted_command_is_refused() {
         let rc = RunCommandTool::new(&tmpdir("deny"), 10);
-        let err = rc.call(ctx(), &json!({"command": "rm -rf /"})).await.unwrap_err();
-        assert!(err.message.starts_with("refused to run:"), "got: {}", err.message);
+        let err = rc
+            .call(ctx(), &json!({"command": "rm -rf /"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.starts_with("refused to run:"),
+            "got: {}",
+            err.message
+        );
     }
 }
