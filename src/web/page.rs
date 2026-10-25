@@ -7,6 +7,14 @@
 //! no bundler): it must work offline, from a local model, on a machine with no
 //! internet — which is most of the machines jonnyq runs on.
 //!
+//! The one exception is the Thai typefaces: the top bar offers nine of them
+//! from Google Fonts. That stylesheet is *optional* in the strongest sense — it
+//! is requested in a way that cannot block the first paint, so a machine with no
+//! internet draws the page immediately and every family falls back to a locally
+//! installed copy of the same name or to the browser's own sans-serif. Nothing
+//! on the page waits for it and no script comes from it, so offline behaviour is
+//! unchanged apart from which face the text is drawn in.
+//!
 //! Layout, per the feature:
 //!
 //! * centre: a tab strip (always a `console` tab, plus one per opened file)
@@ -24,6 +32,15 @@ pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>jonnyq console</title>
+<!-- The Thai typefaces, from Google Fonts. Optional by design, and fetched
+     without blocking the paint: with `media="print"` the browser never waits on
+     this stylesheet before drawing the page, so a machine with no internet (or
+     one whose proxy blackholes the request) paints immediately and redraws when
+     the faces arrive — or never, in which case every family below resolves to a
+     locally installed copy of the same name, or to the browser's sans-serif.
+     Nothing on the page waits for it, and nothing is executed from it. -->
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Athiti:wght@400;700&amp;family=IBM+Plex+Sans+Thai+Looped:wght@400;700&amp;family=K2D:wght@400;700&amp;family=Kodchasan:wght@400;700&amp;family=Noto+Sans+Thai+Looped:wght@400;700&amp;family=Noto+Serif+Thai:wght@400;700&amp;family=Playpen+Sans+Thai:wght@400;700&amp;family=Thasadith:wght@400;700&amp;family=Trirong:wght@400;700&amp;display=swap">
 <style>
 /* gruvbox dark (predniam), the palette the terminal output is written in. */
 :root {
@@ -35,12 +52,17 @@ pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
   --f0: #fb4934;     --f2: #fabb2f;      --f3: #83a598;      --f4: #d3869b;
   --f6: #8ec07c;     --f7: #b8a288;      --f12: #928374;
   --accent: #fe8019;
+  /* What the top bar's controls write: the face the console, the prompt box
+     and the chrome are drawn in, and the text size every one of them uses.
+     Both are overwritten from localStorage on boot, before the first paint. */
+  --ui-font: "IBM Plex Sans Thai Looped", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --ui-size: 14pt;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body {
   background: var(--bg0h); color: var(--fg);
-  font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font: 14px/1.45 var(--ui-font);
   display: flex; flex-direction: column; overflow: hidden;
 }
 #top {
@@ -49,8 +71,29 @@ body {
   flex: 0 0 auto;
 }
 #top b { color: var(--accent); letter-spacing: .04em; }
-#status { color: var(--fg4); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#conn { margin-left: auto; font-size: 12px; color: var(--fg4); white-space: nowrap; }
+/* The status line is the session's live ctx figure, so it gets the space a
+   long model name cannot take from it: it shrinks and ellipsises instead of
+   pushing the type controls and the connection light out of the bar. */
+#status {
+  color: var(--fg4); font-size: 12px; white-space: nowrap;
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+}
+#type { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+#type label { font-size: 11px; color: var(--fg4); }
+#font, #size {
+  background: var(--bg1); color: var(--fg1); border: 1px solid var(--bg2);
+  border-radius: 3px; font: inherit; font-size: 12px; padding: 1px 3px; outline: none;
+}
+#font { max-width: 14em; }
+#size { width: 4.5em; }
+#font:focus, #size:focus { border-color: var(--bg4); }
+#font:hover, #size:hover { border-color: var(--bg4); }
+#type .reset {
+  background: none; border: 1px solid var(--bg2); color: var(--fg4);
+  border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px; padding: 1px 6px;
+}
+#type .reset:hover { color: var(--accent); border-color: var(--accent); }
+#conn { font-size: 12px; color: var(--fg4); white-space: nowrap; }
 #conn.on { color: var(--green); } #conn.off { color: var(--f0); }
 #main { flex: 1 1 auto; display: flex; min-height: 0; }
 #centre { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -77,13 +120,26 @@ body {
 #panels { flex: 1 1 auto; position: relative; min-height: 0; }
 .panel { position: absolute; inset: 0; display: none; flex-direction: column; min-height: 0; }
 .panel.active { display: flex; }
+/* The console, the file views and the prompt box take their size — and, for
+   the two the human reads as prose, their face — from the two properties the
+   top bar's pickers write on :root. That is the whole mechanism: applyType()
+   sets two properties and every text area follows, including a file tab opened
+   later, with no per-element bookkeeping. */
 #console-out, .file-out {
   flex: 1 1 auto; overflow: auto; margin: 0; padding: 10px 12px;
   background: var(--bg0h); white-space: pre-wrap; overflow-wrap: break-word;
-  font-size: 13px;
+  font-size: var(--ui-size); line-height: 1.5;
   tab-size: 4; scrollbar-width: thin; scrollbar-color: var(--bg3) var(--bg0h);
 }
-.file-out { white-space: pre; }
+#console-out { font-family: var(--ui-font); }
+/* A file tab shows source, and source is read by its columns: indentation that
+   lines up, aligned `=` signs, side-by-side diffs. The faces the picker offers
+   are proportional, so a file view keeps a monospaced face and takes only the
+   size — the console keeps the chosen face because its text is prose. */
+.file-out {
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
 .file-head {
   flex: 0 0 auto; padding: 4px 12px; background: var(--bg0);
   border-bottom: 1px solid var(--bg2); color: var(--fg4); font-size: 12px;
@@ -103,7 +159,7 @@ body {
   width: 100%; min-height: 3em; height: 5.5em; max-height: 70vh; resize: vertical;
   background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
   border-radius: 4px; padding: 6px 8px; outline: none;
-  font-family: inherit; font-size: 18px; line-height: 1.4;
+  font-family: var(--ui-font); font-size: var(--ui-size); line-height: 1.5;
   scrollbar-width: thin; scrollbar-color: var(--bg3) var(--bg1);
 }
 #prompt:focus { border-color: var(--bg4); }
@@ -126,6 +182,9 @@ body {
 .c35 { color: var(--purple); } .c95 { color: var(--f4); }
 .c36 { color: var(--aqua); }   .c96 { color: var(--f6); }
 .c37 { color: var(--fg4); }    .c97 { color: var(--fg); }
+/* the "there is more above" line a trimmed console leaves behind — its own
+   element so trimming never has to rewrite the spans around it */
+.trim { color: var(--f12); font-style: italic; }
 
 /* --- the file tree --- */
 #side {
@@ -178,6 +237,13 @@ body {
 <div id="top">
   <b>jonnyq</b>
   <span id="status">connecting&hellip;</span>
+  <span id="type">
+    <label for="font">font</label>
+    <select id="font" title="typeface of the console and the prompt box (a file view stays monospaced so its columns line up)"></select>
+    <label for="size">size</label>
+    <input id="size" type="number" min="8" max="40" step="1" title="text size in pt, for the console, the file views and the prompt box" aria-label="text size in pt">
+    <button class="reset" id="type-reset" title="back to IBM Plex Sans Thai Looped at 14pt">reset</button>
+  </span>
   <span id="conn">offline</span>
 </div>
 <div id="main">
@@ -205,9 +271,113 @@ let active = null;             /* tab id                                        
 let ready = false;             /* the session will accept a prompt              */
 let autoScroll = true;         /* follow the transcript unless scrolled up      */
 let consoleTab = null;
+let treeRefresh = null;        /* the listing in flight, so two are never asked for */
+
+/* ------------------------------------------------------------ typography
+   Nine Thai faces from Google Fonts, in the order the user asked for them,
+   with IBM Plex Sans Thai Looped as the default. The value is the CSS family
+   name: if the stylesheet above never arrived (no internet) the name still
+   resolves to a locally installed copy of the same face, and otherwise to the
+   generic sans-serif the body falls back to — choosing a font is never a
+   network operation.
+
+   Both settings live in localStorage, so a reload or a second tab keeps what
+   was picked, and they are written to two custom properties on :root rather
+   than to each element: one write moves the console, the prompt box, every
+   file tab and the chrome, including tabs opened later. A file view takes the
+   size only — it names a monospaced face for itself so source keeps its
+   columns. */
+const FONTS = [
+  "IBM Plex Sans Thai Looped",
+  "Playpen Sans Thai",
+  "K2D",
+  "Kodchasan",
+  "Noto Serif Thai",
+  "Noto Sans Thai Looped",
+  "Athiti",
+  "Thasadith",
+  "Trirong",
+];
+const DEFAULT_FONT = "IBM Plex Sans Thai Looped";
+const DEFAULT_SIZE = 14;                  /* pt */
+const SIZE_MIN = 8, SIZE_MAX = 40;
+const LS = "jonnyq.type";                /* the one localStorage key */
+
+function clampSize(v) {
+  const n = Math.round(parseFloat(v));
+  if (!Number.isFinite(n)) return DEFAULT_SIZE;
+  return Math.min(SIZE_MAX, Math.max(SIZE_MIN, n));
+}
+
+function storedType() {
+  try {
+    const raw = localStorage.getItem(LS);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    const font = FONTS.includes(v && v.font) ? v.font : DEFAULT_FONT;
+    return { font, size: clampSize(v && v.size) };
+  } catch { return null; }    /* private mode, or a hand-edited value */
+}
+
+function storeType(t) {
+  try { localStorage.setItem(LS, JSON.stringify(t)); } catch {}
+}
+
+let typeface = storedType() || { font: DEFAULT_FONT, size: DEFAULT_SIZE };
+
+function applyType() {
+  const r = document.documentElement.style;
+  /* Quote the family name: "Noto Serif Thai" is three words, and an unquoted
+     multi-word family in a custom property does not match. */
+  r.setProperty("--ui-font", '"' + typeface.font.replace(/"/g, "") + '", ui-sans-serif, system-ui, sans-serif');
+  r.setProperty("--ui-size", typeface.size + "pt");
+}
+
+function syncTypeControls() {
+  $("font").value = typeface.font;
+  $("size").value = typeface.size;
+}
+
+function buildTypeControls() {
+  const sel = $("font");
+  for (const f of FONTS) {
+    const o = document.createElement("option");
+    o.value = f;
+    o.textContent = f;
+    /* Preview the face in its own option, so the list is a menu of what the
+       console will look like rather than a list of names to guess at. */
+    o.style.fontFamily = '"' + f + '", sans-serif';
+    sel.appendChild(o);
+  }
+  sel.addEventListener("change", () => {
+    typeface = { font: FONTS.includes(sel.value) ? sel.value : DEFAULT_FONT, size: typeface.size };
+    applyType(); syncTypeControls(); storeType(typeface);
+  });
+  const box = $("size");
+  const commit = () => {
+    /* The number input is trusted only after clamping, and the field is then
+       rewritten to what was actually applied, so "3" cannot sit in a box that
+       is drawing 8pt. */
+    typeface = { font: typeface.font, size: clampSize(box.value) };
+    applyType(); syncTypeControls(); storeType(typeface);
+  };
+  box.addEventListener("change", commit);
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } });
+  $("type-reset").addEventListener("click", () => {
+    typeface = { font: DEFAULT_FONT, size: DEFAULT_SIZE };
+    applyType(); syncTypeControls(); storeType(typeface);
+  });
+  applyType();
+  syncTypeControls();
+}
 
 /* ------------------------------------------------------------------ utils */
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+/* A rejection here is usually a plain string ("jonnyq is not connected yet"),
+   sometimes an Error from a refused path; the popup must read like a sentence
+   either way, not like "Error: ..." or "[object Object]". */
+const why = (e) => (e && e.message ? e.message : String(e));
 
 function popup(title, body) {
   $("popup-title").textContent = title;
@@ -228,25 +398,36 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("mask").
    Everything is escaped before it is wrapped, so output the model printed can
    never inject markup into this page. */
 const SGR = /\x1b\[([0-9;]*)m/g;
-function ansiToHtml(text) {
-  let out = "", at = 0, open = [];
-  SGR.lastIndex = 0;
-  let m;
-  while ((m = SGR.exec(text)) !== null) {
-    out += span(open, text.slice(at, m.index));
-    at = SGR.lastIndex;
-    const codes = (m[1] === "" ? ["0"] : m[1].split(";")).map((c) => (c === "" ? 0 : +c));
-    for (const c of codes) {
-      if (c === 0) open = [];
-      else if (c === 1) { if (!open.includes("c1")) open.push("c1"); }
-      else if (c === 22) open = open.filter((k) => k !== "c1");
-      else if ((c >= 30 && c <= 37) || (c >= 90 && c <= 97)) {
-        open = open.filter((k) => !/^c(9?[0-9]m?|3[0-7])$/.test(k) || k === "c1");
-        open.push("c" + c);
-      } else if (c === 39) open = open.filter((k) => !/^c[39]/.test(k) || k === "c1");
-    }
+
+/* The attributes a terminal would still be holding when the next byte arrives.
+   Output is mirrored in chunks, so a chunk routinely ends with a colour still
+   switched on (streamed answer text does this on every token); rendering each
+   chunk as if it started in default colour is what makes text go grey
+   mid-sentence. The state therefore lives outside the function, and is cleared
+   only by a reset sequence or by the server's `reset`. */
+let sgrOpen = [];
+
+function applySgr(codes) {
+  for (const c of codes) {
+    if (c === 0) sgrOpen = [];
+    else if (c === 1) { if (!sgrOpen.includes("c1")) sgrOpen.push("c1"); }
+    else if (c === 22) sgrOpen = sgrOpen.filter((k) => k !== "c1");
+    else if ((c >= 30 && c <= 37) || (c >= 90 && c <= 97)) {
+      sgrOpen = sgrOpen.filter((k) => !/^c(9?[0-9]m?|3[0-7])$/.test(k) || k === "c1");
+      sgrOpen.push("c" + c);
+    } else if (c === 39) sgrOpen = sgrOpen.filter((k) => !/^c[39]/.test(k) || k === "c1");
   }
-  out += span(open, text.slice(at));
+}
+
+function ansiToHtml(text) {
+  let out = "", at = 0, m;
+  SGR.lastIndex = 0;
+  while ((m = SGR.exec(text)) !== null) {
+    out += span(sgrOpen, text.slice(at, m.index));
+    at = SGR.lastIndex;
+    applySgr((m[1] === "" ? ["0"] : m[1].split(";")).map((c) => (c === "" ? 0 : +c)));
+  }
+  out += span(sgrOpen, text.slice(at));
   return out;
 }
 function span(classes, text) {
@@ -276,6 +457,9 @@ function makeTab(name, kind, path) {
       '<textarea id="prompt" spellcheck="false" wrap="soft"></textarea>' +
       '<button id="send">Send (Enter)</button></div>';
   } else {
+    /* A file view keeps its own monospaced face (source is read by its
+       columns) and takes only the chosen size — the CSS on .file-out says so,
+       so nothing here has to know about the picker. */
     panel.innerHTML = '<div class="file-head"></div><pre class="file-out"></pre>';
   }
   $("tabs").appendChild(tab);
@@ -326,13 +510,41 @@ function appendConsole(text) {
   out.insertAdjacentHTML("beforeend", ansiToHtml(text));
   /* Truncate from the front once the transcript gets silly: the same
      conversation is in the log file and, for a session that has been running
-     for a day, keeping all of it in the DOM would eat the tab. */
-  if (out.childElementCount > 6000 || out.textContent.length > 1_500_000) {
-    const keep = Math.max(0, out.childElementCount - 4000);
-    for (let i = 0; i < keep; i++) out.removeChild(out.firstChild);
-    out.textContent = "[... earlier output trimmed; it is still in the transcript log ...]\n" + out.textContent;
-  }
+     for a day, keeping all of it in the DOM would eat the tab.
+     Which is also why this removes nodes rather than rebuilding: assigning the
+     whole transcript back as text would replace every colour span with one
+     plain text node and turn the console grey in a single statement — and a
+     reload of a long session is exactly when the limit is crossed, so that
+     shortcut was a second way to lose the theme. */
+  consoleChars += text.length;
+  if (out.childElementCount > TRIM_AT || consoleChars > TRIM_CHARS) trimConsole(out);
   if (autoScroll) scrollToBottom();
+}
+
+const TRIM_AT = 6000, TRIM_KEEP = 4000, TRIM_CHARS = 1_500_000;
+let trimMark = null;
+/* Running total of what has been appended, so the size test above stays O(1).
+   Reading `out.textContent.length` on every chunk is a walk of the whole
+   transcript, and streamed output calls this once per token. Re-measured on the
+   rare occasion a trim happens, and zeroed when the console is emptied. */
+let consoleChars = 0;
+
+function trimConsole(out) {
+  /* The mark is kept: it is the console's way of saying the conversation above
+     this line exists and lives in the log file. Trimming it away on the second
+     pass would leave a transcript that looks like it starts from nothing. */
+  while (out.childElementCount > TRIM_KEEP) {
+    const victim = out.firstChild === trimMark ? out.firstChild.nextSibling : out.firstChild;
+    if (!victim) break;
+    out.removeChild(victim);
+  }
+  if (!trimMark) {
+    trimMark = document.createElement("div");
+    trimMark.className = "trim";
+    trimMark.textContent = "[... earlier output trimmed; it is still in the transcript log ...]";
+  }
+  if (out.firstChild !== trimMark) out.insertBefore(trimMark, out.firstChild);
+  consoleChars = out.textContent.length;
 }
 
 function wireConsole(panel) {
@@ -366,8 +578,21 @@ function sendPrompt() {
   const text = ta.value;
   if (!text.trim()) return;
   if (!ready) { popup("jonnyq is busy", "The session is not waiting for a prompt right now - wait for the turn in progress to finish (or press Ctrl-C in the terminal to cancel it)."); return; }
-  send({ type: "prompt", text });
+  /* The box clears straight away so a second Enter cannot send the same text
+     twice, and the answer comes back as an ack (`ok`, or why it was refused).
+     A prompt that never reached the socket - the link dropped in the moment
+     between - is put back rather than lost, but only if the box is still empty,
+     so nothing the human typed since is ever overwritten. */
+  const draft = text;
   ta.value = "";
+  rpc({ type: "prompt", text: draft }).then((m) => {
+    if (m.ok) return;
+    popup("The prompt was not queued", m.error || "jonnyq did not accept it");
+    if (!ta.value.trim()) ta.value = draft;
+  }, (e) => {
+    popup("The prompt was not queued", why(e));
+    if (!ta.value.trim()) ta.value = draft;
+  });
 }
 
 function setReady(state, note) {
@@ -446,7 +671,7 @@ function renderTree(node, parent) {
       if (loaded) return;
       loaded = true;
       requestTree(item.path).then((n) => { kids.textContent = ""; kids.appendChild(nodeEl(n)); })
-        .catch((e) => { kids.style.display = "none"; tw.textContent = "\u25B8"; loaded = false; popup("Cannot list " + item.path, String(e)); });
+        .catch((e) => { kids.style.display = "none"; tw.textContent = "\u25B8"; loaded = false; popup("Cannot list " + item.path, why(e)); });
     });
   }
   if (!node.entries || !node.entries.length) {
@@ -461,18 +686,27 @@ function renderTree(node, parent) {
 const nodeEl = (n) => renderTree(n, null);
 
 async function refreshTree() {
-  try {
-    const root = await requestTree("");
-    const tree = $("tree");
-    tree.textContent = "";
-    const box = renderTree(root, null);
-    box.classList.remove("kids");
-    box.style.marginLeft = "0";
-    tree.appendChild(box);
-    treeSelection();
-  } catch (e) {
-    popup("Cannot list the working directory", String(e));
-  }
+  /* One refresh at a time: boot, the greeting's `reset` and the refresh button
+     all ask for the same thing, and two parallel listings of the same folder
+     only make the second answer's renderer win at random. */
+  if (treeRefresh) return treeRefresh;
+  treeRefresh = (async () => {
+    try {
+      const root = await requestTree("");
+      const tree = $("tree");
+      tree.textContent = "";
+      const box = renderTree(root, null);
+      box.classList.remove("kids");
+      box.style.marginLeft = "0";
+      tree.appendChild(box);
+      treeSelection();
+    } catch (e) {
+      popup("Cannot list the working directory", why(e));
+    } finally {
+      treeRefresh = null;
+    }
+  })();
+  return treeRefresh;
 }
 $("refresh").addEventListener("click", refreshTree);
 
@@ -482,7 +716,7 @@ $("refresh").addEventListener("click", refreshTree);
 async function openFile(path, name) {
   let res;
   try { res = await rpc({ type: "file", path }); }
-  catch (e) { popup("Cannot open file", String(e)); return; }
+  catch (e) { popup("Cannot open file", why(e)); return; }
   if (!res.ok) { popup("This file cannot be viewed", (res.error || "not a text file") + "\n\n" + path); return; }
   let t = tabs.find((x) => x.kind === "file" && x.path === path);
   if (t) { select(t.id); return; }
@@ -495,15 +729,44 @@ async function openFile(path, name) {
 }
 
 /* ------------------------------------------------------------- websocket */
-function send(obj) { ws && ws.readyState === 1 && ws.send(JSON.stringify(obj)); }
+const OPEN = () => !!ws && ws.readyState === 1;
+
+/* Wait until the socket is usable. Opening a WebSocket is asynchronous - the
+   handshake (TCP, HTTP/1.1 upgrade, TLS when behind a proxy) has not finished
+   when boot code runs - so anything that sends has to wait for `onopen`
+   instead of giving up because the socket is still CONNECTING. Resolves false
+   if it does not open within the deadline, so callers can say something
+   better than hanging. */
+function whenOpen(deadline) {
+  return new Promise((resolve) => {
+    if (OPEN()) { resolve(true); return; }
+    const until = Date.now() + (deadline || 15000);
+    /* Poll rather than bind to one socket's `open`: a failing socket is
+       replaced by the reconnect loop, so listeners on the socket that existed
+       when we got here would fire for a connection this page has already
+       thrown away. The loop's own `onopen` gives the fast path. */
+    const tick = () => {
+      if (OPEN()) { resolve(true); return; }
+      if (Date.now() >= until) { resolve(false); return; }
+      setTimeout(tick, 60);
+    };
+    tick();
+  });
+}
+
 function rpc(obj) {
   return new Promise((resolve, reject) => {
     const id = "r" + (++seq);
     const timer = setTimeout(() => { pending.delete(id); reject("timed out"); }, 20000);
     pending.set(id, { resolve, reject, timer });
     obj.id = id;
-    if (!ws || ws.readyState !== 1) { clearTimeout(timer); pending.delete(id); reject("not connected"); return; }
-    ws.send(JSON.stringify(obj));
+    const giveUp = (reason) => { clearTimeout(timer); pending.delete(id); reject(reason); };
+    if (OPEN()) { ws.send(JSON.stringify(obj)); return; }
+    whenOpen().then((up) => {
+      if (!up) { giveUp("jonnyq is not connected yet"); return; }
+      if (!OPEN()) { giveUp("the connection to jonnyq closed"); return; }
+      ws.send(JSON.stringify(obj));
+    });
   });
 }
 /* A folder's entries. `rpc` resolves the whole reply, so the node has to be
@@ -534,8 +797,16 @@ function onMessage(ev) {
       break;
     case "notice": popup(m.title || "jonnyq", m.body || ""); break;
     case "reset":
-      /* the server asked for a reload: the transcript it holds is gone */
-      if (consoleTab) consoleTab.el.querySelector("#console-out").textContent = "";
+      /* the server asked for a reload: the transcript it holds is gone — and so
+         is the colour state that went with it, or the first line after the
+         reload would be drawn in the colour the last chunk before it left on */
+      if (consoleTab) {
+        const o = consoleTab.el.querySelector("#console-out");
+        o.textContent = "";
+        trimMark = null;
+        consoleChars = 0;
+      }
+      sgrOpen = [];
       refreshTree();
       break;
   }
@@ -556,6 +827,7 @@ function connect() {
 }
 
 /* ---------------------------------------------------------------- boot */
+buildTypeControls();
 consoleTab = makeTab("console", "console", null);
 select(consoleTab.id);
 setReady(false, "connecting");
@@ -606,6 +878,264 @@ mod tests {
         }
     }
 
+    /// The nine faces the human asked for, in the order asked for, with IBM
+    /// Plex Sans Thai Looped as the default — and the stylesheet that offers
+    /// them. The list lives in the page rather than in the server, so the
+    /// choice is one write to a CSS property and never a request.
+    #[test]
+    fn the_nine_thai_faces_are_offered_with_the_named_default() {
+        let want = [
+            "Playpen Sans Thai",
+            "K2D",
+            "Kodchasan",
+            "Noto Serif Thai",
+            "Noto Sans Thai Looped",
+            "IBM Plex Sans Thai Looped",
+            "Athiti",
+            "Thasadith",
+            "Trirong",
+        ];
+        for f in want {
+            assert!(
+                INDEX_HTML.contains(&format!("\"{f}\"")),
+                "missing {f} in the list"
+            );
+            assert!(
+                INDEX_HTML.contains(&f.replace(' ', "+")),
+                "{f} is not requested from Google Fonts"
+            );
+        }
+        assert!(INDEX_HTML.contains("const DEFAULT_FONT = \"IBM Plex Sans Thai Looped\""));
+        // And the CSS default matches, so the page looks right before any
+        // stored choice is applied.
+        assert!(
+            INDEX_HTML.contains("--ui-font: \"IBM Plex Sans Thai Looped\""),
+            "the CSS default face must match DEFAULT_FONT"
+        );
+    }
+
+    /// Text size defaults to 14pt and is applied as a point size (not pixels)
+    /// to the console, the file views and the prompt box, from a number field
+    /// that refuses nonsense.
+    #[test]
+    fn the_text_size_defaults_to_14pt_and_is_clamped() {
+        assert!(INDEX_HTML.contains("const DEFAULT_SIZE = 14"));
+        assert!(INDEX_HTML.contains("--ui-size: 14pt"));
+        assert!(INDEX_HTML.contains("var(--ui-size)"));
+        assert!(INDEX_HTML.contains("\"pt\""));
+        assert!(
+            INDEX_HTML.contains("<input id=\"size\" type=\"number\" min=\"8\" max=\"40\""),
+            "the size field needs a bounded range"
+        );
+        // Out-of-range and non-numeric input must be clamped, not obeyed.
+        let clamp = INDEX_HTML
+            .split("function clampSize(v)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("clampSize");
+        assert!(clamp.contains("Math.min") && clamp.contains("Math.max"));
+        assert!(clamp.contains("Number.isFinite"));
+        assert!(INDEX_HTML.contains("SIZE_MIN = 8"));
+        assert!(INDEX_HTML.contains("SIZE_MAX = 40"));
+    }
+
+    /// Loading a webfont must never hold up the console. The stylesheet is
+    /// requested under `media="print"` and promoted to `all` once it arrives,
+    /// which is how a browser is told not to block first paint on it — the
+    /// difference between an offline session that opens instantly and one that
+    /// sits there until the request times out.
+    #[test]
+    fn the_font_stylesheet_cannot_block_the_page() {
+        let link = INDEX_HTML
+            .split("<link rel=\"stylesheet\"")
+            .nth(1)
+            .and_then(|s| s.split(">").next())
+            .expect("the fonts stylesheet link");
+        assert!(
+            link.contains("media=\"print\""),
+            "must not block paint: {link}"
+        );
+        assert!(
+            link.contains("onload=\"this.media='all'\""),
+            "must apply once loaded: {link}"
+        );
+        assert!(
+            link.contains("display=swap"),
+            "text must render before the faces land: {link}"
+        );
+    }
+
+    /// The colour the terminal showed has to survive a reload, and most of that
+    /// work is in the page: it renders the SGR codes itself. Two ways this used
+    /// to go grey, both pinned here.
+    ///
+    /// First, the escape state was local to one call, so a chunk that ends with
+    /// the colour still switched on — which streamed answer text does on every
+    /// token — left the next chunk, which contains no escape at all, to be drawn
+    /// in default colour. The state now lives outside the function.
+    #[test]
+    fn the_ansi_state_carries_across_chunks() {
+        let fn_body = INDEX_HTML
+            .split("function ansiToHtml(text)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("ansiToHtml");
+        assert!(
+            fn_body.contains("sgrOpen"),
+            "the renderer must read the attributes left over from the last chunk"
+        );
+        assert!(
+            !fn_body.contains("let out = \"\", at = 0, open = []"),
+            "a per-call `open` array is what reset the colour between chunks"
+        );
+        // Declared once, at page scope, and cleared only by a reset or by the
+        // server's `reset` — not by the arrival of the next chunk.
+        assert!(INDEX_HTML.contains("let sgrOpen = [];"));
+        assert!(
+            INDEX_HTML.contains("sgrOpen = [];"),
+            "something must clear it on `reset`, or a reload would inherit the \
+             colour of whatever the previous session last printed"
+        );
+    }
+
+    /// Second way the console went grey: the front-trim, which crosses over on
+    /// exactly the reload of a long session, rebuilt the transcript by assigning
+    /// `textContent` — and one assignment replaces every colour span with a
+    /// single plain text node. Trimming removes nodes now, and the "there is
+    /// more above" line is its own element rather than a prefix glued on.
+    #[test]
+    fn trimming_the_transcript_cannot_erase_the_colours() {
+        let body = INDEX_HTML
+            .split("function appendConsole(text)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("appendConsole");
+        assert!(
+            !body.contains("out.textContent ="),
+            "assigning textContent replaces every colour span with one text node"
+        );
+        assert!(body.contains("trimConsole("), "and must delegate the trim");
+        let trim = INDEX_HTML
+            .split("function trimConsole(out)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("trimConsole");
+        assert!(
+            trim.contains("removeChild"),
+            "the trim has to drop nodes, not rewrite them: {trim}"
+        );
+        assert!(
+            !trim.contains("out.textContent ="),
+            "not even to prepend the marker: {trim}"
+        );
+    }
+
+    /// Reading the transcript's size on every streamed chunk is a walk of the
+    /// whole console, and streamed output calls `appendConsole` once per token.
+    /// The limit is now decided from a running total.
+    #[test]
+    fn the_console_does_not_measure_itself_on_every_chunk() {
+        let body = INDEX_HTML
+            .split("function appendConsole(text)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("appendConsole");
+        assert!(
+            !body.contains("out.textContent.length >"),
+            "the size test must not walk the DOM per token"
+        );
+        assert!(body.contains("consoleChars += text.length"));
+    }
+
+    /// The console, the prompt box and the chrome take the chosen face; a file
+    /// view keeps a monospaced face and takes only the size, because source is
+    /// read by its columns. All of them take the chosen size.
+    #[test]
+    fn a_file_view_keeps_its_columns() {
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        // Split on the rule that *starts* a line: "#console-out, .file-out {"
+        // also ends with those characters, and matching it would check the
+        // shared rule instead of the file view's own.
+        let file = css
+            .split("\n.file-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .file-out rule");
+        assert!(
+            file.contains("monospace"),
+            "a file view must stay monospaced: {file}"
+        );
+        assert!(
+            !file.contains("--ui-font"),
+            "a file view must not take the prose face: {file}"
+        );
+        // Both still take the size, and the console takes the face too.
+        assert!(css.contains("#console-out, .file-out"));
+        assert!(css.contains("font-size: var(--ui-size)"));
+        assert!(
+            css.contains("#console-out { font-family: var(--ui-font); }"),
+            "the console is the thing the picker was asked for"
+        );
+    }
+
+    /// A chosen face that never downloaded is not an error: the CSS family name
+    /// simply resolves to a locally installed copy or to the generic fallback,
+    /// so the page must never depend on the stylesheet having arrived.
+    #[test]
+    fn the_font_choice_survives_no_internet() {
+        let apply = INDEX_HTML
+            .split("function applyType()")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("applyType");
+        assert!(
+            apply.contains("setProperty(\"--ui-font\""),
+            "the face is applied through the fallback-carrying property: {apply}"
+        );
+        assert!(
+            apply.contains("sans-serif"),
+            "the stack must end in a generic family: {apply}"
+        );
+        // Multi-word family names need quoting or they do not match.
+        assert!(
+            apply.contains("'\"' + typeface.font"),
+            "family name must be quoted: {apply}"
+        );
+        // Nothing is fetched at choice time: the stylesheet is referenced once,
+        // from the head, and no script reaches for the network.
+        assert_eq!(
+            INDEX_HTML.matches("fonts.googleapis.com").count(),
+            1,
+            "the fonts stylesheet must appear only in the head"
+        );
+        assert!(
+            !INDEX_HTML.contains("fetch("),
+            "the page must not fetch anything"
+        );
+    }
+
+    /// Both settings are remembered per browser, so a reload or a second tab
+    /// opens with the same face and size.
+    #[test]
+    fn the_type_choice_is_remembered() {
+        assert!(INDEX_HTML.contains("localStorage.getItem("));
+        assert!(INDEX_HTML.contains("localStorage.setItem("));
+        assert!(INDEX_HTML.contains("const LS = \"jonnyq.type\""));
+        // A hand-edited or private-mode value must not break the page.
+        let stored = INDEX_HTML
+            .split("function storedType()")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("storedType");
+        assert!(stored.contains("try") && stored.contains("catch"));
+        // And an unknown stored family falls back rather than poisoning the stack.
+        assert!(stored.contains("FONTS.includes"));
+    }
+
     /// The tree reply is the whole message (`{type, ok, path, node}`), so the
     /// page has to reach into it: passing the envelope to `renderTree` renders
     /// an empty tree without any error, which is exactly the bug this pins.
@@ -628,6 +1158,69 @@ mod tests {
         assert!(
             tree.contains("m.ok"),
             "a refused path must throw, not look empty: {tree}"
+        );
+    }
+
+    /// The page's first tree request happens at boot, before the WebSocket
+    /// handshake has finished - `readyState` is still CONNECTING. An `rpc` that
+    /// refuses instead of waiting for `open` produced
+    /// "Cannot list the working directory / not connected" on every first load
+    /// of a perfectly healthy session, which is what this pins.
+    #[test]
+    fn a_request_waits_for_the_socket_to_open() {
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let rpc = script
+            .split("function rpc(obj)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("rpc");
+        assert!(
+            rpc.contains("whenOpen"),
+            "rpc must wait for the handshake instead of rejecting: {rpc}"
+        );
+        let wait = script
+            .split("function whenOpen")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("whenOpen");
+        assert!(
+            wait.contains("readyState") || wait.contains("OPEN()"),
+            "whenOpen must look at the socket state: {wait}"
+        );
+        assert!(
+            !rpc.contains("reject(\"not connected\")"),
+            "a page that has not finished connecting is not an error: {rpc}"
+        );
+        /* The waiter has to give up eventually, or a page opened against a
+        dead port would spin forever instead of saying so. */
+        assert!(
+            wait.contains("until") && wait.contains("setTimeout"),
+            "whenOpen needs a deadline: {wait}"
+        );
+    }
+
+    /// Two listings of the same folder racing each other (boot plus the
+    /// greeting's `reset`) would both render, so the second clears what the
+    /// first drew. A refresh in flight must be reused, not duplicated.
+    #[test]
+    fn the_tree_is_listed_once_at_a_time() {
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let refresh = script
+            .split("async function refreshTree")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("refreshTree");
+        assert!(
+            refresh.contains("treeRefresh"),
+            "refreshTree must collapse concurrent calls: {refresh}"
         );
     }
 

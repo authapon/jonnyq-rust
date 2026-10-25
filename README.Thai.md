@@ -323,18 +323,41 @@ jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.
 
 `-web <port>` แสดง session เดียวกันบนเวบไปด้วยพร้อมกับ terminal — ทำงานได้ทั้งสอง
 หน้าต่างพร้อมกัน และไม่มีทางทำให้รันสอง turn ซ้อนกัน หน้าเวบใช้ websocket เส้นเดียว
-ไม่มี asset ภายนอก จึงทำงาน offline กับ model ในเครื่องได้
+ไม่มี script หรือ bundler ของตัวเอง จึงทำงานกับ model ในเครื่องแบบ offline ได้
+สิ่งเดียวที่เรียกจากภายนอกคือ stylesheet ของ Google Fonts ที่อยู่บน font picker —
+ถ้าดึงไม่เจอก็จะ render ด้วย font เดียวที่ติดตั้งไว้ในเครื่อง หรือ sans-serif ของ
+browser แทน
 
 | ส่วน | ทำงานอะไร |
 |---|---|
+| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน พร้อม font picker และช่องใส่ size ตามที่อธิบายด้านล่าง |
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ |
 | **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
 | **tree** (ขวา) | รายการ working directory (folder ก่อนไฟล์) ขยาย folder เพื่อดูรายการข้างใน คลิกไฟล์ text เพื่อเปิดในแท็บใหม่ ส่วน PDF/image/binary จะขึ้น popup บอกว่าเปิดดูไม่ได้เพราะอะไร |
 
+**font และ size** font picker บนแถบบนมี font ไทยจาก Google Fonts ให้เลือก 9 แบบ —
+IBM Plex Sans Thai Looped (ค่า default), Playpen Sans Thai, K2D, Kodchasan,
+Noto Serif Thai, Noto Sans Thai Looped, Athiti, Thasadith และ Trirong — ส่วนช่อง
+`size` ตั้งขนาดตัวอักษรเป็น pt (8–40, default **14pt**) font ที่เลือกจะถูกใช้กับ
+console, ช่องพิมพ์ prompt และแถบบน ส่วนแท็บไฟล์จะคง font mono ไว้ตามเดิมเพื่อให้
+column ของ source ตรงกัน แต่ได้รับขนาดตัวอักษรด้วย ทั้งสองค่าถูกจำไว้ต่อบราวเซอร์
+จึง reload หรือเปิดแท็บใหม่แล้วได้หน้าตาเดิม กด `reset` เพื่อกลับมาเป็น
+IBM Plex Sans Thai Looped 14pt การเลือก font ไม่ใช่ operation ที่ต้องต่อเน็ต: มันคือ
+ชื่อ CSS family หนึ่งชื่อ ซึ่งจะ resolve เป็น font ที่ดาวน์โหลดมา, font เดียวที่ติดตั้ง
+ไว้ในเครื่อง, หรือ generic fallback ตามลำดับ
+
+**แถว status เป็นของสด** ตัวเลข `ctx` บนแถบบนคือ context ที่ session ใช้อยู่ตอนนี้
+ไม่ใช่ค่าที่ snapshot ตอน connect: มันถูกอ่านใหม่ทุก 2 วินาที, ตอน start และ end ของ
+ทุก turn, และทุกครั้งที่ slash command เปลี่ยน model หรือ window — และจะส่ง frame ก็ต่อ
+เมื่อข้อความเป็นค่าใหม่จริงเท่านั้น
+
 prompt ที่พิมพ์บนเวบจะถูกเข้าคิวให้ loop ของ REPL เป็นตัวอ่านเอง นี่คือเหตุผลที่
 คำตอบโผล่ทั้งสองหน้าต่าง และทำให้ prompt จากเวบ, prompt ที่พิมพ์ และ trigger ของ
 `/watchfile` ไม่รันซ้อนกัน textarea จะ freeze ระหว่าง turn และกลับมาพิมพ์ได้เมื่อจบ
+การเปิดหรือ reload แท็บจะ replay บทสนทนาที่ผ่านมา **พร้อมสีครบ** เพราะ replay อ่านจาก
+สิ่งที่ถูกส่งให้ terminal ไม่ใช่จากไฟล์ log ที่ถูก strip ANSI แล้ว จึงเห็นบทสนทนาเดิม
+ในสีเดียวกับที่ terminal แสดง
 
 `jonnyq -web 8080 < /dev/null` (หรือ session ที่ stdin ถูกปิดด้วย Ctrl-D) จะรันต่อ
 แบบมีแต่เวบแทนที่จะ exit ด้วย EOF — prompt ที่ส่งมาจะถูก echo กลับเข้า console และ
@@ -344,7 +367,8 @@ listener ผูกกับ `127.0.0.1` และตอบเฉพาะ reques
 browser ส่งมา) เป็น loopback จึงเป็น interface ในเครื่องเท่านั้น `GET /health` ตอบ
 สถานะ session เป็น JSON ส่วนนี้**ไม่ใช่** wall กันผู้ที่รันเป็น user เดียวกัน: แท็บ
 เวบใดๆ ก็อ่านไฟล์ใน working directory ได้ และการเปลี่ยน model / provider / proxy /
-ntfy topic ยังต้องพิมพ์ที่ keyboard เท่านั้น (หน้าเวบไม่มีปุ่มเหล่านี้)
+ntfy topic ยังต้องพิมพ์ที่ keyboard เท่านั้น (ปุ่มบนหน้าเวบมีไว้เลือก font กับขนาด
+ตัวอักษรเท่านั้น)
 
 ## การแจ้งเตือน (ntfy)
 

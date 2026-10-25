@@ -324,22 +324,44 @@ jonnyq -model qwen3:14b -web 8080     # then open http://127.0.0.1:8080
 
 `-web <port>` serves the same session in the browser, next to the terminal — both
 are live at the same time, and neither can make the other run two turns at once.
-The page has one websocket and no external assets, so it works offline against a
-local model.
+The page has one websocket and no scripts or bundler of its own, so it works
+against a local model on a machine with no internet; the only thing it reaches
+out for is the Google Fonts stylesheet behind the font picker, and a page that
+cannot fetch it simply draws the text in the same face installed locally, or in
+the browser's own sans-serif.
 
 | Part | What it does |
 |---|---|
+| **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **font** and **size** pickers described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **tree** (right) | The working directory, folders first. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
 
+**Font and size.** The top bar's `font` picker offers nine Thai faces from Google
+Fonts — IBM Plex Sans Thai Looped (the default), Playpen Sans Thai, K2D,
+Kodchasan, Noto Serif Thai, Noto Sans Thai Looped, Athiti, Thasadith and Trirong
+— and `size` sets the text size in pt (8–40, default **14pt**). The face applies to
+the console, the prompt box and the bar itself; a file view keeps a monospaced
+face so source keeps its columns, and takes the size. Both settings are remembered
+per browser, so a reload or a second tab opens the way you left it, and `reset`
+goes back to 14pt IBM Plex Sans Thai Looped. Picking a face is never a network
+operation: it is one CSS family name, which resolves to the downloaded face, to a
+locally installed copy of it, or to the generic fallback.
+
+**The status line is live.** The `ctx` figure in the bar is the session's current
+context use, not a snapshot of connect time: it is re-read on a two-second
+ticker, at the start and end of every turn, and whenever a slash command changes
+the model or the window, and a frame is only sent when the line actually changed.
+
 A prompt typed in the browser goes onto a queue that the REPL's own loop reads,
 which is why the answer appears in *both* windows, and why a browser prompt, a
 typed prompt and a `/watchfile` trigger are serialised against each other. The
 textarea freezes while a turn runs and thaws when it finishes. Opening or
-reloading a tab replays the transcript so far, so a second browser window shows
-the conversation that already happened.
+reloading a tab replays the transcript so far **in the same colours** — the replay
+comes from what the terminal was sent, not from the ANSI-stripped log file — so a
+second browser window shows the conversation that already happened, coloured the
+way the terminal showed it.
 
 `jonnyq -web 8080 < /dev/null` (or a session whose stdin was closed with Ctrl-D)
 keeps running as a browser-only session instead of exiting on EOF — the prompt
@@ -350,7 +372,7 @@ The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 and nothing else. `GET /health` reports the session as JSON. It is *not* a
 boundary against something already running as you: any browser tab can read the
 working directory. Changing the model, provider, proxy or ntfy topic stays under
-the keyboard — the page has no controls for them.
+the keyboard — the page's pickers cover typeface and text size, nothing else.
 
 ## Notifications (ntfy)
 

@@ -1,8 +1,9 @@
 //! The browser console: `-web <port>` serves jonnyq's terminal on
 //! `http://127.0.0.1:<port>`.
 //!
-//! One page, one websocket, no assets and no dependencies beyond what jonnyq
-//! already has:
+//! One page, one websocket, no build step and no dependencies beyond what
+//! jonnyq already has (the page's only network request is the optional Google
+//! Fonts stylesheet behind its font picker — see [`page`]):
 //!
 //! * **console tab** — everything [`Writer`] puts on stdout
 //!   is mirrored to the browser through [`ConsoleSink`], escape sequences
@@ -15,6 +16,10 @@
 //!   `/watchfile` trigger are serialised exactly like each other — nothing can
 //!   run two turns at once, which is the invariant the whole REPL is built on
 //!   (see [`crate::repl`]'s module docs).
+//! * **status line** — the `model | ctx … | mode` string `main` builds from the
+//!   agent ([`StatusFn`]). It tracks a moving value, so it is re-asked on a
+//!   ticker ([`STATUS_INTERVAL`]) as well as at every readiness flip and turn
+//!   boundary, and broadcast only when it has actually changed.
 //! * **file tree** — the working directory, listed lazily as folders are
 //!   expanded. Clicking a text file opens it in a new tab (any number at a
 //!   time, switchable from the tab strip); clicking a PDF/image/binary pops up
@@ -36,6 +41,7 @@
 pub mod page;
 pub mod ws;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -45,7 +51,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{AgentError, R};
-use crate::ui::{ConsoleSink, Writer};
+use crate::ui::{ConsoleSink, Writer, COLOR_RESET};
 
 /// The only address the console binds to: never reachable from another machine
 /// by accident.
@@ -62,14 +68,118 @@ pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Prompts the browser may have queued but the REPL has not picked up.
 pub const PROMPT_QUEUE_LIMIT: usize = 32;
 
-/// How much of the transcript log is replayed to a newly opened page. The tail
-/// is what matters when a tab is reopened mid-session; the rest stays in the
-/// file.
+/// How much console output is kept for a newly opened page. The tail is what
+/// matters when a tab is reopened mid-session; the rest stays in the log file.
+///
+/// This bounds the *coloured* mirror buffer ([`Replay`]), not the log: the log
+/// is ANSI-stripped on purpose and cannot give a reconnecting tab its colours.
 pub const REPLAY_TAIL: usize = 256 * 1024;
+
+/// What part of that window the log seeding (see [`log_tail`]) may take. The
+/// log is colourless, so it gets the smaller half: letting a 256 KB transcript
+/// fill the buffer would mean the first chunk of real output after startup
+/// evicts all of it, and the older half of the session would vanish from a
+/// reloaded tab precisely when there is new, coloured output to show.
+pub const SEED_TAIL: usize = REPLAY_TAIL / 2;
+
+/// How often the session line (`model | ctx … | mode`) is re-asked of the agent
+/// and pushed to the open tabs. The status line is the one part of the page
+/// that describes a moving value — context use climbs through a turn, and a
+/// `/model` or `/context` changes it outright — so it needs a pulse rather than
+/// a send-once-at-connect greeting. Two seconds is often enough that the figure
+/// reads as live and rare enough that an idle session costs nothing: a tick
+/// that computes the same string sends nothing at all.
+pub const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Builds the one-line session description the page shows (`model · ctx …`).
 /// Supplied by `main` because only it can see both the agent and the config.
 pub type StatusFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// The tail of the transcript log, for seeding the console's replay buffer (see
+/// [`WebConsole::bind`]).
+///
+/// The log is ANSI-stripped — that is what makes it a readable file — so this
+/// can only ever be the *opening* of a replay: the colour of anything printed
+/// while jonnyq is running comes from [`Replay`], which records what the
+/// terminal was actually sent. That is also why it is capped at [`SEED_TAIL`]
+/// rather than the whole window: it is the oldest and the colourless part, so it
+/// is the first thing the buffer gives up as new, coloured output arrives.
+fn log_tail(path: &str) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    let mut start = data.len().saturating_sub(SEED_TAIL);
+    // Never start mid-character: Thai in a transcript is common.
+    while start < data.len() && (data[start] & 0xc0) == 0x80 {
+        start += 1;
+    }
+    let mut s = String::from_utf8_lossy(&data[start..]).into_owned();
+    if start > 0 {
+        s.insert_str(
+            0,
+            "[... the transcript before this point is in the log file ...]\n",
+        );
+    }
+    Some(s)
+}
+
+/// What a reconnecting tab is replayed.
+///
+/// The transcript log on disk is ANSI-stripped — that is what makes it readable
+/// as a file — so replaying it would hand a returning tab grey text no matter
+/// how colourful the terminal was. The console therefore keeps its *own* tail of
+/// what it mirrored, escapes included, and that is what a reload gets back.
+///
+/// Kept as chunks rather than one growing `String`: streamed output arrives in
+/// small pieces, and repeatedly reallocating a megabyte buffer per token is the
+/// kind of "it works, then the tab is slow" bug worth avoiding at the type
+/// level. `len` is the byte total, so the trim can drop whole chunks from the
+/// front until it is back under [`REPLAY_TAIL`].
+#[derive(Default)]
+struct Replay {
+    chunks: VecDeque<String>,
+    len: usize,
+    /// True once something has been dropped from the front, so the page can be
+    /// told the conversation starts further back than what it was sent.
+    trimmed: bool,
+}
+
+impl Replay {
+    fn push(&mut self, text: &str) {
+        self.len += text.len();
+        self.chunks.push_back(text.to_string());
+        // Trim from the front. Whole chunks only: a chunk that ends mid-colour
+        // is still a chunk the browser can render, cutting inside an escape
+        // sequence would show its remainder as literal text, and a chunk is
+        // always valid UTF-8, so the cut can never split a rune — which matters
+        // because Thai in a transcript is common.
+        while self.len > REPLAY_TAIL && self.chunks.len() > 1 {
+            if let Some(first) = self.chunks.pop_front() {
+                self.len -= first.len();
+            }
+            self.trimmed = true;
+        }
+    }
+
+    /// Everything held, with the mirror's colour state reset so the first line
+    /// after the replay is not drawn in whatever colour the last chunk left on.
+    fn text(&self) -> String {
+        let mut s = String::with_capacity(self.len + 64);
+        if self.trimmed {
+            s.push_str("[... the transcript before this point is in the log file ...]\n");
+        }
+        for c in &self.chunks {
+            s.push_str(c);
+        }
+        s.push_str(COLOR_RESET);
+        s
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
 
 /// The web console of one jonnyq session.
 pub struct WebConsole {
@@ -101,6 +211,15 @@ pub struct WebConsole {
     closing: AtomicBool,
     published: AtomicBool,
     note: RwLock<String>,
+    /// The session line last handed to the browser, so the status ticker sends
+    /// on change rather than on every tick (see [`STATUS_INTERVAL`]).
+    last_status: RwLock<String>,
+    /// The coloured tail of everything mirrored to the browser, replayed to a
+    /// tab that connects later (see [`Replay`]).
+    replay: Mutex<Replay>,
+    /// How many times the session line has been recomputed — the number the
+    /// tests watch to prove the status closure is re-asked rather than cached.
+    status_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// Names what a test or a panic message needs to see, and skips what it cannot
@@ -136,6 +255,15 @@ impl WebConsole {
             AgentError::new(format!("cannot listen on {}:{}: {}", BIND_HOST, port, e))
         })?;
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(PROMPT_QUEUE_LIMIT);
+        // Seed the replay from the log so a tab opened on a session that has
+        // been running since before the browser existed — or on a jonnyq that
+        // was restarted — still opens onto the conversation rather than onto a
+        // blank console. Everything printed from here on is recorded as the
+        // terminal received it, escapes included, so it is the coloured copy.
+        let mut replay = Replay::default();
+        if let Some(tail) = log_tail(&ui.output_file()) {
+            replay.push(&tail);
+        }
         let web = Arc::new(WebConsole {
             ui: ui.clone(),
             work_dir: dir,
@@ -152,6 +280,9 @@ impl WebConsole {
             closing: AtomicBool::new(false),
             published: AtomicBool::new(false),
             note: RwLock::new(String::from("jonnyq is starting")),
+            last_status: RwLock::new(String::new()),
+            replay: Mutex::new(replay),
+            status_calls: std::sync::atomic::AtomicUsize::new(0),
         });
         ui.add_console_sink(web.clone());
         Ok(web)
@@ -243,7 +374,70 @@ impl WebConsole {
                 }
             }
         });
+        self.start_status_ticker();
         Ok(())
+    }
+
+    /// Keeps the page's status line current. Without this the `model | ctx …`
+    /// line is whatever it was when the tab connected — the agent updates its
+    /// own context figures throughout a turn, but nothing on the console side
+    /// ever asks again, so the bar shows `ctx 0/0` next to a session that has
+    /// filled a window.
+    ///
+    /// Spawned once (a second `start` returns early, so the ticker cannot
+    /// double up) and lives as long as the process, like the accept loop.
+    fn start_status_ticker(self: &Arc<Self>) {
+        let web = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STATUS_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if web.closing.load(Ordering::SeqCst) {
+                    return;
+                }
+                web.publish_status();
+            }
+        });
+    }
+
+    /// Re-asks the agent for the session line and pushes it to the open tabs,
+    /// but only when it differs from what they were last told. Cheap enough to
+    /// run on a timer precisely because the string is the comparison: no
+    /// clients, no change, no frame.
+    fn publish_status(&self) {
+        self.publish_status_value(self.clients() > 0);
+    }
+
+    /// How many times the session line has been recomputed. A test's way of
+    /// seeing that the status closure is consulted again rather than cached.
+    pub fn status_calls(&self) -> usize {
+        self.status_calls.load(Ordering::SeqCst)
+    }
+
+    /// The comparison `publish_status` needs, spelled out so a test can watch
+    /// it without a socket: `send` is false when there is nobody to address.
+    fn publish_status_value(&self, send: bool) -> String {
+        if self.closing.load(Ordering::SeqCst) {
+            // The session is over; the tabs have been told and nothing else
+            // belongs on the wire after that notice.
+            return self.last_status.read().unwrap().clone();
+        }
+        self.status_calls.fetch_add(1, Ordering::SeqCst);
+        let status = (self.status)();
+        let changed = {
+            let mut last = self.last_status.write().unwrap();
+            if *last == status {
+                false
+            } else {
+                *last = status.clone();
+                true
+            }
+        };
+        if changed && send {
+            self.send_all(&self.info_value_with(None, status.clone()).to_string());
+        }
+        status
     }
 
     // -- readiness ---------------------------------------------------------
@@ -256,12 +450,22 @@ impl WebConsole {
         *self.note.write().unwrap() = note.to_string();
         self.model_ready.store(waiting, Ordering::SeqCst);
         self.publish_ready();
+        // The loop calls this at the top of every iteration, so it is also the
+        // event that says "the model may have changed" (`/model`, a rebuilt
+        // provider): the status line names the model, and it must not lag a
+        // turn behind the prompt.
+        self.publish_status();
     }
 
     /// A turn started/finished: the textarea must freeze and thaw with it.
     pub fn set_busy(&self, busy: bool) {
         self.busy.store(busy, Ordering::SeqCst);
         self.publish_ready();
+        // A finished turn is exactly when the context figures moved, so the
+        // status line is re-asked here rather than waiting for the next tick.
+        if !busy {
+            self.publish_status();
+        }
     }
 
     /// The session is ending: no more prompts, and the browser is told. The
@@ -305,20 +509,64 @@ impl WebConsole {
     /// proxy, the topic…).
     pub fn refresh(&self) {
         self.publish_ready();
-        let info = self.info_value(None).to_string();
-        self.send_all(&info);
+        self.publish_status();
     }
 
     // -- the console mirror ------------------------------------------------
+
+    /// Registers a browser and take the transcript it is to be greeted with, in
+    /// one step.
+    ///
+    /// Both halves happen under the replay lock, which [`push_console`] holds
+    /// across "record this chunk" and "send it to the tabs". So a chunk printed
+    /// while this tab is joining is either already in the tail it is handed (and
+    /// never also sent live) or sent live (and never also in the tail) — never
+    /// both. That is what keeps a reload in the middle of a streaming turn from
+    /// drawing the same line twice.
+    fn join(&self, conn: &Arc<ws::Conn>) -> Option<String> {
+        let replay = self.replay.lock().unwrap();
+        let tail = if replay.is_empty() {
+            None
+        } else {
+            Some(replay.text())
+        };
+        self.hub.lock().unwrap().push(conn.clone());
+        tail
+    }
 
     /// One stdout chunk, one frame. JSON-encoding the chunk as-is is what keeps
     /// the mirror faithful: no re-splitting on newlines, no guessing where a
     /// chunk ends, no waiting for a line terminator that streamed text never
     /// sends.
+    ///
+    /// Recording and sending happen under the same lock on purpose: a chunk is
+    /// either part of the tail a connecting tab is greeted with or part of the
+    /// live stream it receives afterwards, never both — which is the only way a
+    /// tab opened *while* a turn streams cannot show the same line twice.
+    ///
+    /// The chunk is recorded whether or not a tab is listening: output printed
+    /// before the first browser opens is part of the conversation a later tab
+    /// is greeted with, and these are the *same* bytes the terminal got, colours
+    /// included, rather than the stripped copy the log file holds.
     fn push_console(&self, text: &str) {
-        if text.is_empty() || self.clients() == 0 {
+        if text.is_empty() {
             return;
         }
+        let mut replay = match self.replay.lock() {
+            Ok(g) => g,
+            // A poisoned buffer means an earlier push panicked mid-trim. The
+            // chunk still deserves to reach the tabs; a lost replay is cheaper
+            // than taking the session down with it.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        replay.push(text);
+        if self.clients() > 0 {
+            // Guard still held — see the comment above.
+            self.send_console(text);
+        }
+    }
+
+    fn send_console(&self, text: &str) {
         self.send_all(&json!({"type": "console", "data": text}).to_string());
     }
 
@@ -386,8 +634,8 @@ impl WebConsole {
                 .await
                 .map_err(AgentError::from)?;
             let conn = ws::Conn::new(socket, head.rest);
-            self.hub.lock().unwrap().push(conn.clone());
-            self.greet(&conn);
+            let tail = self.join(&conn);
+            self.greet(&conn, tail);
             self.pump(conn).await;
             return Ok(());
         }
@@ -427,12 +675,18 @@ impl WebConsole {
     /// What a newly connected browser gets before it asks for anything: a reset
     /// marker, the transcript so far, the session line, and whether a prompt
     /// can be typed. Without the replay a page reloaded mid-session would open
-    /// onto a blank console and have lost the conversation it was watching.
-    fn greet(&self, conn: &Arc<ws::Conn>) {
+    /// onto a blank console and have lost the conversation it was watching — and
+    /// that replay is the coloured mirror tail, so the colours survive the
+    /// reload; `tail` was taken by the caller at the moment this tab was
+    /// registered (see [`WebConsole::serve_connection`]).
+    fn greet(&self, conn: &Arc<ws::Conn>, tail: Option<String>) {
         let _ = conn.send(&json!({"type": "reset"}).to_string());
-        if let Some(tail) = self.transcript_tail() {
+        if let Some(tail) = tail {
             let _ = conn.send(&json!({"type": "console", "data": tail}).to_string());
         }
+        // Seeding the cache with what this tab is being handed keeps the ticker
+        // from immediately repeating the line it was greeted with.
+        *self.last_status.write().unwrap() = (self.status)();
         let _ = conn.send(&self.info_value(None).to_string());
         let note = self.note.read().unwrap().clone();
         let _ = conn.send(
@@ -440,27 +694,20 @@ impl WebConsole {
         );
     }
 
-    /// The tail of the transcript log. The log holds ANSI-stripped text, so a
-    /// replay is colourless — the live stream that follows it is the coloured
-    /// one, and the transcript itself is the same text either way.
-    fn transcript_tail(&self) -> Option<String> {
-        let data = std::fs::read(self.ui.output_file()).ok()?;
-        if data.is_empty() {
+    /// The coloured tail of the mirror, for a tab that connects later.
+    ///
+    /// This is deliberately *not* the log file. The log is ANSI-stripped — see
+    /// [`crate::ui::Writer`] — and a replay built from it opened every reloaded
+    /// tab onto grey text, which is the exact thing the live stream right after
+    /// it is not. The tail lives in memory instead, so a reload shows the same
+    /// colours the terminal has been showing all along.
+    #[cfg(test)]
+    fn replay_tail(&self) -> Option<String> {
+        let replay = self.replay.lock().unwrap();
+        if replay.is_empty() {
             return None;
         }
-        let mut start = data.len().saturating_sub(REPLAY_TAIL);
-        // Never start mid-character: Thai in a transcript is common.
-        while start < data.len() && (data[start] & 0xc0) == 0x80 {
-            start += 1;
-        }
-        let mut s = String::from_utf8_lossy(&data[start..]).into_owned();
-        if start > 0 {
-            s.insert_str(
-                0,
-                "[... the transcript before this point is in the log file ...]\n",
-            );
-        }
-        Some(s)
+        Some(replay.text())
     }
 
     async fn pump(&self, conn: Arc<ws::Conn>) {
@@ -522,9 +769,19 @@ impl WebConsole {
     }
 
     fn info_value(&self, id: Option<&str>) -> Value {
+        self.info_value_with(id, (self.status)())
+    }
+
+    /// The `info` message: the session line, the working directory, and the
+    /// state of the textarea. `status` is a parameter rather than always being
+    /// re-read because the status ticker has already computed it to decide
+    /// whether anything changed — re-reading it here would ask the agent twice
+    /// per tick and, worse, could send a line that differs from the one that
+    /// justified the send.
+    fn info_value_with(&self, id: Option<&str>, status: String) -> Value {
         let mut v = json!({
             "type": "info", "ok": true,
-            "status": (self.status)(),
+            "status": status,
             "work_dir": self.work_dir,
             "ready": self.ready_now(),
             "note": *self.note.read().unwrap(),
@@ -1460,6 +1717,56 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         assert!(got.contains("yellow"), "got {got:?}");
     }
 
+    /// The reported bug, on the wire: the first tab shows colours, and after
+    /// the browser was closed and reopened every colour was gone. The greeting
+    /// is where that happens — it used to read the ANSI-stripped log file, so
+    /// the text arrived but not the escapes that say which colour. So: print
+    /// coloured output while nobody is watching, then connect and read what the
+    /// tab is greeted with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reopened_tab_is_greeted_with_colour() {
+        let web = console(".");
+        web.start().unwrap();
+        // Output first, browser second — the order a reload produces.
+        web.console("\u{1b}[1m\u{1b}[93mAnswer (2026-10-25 22:00:00)\u{1b}[0m\n");
+        web.console("\u{1b}[33mสวัสดี\u{1b}[0m\n");
+        let port = web.port();
+        let greeted = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            let mut got = String::new();
+            while let Some(f) = read_server_frame(&mut s) {
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("console") {
+                    got.push_str(v["data"].as_str().unwrap());
+                }
+                if v["type"] == json!("ready") {
+                    break; // the greeting is over
+                }
+            }
+            got
+        });
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), greeted)
+            .await
+            .expect("no greeting")
+            .unwrap();
+        assert!(got.contains("สวัสดี"), "the text must be there: {got:?}");
+        assert!(
+            got.contains("\u{1b}[33m") && got.contains("\u{1b}[93m"),
+            "and so must the escapes the page turns into gruvbox colours: {got:?}"
+        );
+        // The log is no longer the replay's source, so it must not also be
+        // appended: a tab greeted with the conversation twice is as broken as
+        // one greeted with it in grey.
+        assert_eq!(
+            got.matches("สวัสดี").count(),
+            1,
+            "the greeting must come from the mirror alone: {got:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_prompt_is_refused_until_the_session_is_waiting() {
         let web = console(".");
@@ -1562,6 +1869,230 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         assert_eq!(states[1].0, json!(true), "{states:?}");
     }
 
+    /// The status bar's complaint was "ctx never updates": the session line was
+    /// only ever sent in the greeting, so a tab that connected at the start of
+    /// a session kept showing the figures it happened to arrive with, however
+    /// full the context got. What makes it live is a re-ask on a timer plus a
+    /// re-ask at the loop's own boundaries — and the re-ask must actually
+    /// re-read the status, not replay a cached string.
+    #[test]
+    fn the_status_line_is_re_read_and_re_sent_when_it_moves() {
+        let log = crate::testsupport::TestLog::new("web-status");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let ctx = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1000));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ctx_c, seen_c) = (ctx.clone(), seen.clone());
+        let web = WebConsole::bind(
+            free_port(),
+            ".",
+            ui,
+            Arc::new(move || {
+                seen_c.fetch_add(1, Ordering::SeqCst);
+                format!("test-model | ctx {}/16,384", ctx_c.load(Ordering::SeqCst))
+            }),
+        )
+        .unwrap();
+
+        // Same figures, nothing to say: the tick recomputes but sends nothing.
+        assert_eq!(
+            web.publish_status_value(false),
+            "test-model | ctx 1000/16,384"
+        );
+        assert_eq!(
+            web.publish_status_value(false),
+            "test-model | ctx 1000/16,384"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "each tick must re-read the agent"
+        );
+
+        // Moved figures: the new line is what comes back, and the broadcast
+        // happens for it (no clients here, so only the string is observable).
+        ctx.store(9_400, Ordering::SeqCst);
+        assert_eq!(
+            web.publish_status_value(false),
+            "test-model | ctx 9400/16,384"
+        );
+
+        // A turn ending re-asks too — that is when the figures move.
+        web.set_busy(true);
+        web.set_busy(false);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            4,
+            "ready flip re-asks the status"
+        );
+    }
+
+    /// The REPL reports readiness on every loop iteration, so a `/model` or a
+    /// `/context` between iterations has to reach the bar without waiting for a
+    /// timer tick.
+    #[test]
+    fn a_model_change_shows_up_in_the_status_as_soon_as_the_loop_reports() {
+        let log = crate::testsupport::TestLog::new("web-status2");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let model = Arc::new(std::sync::Mutex::new("first-model".to_string()));
+        let m = model.clone();
+        let web = WebConsole::bind(
+            free_port(),
+            ".",
+            ui,
+            Arc::new(move || format!("{} | ctx 0/16,384", m.lock().unwrap())),
+        )
+        .unwrap();
+        web.set_waiting(true, "waiting");
+        *model.lock().unwrap() = "second-model".to_string();
+        web.set_waiting(true, "waiting");
+        // And the cached line now matches, so the next tick stays quiet.
+        assert_eq!(
+            *web.last_status.read().unwrap(),
+            "second-model | ctx 0/16,384"
+        );
+    }
+
+    /// A page asks for the session line explicitly; it must be current, not the
+    /// one from connect time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_info_call_returns_the_current_status() {
+        let log = crate::testsupport::TestLog::new("web-info");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let ctx = Arc::new(std::sync::atomic::AtomicI64::new(100));
+        let c = ctx.clone();
+        let web = WebConsole::bind(
+            free_port(),
+            ".",
+            ui,
+            Arc::new(move || format!("test-model | ctx {}/16,384", c.load(Ordering::SeqCst))),
+        )
+        .unwrap();
+        web.start().unwrap();
+        let port = web.port();
+        let first = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::Write;
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            s.write_all(&client_frame(r#"{"type":"info","id":"i1"}"#))
+                .unwrap();
+            for _ in 0..8 {
+                let f = read_server_frame(&mut s).unwrap();
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["id"] == json!("i1") {
+                    return v;
+                }
+            }
+            panic!("no info reply");
+        })
+        .await
+        .unwrap();
+        assert_eq!(first["status"], json!("test-model | ctx 100/16,384"));
+        ctx.store(15_000, Ordering::SeqCst);
+        let second = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::Write;
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            s.write_all(&client_frame(r#"{"type":"info","id":"i2"}"#))
+                .unwrap();
+            for _ in 0..8 {
+                let f = read_server_frame(&mut s).unwrap();
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["id"] == json!("i2") {
+                    return v["status"].clone();
+                }
+            }
+            panic!("no info reply");
+        })
+        .await
+        .unwrap();
+        assert_eq!(second, json!("test-model | ctx 15000/16,384"));
+    }
+
+    /// The ticker is what makes the bar move while a turn streams by, with no
+    /// loop boundary in sight. It runs on the reactor, so this drives the real
+    /// task rather than calling the method.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_status_bar_follows_the_session_without_being_asked() {
+        let log = crate::testsupport::TestLog::new("web-ticker");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let ctx = Arc::new(std::sync::atomic::AtomicI64::new(10));
+        let c = ctx.clone();
+        let web = WebConsole::bind(
+            free_port(),
+            ".",
+            ui,
+            Arc::new(move || format!("test-model | ctx {}/16,384", c.load(Ordering::SeqCst))),
+        )
+        .unwrap();
+        web.start().unwrap();
+        let port = web.port();
+        let seen = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            /* Generous on purpose: the driver below pushes on wall-clock
+               sleeps and this thread only hears on its own timeout, so a
+               loaded machine (a build running alongside the suite) must not be
+               able to end the read before the frames it is waiting for land. */
+            s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            let mut got = Vec::new();
+            while let Some(f) = read_server_frame(&mut s) {
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("info") {
+                    let st = v["status"].as_str().unwrap_or("").to_string();
+                    if !got.contains(&st) {
+                        got.push(st);
+                    }
+                }
+                if got.iter().any(|g| g.contains("3000")) {
+                    break;
+                }
+            }
+            got
+        });
+        // A turn fills the window while nobody is looking at the socket.
+        for n in [500, 1000, 2000, 3000] {
+            tokio::time::sleep(STATUS_INTERVAL).await;
+            ctx.store(n, Ordering::SeqCst);
+        }
+        let got = tokio::time::timeout(std::time::Duration::from_secs(40), seen)
+            .await
+            .expect("the status line never moved")
+            .unwrap();
+        // Which figures land in the bar depends on where the ticks fall, so
+        // what is asserted is the guarantee: the tab was greeted with the
+        // opening figures, and later frames carry the later ones without the
+        // page having asked for anything.
+        assert_eq!(
+            got[0], "test-model | ctx 10/16,384",
+            "the greeting must still report the session as it is then, got {got:?}"
+        );
+        assert!(
+            got.last().unwrap().contains("3000"),
+            "the bar should have followed the session to its latest figures, got {got:?}"
+        );
+        assert!(
+            got.len() >= 3,
+            "the bar should have moved more than once, got {got:?}"
+        );
+    }
+
+    /// Ending the session stops the ticker: nothing should be pushed out after
+    /// the "jonnyq has exited" notice.
+    #[test]
+    fn a_closing_session_sends_no_more_status() {
+        let web = console(".");
+        web.publish_status();
+        web.begin_shutdown();
+        let before = web.status_calls();
+        web.publish_status();
+        assert_eq!(
+            web.status_calls(),
+            before,
+            "no re-ask once the session is closing"
+        );
+    }
+
     #[test]
     fn busy_and_closing_both_close_the_textarea() {
         let web = console(".");
@@ -1575,21 +2106,87 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         assert!(!web.ready_now(), "an exiting session takes no prompts");
     }
 
+    /// The replay a reloaded tab is greeted with must carry the colour escapes,
+    /// because the log file on disk has them stripped and a replay built from it
+    /// showed every reconnected tab in grey — the bug this guards.
     #[test]
-    fn the_transcript_replay_is_a_tail_and_never_rune_split() {
-        let log = crate::testsupport::TestLog::new("web-replay");
-        // Longer than the replay window, and multibyte throughout: the cut has
-        // to land on a rune boundary, so nothing here may end up as mojibake.
-        std::fs::write(&log.file, "กขค".repeat(REPLAY_TAIL / 3 + 64)).unwrap();
+    fn the_replay_keeps_the_colour_the_terminal_showed() {
+        let web = console(".");
+        web.console("\u{1b}[1m\u{1b}[33mAnswer (2026-...\u{1b}[0m\n");
+        web.console("\u{1b}[33mคำตอบ\u{1b}[0m");
+        let tail = web.replay_tail().expect("a replay after output");
+        assert!(
+            tail.contains("\u{1b}[33m"),
+            "the replay must still carry the SGR codes the page renders as colour"
+        );
+        assert!(tail.contains("\u{1b}[1m"));
+        assert!(tail.contains("คำตอบ"), "and the text itself");
+        // ...and it ends on a reset, so the live line that follows the replay
+        // cannot inherit the colour of the chunk that happened to end it.
+        assert!(
+            tail.ends_with(COLOR_RESET),
+            "the replay must close the colour it left open"
+        );
+    }
+
+    /// Output printed *before* any browser connects is part of the conversation
+    /// the first tab is greeted with — otherwise opening the page after a turn
+    /// has already run would show an empty console.
+    #[test]
+    fn output_printed_before_a_tab_opens_is_still_replayed() {
+        let web = console(".");
+        assert_eq!(web.clients(), 0);
+        web.console("hello from before the browser\n");
+        let tail = web.replay_tail().expect("the greeting must not be empty");
+        assert!(tail.contains("hello from before the browser"));
+    }
+
+    /// A tab opened on a session that was already running — or on a jonnyq
+    /// restarted against an existing log — must not open onto a blank console.
+    /// The log is the only thing that knows about that earlier text, so it
+    /// seeds the replay buffer at bind time.
+    #[test]
+    fn the_log_seeds_the_replay_of_a_console_that_starts_empty() {
+        let log = crate::testsupport::TestLog::new("web-seed");
+        std::fs::write(&log.file, "answered before the browser existed\n").unwrap();
         let ui = Arc::new(Writer::new(&log.file).unwrap());
         let web = WebConsole::bind(free_port(), ".", ui, Arc::new(String::new)).unwrap();
-        let tail = web.transcript_tail().unwrap();
+        let tail = web
+            .replay_tail()
+            .expect("the earlier text must be replayed");
+        assert!(
+            tail.contains("answered before the browser existed"),
+            "{tail:?}"
+        );
+        // And new coloured output is added to it, not swapped for it.
+        web.console("\u{1b}[32mnew\u{1b}[0m");
+        let tail = web.replay_tail().unwrap();
+        assert!(
+            tail.contains("answered before the browser existed"),
+            "{tail:?}"
+        );
+        assert!(tail.contains("\u{1b}[32m"), "{tail:?}");
+    }
+
+    #[test]
+    fn the_replay_is_a_tail_and_never_splits_a_multibyte_rune() {
+        let web = console(".");
+        // Longer than the replay window, and multibyte throughout. Chunks are
+        // dropped whole, so the cut can never land inside a Thai character the
+        // way a byte-offset cut into the log file could.
+        let chunk = "กขค".repeat(4096);
+        let chunks = REPLAY_TAIL / chunk.len() + 8;
+        for _ in 0..chunks {
+            web.console(&chunk);
+        }
+        let tail = web.replay_tail().unwrap();
         let (marker, kept) = tail.split_once('\n').expect("a marker line");
         assert!(marker.contains("transcript before this point"), "{marker}");
+        let kept = kept.strip_suffix(COLOR_RESET).expect("a closing reset");
         assert!(kept.len() <= REPLAY_TAIL, "{} > {REPLAY_TAIL}", kept.len());
         assert!(
             kept.chars().all(|c| matches!(c, 'ก' | 'ข' | 'ค')),
-            "the tail must start on a rune boundary, got {:?}",
+            "the tail must not start mid-rune, got {:?}",
             kept.chars().take(4).collect::<Vec<_>>()
         );
     }
@@ -1597,7 +2194,7 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
     #[test]
     fn an_empty_transcript_replays_nothing() {
         let web = console(".");
-        assert!(web.transcript_tail().is_none() || web.transcript_tail() == Some(String::new()));
+        assert_eq!(web.replay_tail(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
