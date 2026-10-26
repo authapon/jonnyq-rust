@@ -264,6 +264,17 @@ impl Conn {
     /// False means the client could not take it (queue full, or the connection
     /// is finished) and the frame was counted as dropped.
     pub fn send(&self, text: &str) -> bool {
+        self.push(OP_TEXT, text.as_bytes())
+    }
+
+    /// Queues one *binary* message — a terminal tab's output, which is arbitrary
+    /// bytes and cannot be carried by a JSON string (see
+    /// [`crate::web::term`]). Same rules as [`send`](Self::send).
+    pub fn send_binary(&self, data: &[u8]) -> bool {
+        self.push(OP_BINARY, data)
+    }
+
+    fn push(&self, opcode: u8, payload: &[u8]) -> bool {
         if self.is_closed() {
             return false;
         }
@@ -272,7 +283,7 @@ impl Conn {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        if self.out.send(encode(OP_TEXT, text.as_bytes())).is_err() {
+        if self.out.send(encode(opcode, payload)).is_err() {
             return false;
         }
         self.queued

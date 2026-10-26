@@ -36,6 +36,12 @@
 //!   expanded. Clicking a text file opens it in a new tab (any number at a
 //!   time, switchable from the tab strip); clicking a PDF/image/binary pops up
 //!   why it cannot be shown.
+//! * **terminal tabs** — a **Terminal** button beside the Send button opens a
+//!   real interactive shell (`$SHELL` in a PTY, in the working directory) in a
+//!   new tab, where the human can type any command line: `git status`,
+//!   `cargo test`, `less`, `vim`. It is jonnyq's own terminal, not the model's
+//!   `run_command`, and it does not wait for a turn to finish. See
+//!   [`crate::web::term`].
 //!
 //! # Scope, on purpose
 //!
@@ -46,11 +52,13 @@
 //! drives a port that was never meant to be reachable from a browser.
 //!
 //! It is *not* a security boundary against something already running as this
-//! user: a browser tab can read any file in the working directory. And it
-//! deliberately offers no way to change the model, the provider, the proxy or
-//! the ntfy topic — those stay under the human's keyboard.
+//! user: a browser tab can read any file in the working directory, and a
+//! terminal tab can run any command as them. And it deliberately offers no way
+//! to change the model, the provider, the proxy or the ntfy topic — those stay
+//! under the human's keyboard.
 
 pub mod page;
+pub mod term;
 pub mod ws;
 
 use std::collections::VecDeque;
@@ -263,6 +271,8 @@ pub struct WebConsole {
     /// stack because a turn can be cancelled while an earlier question is
     /// still open, and both must stay answerable.
     questions: Mutex<Vec<WebQuestion>>,
+    /// The terminal tabs, and the shells behind them (see [`term`]).
+    terms: term::Terminals,
     /// Ids handed out, so the browser's answer can be matched to its question
     /// (and a reply to a withdrawn one ignored).
     question_seq: std::sync::atomic::AtomicUsize,
@@ -283,6 +293,7 @@ impl std::fmt::Debug for WebConsole {
             .field("busy", &self.busy.load(Ordering::SeqCst))
             .field("closing", &self.closing.load(Ordering::SeqCst))
             .field("queued_prompts", &self.pending.load(Ordering::SeqCst))
+            .field("terminals", &self.terms.count())
             .field("listeners", &self.hub.lock().unwrap().len())
             .finish()
     }
@@ -292,7 +303,25 @@ impl WebConsole {
     /// Binds `127.0.0.1:port` without accepting anything, and registers the
     /// console mirror on the writer so every chunk printed to stdout is also
     /// sent to the browser.
+    /// A console on `port`, running `$SHELL` in its terminal tabs.
     pub fn bind(port: u16, work_dir: &str, ui: Arc<Writer>, status: StatusFn) -> R<Arc<Self>> {
+        Self::bind_with_shell(port, work_dir, ui, status, None)
+    }
+
+    /// …or running a named program in them instead of `$SHELL`.
+    ///
+    /// A real terminal emulator runs whatever the account's login shell is and
+    /// has no opinion, so production passes `None`; the parameter exists because
+    /// a test that types to a shell has to know what it typed into, and `$SHELL`
+    /// is not something a test can choose without editing the environment out
+    /// from under every other test in the binary.
+    pub fn bind_with_shell(
+        port: u16,
+        work_dir: &str,
+        ui: Arc<Writer>,
+        status: StatusFn,
+        shell: Option<&str>,
+    ) -> R<Arc<Self>> {
         if port == 0 {
             return Err(AgentError::new("a web port must be between 1 and 65535"));
         }
@@ -313,6 +342,10 @@ impl WebConsole {
         if let Some(tail) = log_tail(&ui.output_file()) {
             replay.push(&tail);
         }
+        let terms = match shell {
+            Some(sh) => term::Terminals::with_shell(&dir, ui.clone(), sh.to_string()),
+            None => term::Terminals::new(&dir, ui.clone()),
+        };
         let web = Arc::new(WebConsole {
             ui: ui.clone(),
             work_dir: dir,
@@ -334,6 +367,7 @@ impl WebConsole {
             last_status: RwLock::new(String::new()),
             replay: Mutex::new(replay),
             questions: Mutex::new(Vec::new()),
+            terms,
             question_seq: std::sync::atomic::AtomicUsize::new(0),
             status_calls: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -591,6 +625,10 @@ impl WebConsole {
         for id in left {
             self.send_all(&json!({"type": "ask_close", "id": id}).to_string());
         }
+        // And so do the shells: a terminal tab whose session has ended can no
+        // longer be typed into, and a shell left running behind an exited
+        // jonnyq is a process nobody owns.
+        self.terms.shutdown();
         self.publish_ready();
         self.send_all(&json!({"type": "notice", "title": "jonnyq has exited", "body": "Close this tab, or reload it to reconnect if jonnyq is started again."}).to_string());
     }
@@ -883,6 +921,9 @@ impl WebConsole {
                     // a session blocked on one is the first thing a script or
                     // a human checking in wants to know.
                     "asks": self.questions.lock().unwrap().len(),
+                    // Terminal tabs running, so a script can see that a shell
+                    // was left open (and that `/exit` will take it down).
+                    "terminals": self.terms.count(),
                     "url": self.url(),
                 })
                 .to_string();
@@ -912,6 +953,11 @@ impl WebConsole {
     /// registered (see [`WebConsole::serve_connection`]).
     fn greet(&self, conn: &Arc<ws::Conn>, tail: Option<String>) {
         let _ = conn.send(&json!({"type": "reset"}).to_string());
+        // A tab that (re)connects has no terminals of its own: a shell belongs to
+        // the connection that opened it, and the one this page had before (a
+        // dropped websocket, a reconnect) died with it. The page drops its
+        // terminal panes on this rather than leaving panes that cannot answer.
+        let _ = conn.send(&json!({"type": "term_reset"}).to_string());
         if let Some(tail) = tail {
             let _ = conn.send(&json!({"type": "console", "data": tail}).to_string());
         }
@@ -1010,6 +1056,13 @@ impl WebConsole {
             }
             "prompt" => self.enqueue_prompt(&msg, &id),
             "stop" => self.stop_value(&id),
+            // Terminal tabs: a shell of the human's own, in the working
+            // directory. Answered by the terminal set itself; the bytes of the
+            // shell's output never come through here (they are pushed as binary
+            // frames by the copy task — see `term`).
+            "term_open" | "term_in" | "term_resize" | "term_close" | "term_list" => {
+                self.terms.handle(conn, kind, &msg, &id).await
+            }
             "answer" => {
                 let qid = string_field(&msg, "ask");
                 let text = string_field(&msg, "text");
@@ -1501,6 +1554,21 @@ mod tests {
             d,
             ui,
             Arc::new(|| "test-model · ctx 1,000".to_string()),
+        )
+        .unwrap()
+    }
+
+    /// As [`console`], with the terminal tabs running a named program — for the
+    /// rare test that types into a shell and has to predict what it says back.
+    fn console_with_shell(d: &str, shell: &str) -> Arc<WebConsole> {
+        let log = crate::testsupport::TestLog::new("web");
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        WebConsole::bind_with_shell(
+            free_port(),
+            d,
+            ui,
+            Arc::new(|| "test-model · ctx 1,000".to_string()),
+            Some(shell),
         )
         .unwrap()
     }
@@ -2265,15 +2333,26 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
             let mut s = connect_to(port);
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
             let mut ready_states = Vec::new();
-            // One more read than the greeting: set_waiting below must arrive.
-            for _ in 0..4 {
-                let f = read_server_frame(&mut s).unwrap();
+            /* Read until both ready frames are in rather than a fixed number of
+               frames: the greeting's shape (reset, term_reset, tail, info,
+               ready, any pending asks) is exactly the kind of thing that changes,
+               and a count here would fail for a reason that has nothing to do
+               with readiness. Bounded, so a session that never broadcasts the
+               second one ends the test rather than hanging it. */
+            for _ in 0..16 {
+                let f = match read_server_frame(&mut s) {
+                    Some(f) => f,
+                    None => break,
+                };
                 let v: Value = serde_json::from_str(&f).unwrap();
                 if v["type"] == json!("ready") {
                     ready_states.push((
                         v["ready"].clone(),
                         v["note"].as_str().unwrap_or("").to_string(),
                     ));
+                    if ready_states.len() >= 2 {
+                        break;
+                    }
                 }
             }
             ready_states
@@ -2951,6 +3030,312 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         assert!(web.pending_asks().is_empty(), "the popup is gone with the session");
         // And a question asked after that is refused rather than queued.
         assert!(WebAsk::ask_web(&*web, "still there?").is_none());
+    }
+
+    // -- a terminal tab, end to end ---------------------------------------
+
+    /// Frames the server sends, whatever their kind. `read_server_frame`
+    /// asserts text because every other frame in the protocol is text; a
+    /// terminal's output is not, and the page tells the two apart by opcode.
+    fn read_server_frame_raw(stream: &mut std::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        use std::io::Read;
+        let mut h = [0u8; 2];
+        stream.read_exact(&mut h).ok()?;
+        let opcode = h[0] & 0x0f;
+        let n = match h[1] & 0x7f {
+            126 => {
+                let mut b = [0u8; 2];
+                stream.read_exact(&mut b).ok()?;
+                u16::from_be_bytes(b) as usize
+            }
+            127 => {
+                let mut b = [0u8; 8];
+                stream.read_exact(&mut b).ok()?;
+                u64::from_be_bytes(b) as usize
+            }
+            n => n as usize,
+        };
+        let mut body = vec![0u8; n];
+        stream.read_exact(&mut body).ok()?;
+        Some((opcode, body))
+    }
+
+    /// `[ id length ][ session id ][ output ]` — the header the page's
+    /// `termFrame` reads. `None` when the frame names a different shell, which
+    /// is what the page does with it too.
+    fn term_output<'a>(bytes: &'a [u8], session: &str) -> Option<&'a [u8]> {
+        let n = *bytes.first()? as usize;
+        if bytes.len() < 1 + n || &bytes[1..1 + n] != session.as_bytes() {
+            return None;
+        }
+        Some(&bytes[1 + n..])
+    }
+
+    /// The shell the e2e test runs. `/bin/sh` by default, because a login fish
+    /// greets the terminal with queries and the ten seconds it waits for their
+    /// answers is fish's latency, not the feature's (its greeting runs a fetch
+    /// that the ten seconds is spent on). `JONNYQ_TERM_SHELL` points the same
+    /// test at a real login shell — fish, zsh, bash — for the shells people
+    /// actually use, at the cost of that wait.
+    fn term_test_shell() -> String {
+        std::env::var("JONNYQ_TERM_SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+
+    /// One frame off the socket into `pane`/`frames`, as the page would: JSON
+    /// replies are acknowledged and ignored, binary ones are output. `false`
+    /// when the socket has gone quiet or closed — that is how a drain ends.
+    fn read_one(
+        s: &mut std::net::TcpStream,
+        pane: &mut String,
+        frames: &mut Vec<Vec<u8>>,
+        session: &str,
+        drain: bool,
+    ) -> bool {
+        let (opcode, body) = match read_server_frame_raw(s) {
+            Some(f) => f,
+            None if drain => return false, // the shell has gone quiet
+            None => panic!("the socket closed while the terminal was open"),
+        };
+        match opcode {
+            ws::OP_BINARY => {
+                let text = match term_output(&body, session) {
+                    Some(p) => {
+                        assert!(!p.is_empty(), "an output frame carrying no output");
+                        String::from_utf8_lossy(p).into_owned()
+                    }
+                    None => panic!("a frame naming another shell: {session}"),
+                };
+                frames.push(body);
+                pane.push_str(&text);
+            }
+            ws::OP_TEXT => {}
+            other => panic!("unexpected frame opcode {other:#x}"),
+        }
+        true
+    }
+
+    /// A whole terminal tab over a real socket: open a shell, tell it the size
+    /// the page measured, type a command, and read the output frames back.
+    ///
+    /// This is the one test that spans both halves of the feature. The unit
+    /// tests in [`crate::web::term`] hand messages to `Terminals::handle` and
+    /// read a fake connection, so they cannot see the frame format the page
+    /// depends on; the page's tests in [`crate::web::page`] drive the emulator
+    /// with frames they build themselves, so they cannot see what the server
+    /// really sends. A server and a page that disagree about the header — an
+    /// off-by-one on the length byte, say — pass both and fail here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_tab_round_trips_through_a_real_socket() {
+        let dir = crate::testsupport::TempDir::new("term-e2e");
+        std::fs::write(dir.path().join("marker.txt"), b"on-disk\n").unwrap();
+        let want_dir = dir.str();
+        /* `/bin/sh` by default; see [`term_test_shell`]. What is under test
+           here is the frame plumbing, which does not care which shell is on the
+           other end of it. */
+        let web = console_with_shell(&want_dir, &term_test_shell());
+        web.start().unwrap();
+        let port = web.port();
+
+        let (out, frames, session) = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            s.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+                .unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+
+            // Open the tab. The reply is the shell's identity: the id output
+            // frames will name, and the folder the shell is in.
+            send_client(&mut s, &json!({"type": "term_open", "id": "o1", "path": ""}));
+            let opened = await_reply(&mut s, "o1");
+            assert_eq!(opened["ok"], json!(true), "term_open failed: {opened}");
+            let session = opened["session"].as_str().unwrap().to_string();
+            assert_eq!(
+                opened["dir"],
+                json!(want_dir),
+                "the shell started somewhere other than the working directory"
+            );
+
+            // 132x43 is arbitrary but specific: any other answer means the
+            // window the page measured never reached the terminal.
+            send_client(
+                &mut s,
+                &json!({"type": "term_resize", "id": "r1", "session": session,
+                        "cols": 132, "rows": 43}),
+            );
+            assert_eq!(await_reply(&mut s, "r1")["cols"], json!(132));
+
+            let mut pane = String::new();
+            /* Every binary frame is checked as it arrives: it must name this
+               shell and it must begin with real output. Truncating the payload,
+               shortening the id, or prefixing a byte would all fail here, even
+               though this test's own decoder reads the header the same way the
+               page's does — a shared misreading is exactly what a check that
+               looks at the *bytes* rather than the decoding catches. */
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            for (cmd, want) in [
+                (b"pwd; echo e2e-marker; ls\r".as_slice(), "e2e-marker"),
+                (b"stty size\r".as_slice(), "43 132"),
+            ] {
+                send_client(
+                    &mut s,
+                    &json!({"type": "term_in", "session": session, "data": base64_of(cmd)}),
+                );
+                // Read frames until the shell has said it. A JSON reply (the
+                // `term_in` acknowledgement) is skipped exactly as the page
+                // skips it, and a binary frame is decoded by its header.
+                while !pane.contains(want) {
+                    read_one(&mut s, &mut pane, &mut frames, &session, false);
+                }
+                /* Then drain what is still on its way, so the replay below gets
+                   the whole exchange and not a prefix that happens to contain
+                   the marker. A shell answers in several reads — echo, output,
+                   prompt — and short-timeout reads are how the tail is told
+                   from a shell that has gone quiet. */
+                s.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+                while read_one(&mut s, &mut pane, &mut frames, &session, true) {}
+                s.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
+            }
+            (pane, frames, session)
+        })
+        .await
+        .expect("the socket thread panicked");
+
+        // What the shell printed, on the wire, in the folder it was started in,
+        // with the window the page asked for.
+        assert!(out.contains("e2e-marker"), "command output missing: {out:?}");
+        assert!(out.contains("marker.txt"), "the listing is missing: {out:?}");
+        assert!(out.contains("43 132"), "the shell did not learn its size: {out:?}");
+        // Two commands, so the frames are more than one exchange's worth, and
+        // each carries output — an empty frame is a read that saw nothing, and
+        // the page would decode it into nothing drawn.
+        assert!(frames.len() >= 2, "expected output from both commands, got {} frame(s)", frames.len());
+
+        /* Now the part no Rust-only test can do: feed those exact bytes to the
+           page's own `termFrame` and read the pane back. The server's encoder
+           and the page's decoder are then checked against each other rather
+           than each against this file's reading of them — the only way a shared
+           misreading of the header shows up. */
+        if let Some(pane) = replay_frames_in_page(&frames, &session) {
+            assert!(
+                pane.contains("e2e-marker"),
+                "the page's decoder did not recover the shell's output: {pane:?}"
+            );
+            assert!(
+                pane.contains("43 132"),
+                "nor the window it was given: {pane:?}"
+            );
+            assert!(
+                !pane.contains('\u{1b}'),
+                "escape bytes leaked into the pane: {pane:?}"
+            );
+        }
+
+        web.terms.shutdown();
+    }
+
+    /// Replay real server output frames through the page's own `termFrame`.
+    ///
+    /// `page_harness.js` is the page's fake DOM — the half of it above the
+    /// splice point, which is all that is needed to boot the shipped page under
+    /// node — with the page's own `<script>` spliced in and a few lines of
+    /// replay appended: a terminal tab wired by the page's own `wireTerm`, the
+    /// frames fed to the page's own `termFrame`, and the screen's text printed.
+    /// So the server's encoder and the page's decoder are checked against
+    /// *each other*, over the bytes a real shell produced, which no Rust-only
+    /// test can do: an off-by-one on the length byte, or an id written at the
+    /// wrong offset, is invisible to a test that decodes its own framing.
+    ///
+    /// `None` where node is not installed, matching the page's own node tests;
+    /// a page that *throws* on these frames is a hard failure, not a skip.
+    fn replay_frames_in_page(frames: &[Vec<u8>], session: &str) -> Option<String> {
+        let script = crate::web::page::INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let prelude = crate::web::page::PAGE_HARNESS
+            .split(crate::web::page::PAGE_SCRIPT)
+            .next()
+            .expect("the harness's splice point")
+            .to_string();
+        let driver = format!(
+            "{prelude}{script}\n\
+             /* --- replay of a live shell's output (see the web e2e test) --- */\n\
+             const __p = termPanel();\n\
+             const __tab = {{ id: \"T9\", kind: \"term\", path: null, el: __p.panel,\n\
+               tab: node(\"div\", \"tab\"), term: null }};\n\
+             __tab.tab.querySelector = () => node(\"span\", \"name\");\n\
+             wireTerm(__tab);\n\
+             __tab.term.screen.resize(132, 43);\n\
+             termTabs.set(__SESSION__, __tab);\n\
+             __tab.term.session = __SESSION__;\n\
+             for (const f of JSON.parse(process.argv[2])) termFrame(new Uint8Array(f).buffer);\n\
+             console.log(\"@@PANE@@\" + JSON.stringify(__tab.term.screen.text()));\n\
+             /* The page keeps a heartbeat timer running once it connects, so\n\
+                node would sit on it forever; the screen is printed, so this\n\
+                run is over whether or not the socket ever came up. */\n\
+             process.exit(0);\n",
+            script = script,
+        );
+        let dir = crate::testsupport::TempDir::new("term-replay");
+        let js = dir.path().join("replay.js");
+        if std::fs::write(&js, driver.replace("__SESSION__", &serde_json::Value::String(session.to_string()).to_string()).as_bytes()).is_err() {
+            panic!("cannot write the replay driver");
+        }
+        let list: Vec<serde_json::Value> = frames.iter().cloned().map(serde_json::Value::from).collect();
+        let run = std::process::Command::new("node")
+            .arg(&js)
+            .arg(serde_json::Value::Array(list).to_string())
+            .output();
+        let Ok(out) = run else {
+            eprintln!("node is not installed, skipping the page side of this test");
+            return None;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "the page died on the server's frames:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        const MARKER: &str = "@@PANE@@";
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(MARKER))
+            .unwrap_or_else(|| panic!("the page never reported its screen:\n{stdout}"));
+        let text: String = serde_json::from_str(&line[MARKER.len()..])
+            .unwrap_or_else(|e| panic!("unreadable screen text {:?}: {e}", &line[MARKER.len()..]));
+        // Frames named for a shell the page does not have are dropped silently,
+        // which would otherwise look like a clean run that proved nothing.
+        assert!(!text.is_empty(), "the page drew nothing from {} frames", frames.len());
+        Some(text)
+    }
+
+    /// Base64, the way `term_in` wants its bytes.
+    fn base64_of(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn send_client(s: &mut std::net::TcpStream, msg: &Value) {
+        use std::io::Write;
+        s.write_all(&client_frame(&msg.to_string())).unwrap();
+        s.flush().unwrap();
+    }
+
+    /// Text frames until the reply carrying this id arrives, ignoring the
+    /// greeting (reset, term_reset, tail, info, ready).
+    fn await_reply(s: &mut std::net::TcpStream, id: &str) -> Value {
+        for _ in 0..32 {
+            let text = match read_server_frame(s) {
+                Some(t) => t,
+                None => break,
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                if v["id"].as_str() == Some(id) {
+                    return v;
+                }
+            }
+        }
+        panic!("no reply to {id:?}");
     }
 
     #[test]

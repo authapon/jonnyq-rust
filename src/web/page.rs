@@ -29,6 +29,16 @@
 //! flight; pressing it sends one `stop` message, which cancels the same token
 //! the terminal's Ctrl-C cancels (see [`crate::web::WebConsole::request_stop`]).
 
+/// Where [`page_harness.js`] expects the page's own script to be inserted. A
+/// comment in the harness, so the file parses on its own.
+pub const PAGE_SCRIPT: &str = "@@PAGE_SCRIPT@@";
+
+/// The harness itself, with the splice point still in it. The page's terminal
+/// tests splice and run all of it; the web e2e test in [`crate::web`] uses only
+/// the half above [`PAGE_SCRIPT`] — the fake DOM — so it can boot the page and
+/// drive it with frames that came off a real pty.
+pub const PAGE_HARNESS: &str = include_str!("page_harness.js");
+
 pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -186,6 +196,70 @@ body {
 }
 #stop:hover:enabled { background: var(--f0); color: var(--bg0h); }
 #stop:disabled { color: var(--fg4); border-color: var(--bg2); cursor: progress; }
+
+/* --- terminal tabs ---
+   A terminal tab is a pane of cells, so the face is monospaced no matter what
+   the picker is set to (proportionate glyphs cannot tile a grid) and the size
+   comes from the same --ui-size every other text area takes. The size is
+   applied here rather than by script: measureCell() then reads the numbers back
+   out of getComputedStyle, so the type control and the grid cannot disagree. */
+.term-head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px; background: var(--bg0); border-bottom: 1px solid var(--bg2);
+  color: var(--fg4); font-size: 12px; white-space: nowrap; overflow: hidden;
+}
+.term-head .dir { color: var(--f3); overflow: hidden; text-overflow: ellipsis; }
+.term-head .shell { color: var(--fg4); }
+.term-head .spacer { flex: 1 1 auto; }
+.term-head .gone { color: var(--f0); }
+.term-head button {
+  background: var(--bg1); color: var(--fg1); border: 1px solid var(--bg2);
+  border-radius: 4px; padding: 2px 8px; font: inherit; cursor: pointer; flex: 0 0 auto;
+}
+.term-head button:hover { border-color: var(--accent); color: var(--accent); }
+/* Keystrokes need a real input surface, and a div is not one: a browser only
+   starts an IME composition, honours a keyboard layout's dead keys, or offers a
+   soft keyboard on a phone when there is a text field to type into. So the pane
+   keeps a hidden textarea — the same trick every browser terminal uses — and it
+   sits beside the pane rather than inside it, because an element inside a
+   scrolling container gets the pane's scroll yanked to it when it is focused. */
+.term-input {
+  position: absolute; right: 2px; bottom: 2px; width: 1px; height: 1px;
+  padding: 0; margin: 0; border: 0; outline: none; resize: none; overflow: hidden;
+  background: transparent; color: transparent; caret-color: transparent;
+  font: inherit; opacity: 0;
+}
+.term-out {
+  flex: 1 1 auto; overflow: auto; position: relative; outline: none;
+  background: var(--bg0h); padding: 6px 8px; cursor: text;
+  font: var(--ui-size)/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  scrollbar-width: thin; scrollbar-color: var(--bg3) var(--bg0h);
+}
+.panel:focus-within .term-out { box-shadow: inset 0 0 0 1px var(--bg4); }
+.term-grid { margin: 0; white-space: pre; }
+/* The cell measure, in the pane's own font metrics: one long word plus a line
+   break, measured by scrollWidth/scrollHeight. Hidden by having no layout of
+   its own — it must not change the size of the thing whose size it gives. */
+.term-size {
+  position: absolute; left: 0; top: 0; visibility: hidden; height: 0; width: 0;
+  overflow: hidden; white-space: pre; pointer-events: none;
+}
+.tv { background: var(--fg4); color: var(--bg0h); }
+.b30 { background: var(--bg3); } .b90 { background: var(--f12); }
+.b31 { background: var(--red); }  .b91 { background: var(--f0); }
+.b32 { background: var(--green); } .b92 { background: #b8bb26; }
+.b33 { background: var(--yellow); } .b93 { background: var(--f2); }
+.b34 { background: var(--blue); }  .b94 { background: var(--f3); }
+.b35 { background: var(--purple); } .b95 { background: var(--f4); }
+.b36 { background: var(--aqua); }  .b96 { background: var(--f6); }
+.b37 { background: var(--fg4); }   .b97 { background: var(--fg); }
+.ti { font-style: italic; } .tu { text-decoration: underline; }
+.ts { text-decoration: line-through; }
+/* The tab itself is named after the folder the shell is in, so several open at
+   once tell you which is which; the dot is the one bit of state worth colour
+   for: orange while the shell is running, grey once it is not. */
+.tab .dot { color: var(--accent); }
+.tab.dead .dot { color: var(--bg4); }
 
 /* --- ANSI colours, one class per SGR code so bold can pick the bright
        variant the way a terminal does --- */
@@ -659,13 +733,1129 @@ function span(classes, text) {
   return keep.length ? '<span class="' + keep.join(" ") + '">' + body + "</span>" : body;
 }
 
+/* ---------------------------------------------------- terminal emulation
+   A terminal tab is a window onto a PTY, and PTY output is a stream of cursor
+   movement, erase and colour sequences — so the page has to be a terminal, not
+   a `<pre>`. This is that emulation: it takes characters, keeps a screen of
+   `rows` lines of `cols` cells, and hands back HTML.
+
+   It is deliberately not a general xterm. It is what the programs people
+   actually open in a terminal tab emit — a shell with readline, `ls --color`,
+   `less`, `vim`, `htop`, a REPL — and it was written against captures of those
+   from a real PTY, then diffed against an independent emulator's screen at
+   several points in each capture. What it does not implement it swallows
+   rather than draws, and what a program *asks* it answers, because a program
+   that queries the terminal and gets nothing just sits there (that silence is
+   the one failure mode that makes a pane look hung rather than wrong). */
+
+/* One cell's blank: a space with no attributes. */
+function blankLine(cols) {
+  const ch = new Array(cols);
+  const at = new Array(cols);
+  for (let i = 0; i < cols; i++) { ch[i] = " "; at[i] = ""; }
+  return { ch, at };
+}
+
+/* DEC special graphics (the ACS line-drawing set), used by `less`, `vim` and
+   anything else that draws a box with `ESC ( 0` instead of Unicode. */
+const DEC_GRAPHICS = {
+  "`": "\u25C6", a: "\u2592", f: "\u00B0", g: "\u00B1", j: "\u2518", k: "\u2510",
+  l: "\u250C", m: "\u2514", n: "\u253C", o: "\u23BA", p: "\u23BB", q: "\u2500",
+  r: "\u23DC", s: "\u23DD", t: "\u251C", u: "\u2524", v: "\u2534", w: "\u252C",
+  x: "\u2502", y: "\u2264", z: "\u2265", "{": "\u03C0", "|": "\u2260",
+  "}": "\u00A3", "~": "\u00B7",
+};
+
+/* The 256-colour palette above the sixteen the page already has classes for:
+   indexes 16..255 are the xterm 6x6x6 cube and its greyscale ramp, and apps
+   that emit `38;5;N` expect those exact values. 0..15 are left to the CSS
+   classes so the terminal takes the gruvbox colours the rest of the page uses. */
+function xterm256(n) {
+  if (n < 16) return null;                    /* the palette the page themes */
+  if (n >= 232) {
+    const v = 8 + (n - 232) * 10;
+    return "#" + [v, v, v].map((x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  const i = n - 16;
+  const lv = [0, 95, 135, 175, 215, 255];
+  const r = lv[Math.floor(i / 36)], g = lv[Math.floor(i / 6) % 6], b = lv[i % 6];
+  return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+class TermScreen {
+  constructor(cols, rows) {
+    this.cols = Math.max(1, cols | 0);
+    this.rows = Math.max(1, rows | 0);
+    this.saved = null;      /* cursor saved by ESC 7 / CSI s */
+    this.alt = null;        /* the main screen, while the alt one is showing */
+    this.reply = "";        /* bytes the shell asked for, owed back to it */
+    this.reset();
+  }
+
+  /* Back to a blank screen and initial state — what `reset` and DECRC-from-
+     nothing mean, and what the page does when a tab is opened. */
+  reset() {
+    this.lines = [];
+    for (let r = 0; r < this.rows; r++) this.lines.push(blankLine(this.cols));
+    this.x = 0; this.y = 0;
+    this.top = 0; this.bottom = this.rows - 1;
+    this.attr = "";
+    this.wrap = false;        /* a pending wrap: the next glyph starts a line */
+    this.visible = true;
+    this.decckm = false;      /* application cursor keys (vim needs this) */
+    this.bracketed = false;   /* bracketed paste mode */
+    this.charset = false;     /* DEC special graphics in use */
+    this.sync = false;        /* synchronized output: repaint at the frame end */
+    this.tabs = 8;
+    this.state = "ground";
+    this.priv = ""; this.inter = ""; this.params = "";
+    this.osc = "";
+    this.altActive = false;
+  }
+
+  /* Grow or shrink the window, keeping the top of the screen — the way a
+     terminal does, so scrolling a long `cargo` build up and then resizing does
+     not throw the output away. */
+  resize(cols, rows) {
+    cols = Math.max(1, cols | 0); rows = Math.max(1, rows | 0);
+    if (cols === this.cols && rows === this.rows) return;
+    const rescale = (lines) => {
+      const out = [];
+      for (let r = 0; r < rows; r++) {
+        const src = lines[r];
+        const ln = blankLine(cols);
+        if (src) {
+          for (let c = 0; c < cols; c++) {
+            ln.ch[c] = src.ch[c] !== undefined ? src.ch[c] : " ";
+            ln.at[c] = src.at[c] !== undefined ? src.at[c] : "";
+          }
+        }
+        out.push(ln);
+      }
+      return out;
+    };
+    this.lines = rescale(this.lines);
+    if (this.alt) this.alt.lines = rescale(this.alt.lines);
+    this.cols = cols; this.rows = rows;
+    this.top = 0; this.bottom = rows - 1;
+    this.x = Math.min(this.x, cols - 1);
+    this.y = Math.min(this.y, rows - 1);
+    this.wrap = false;
+  }
+
+  /* ---------------------------------------------------------------- feed */
+
+  /* One chunk of shell output. Kept state makes a sequence that ends at a
+     chunk boundary resume on the next call rather than being drawn as text. */
+  write(s) {
+    for (const ch of s) {
+      const code = ch.codePointAt(0);
+      if (this.state === "ground") {
+        if (code === 0x1b) { this.state = "esc"; continue; }
+        if (code === 0x07) continue;                             /* BEL */
+        if (code === 0x08) { this.backspace(); continue; }
+        if (code === 0x09) { this.tab(); continue; }
+        if (code === 0x0a || code === 0x0b || code === 0x0c) { this.lineFeed(); continue; }
+        if (code === 0x0d) { this.x = 0; this.wrap = false; continue; }
+        if (code === 0x0e || code === 0x0f) { this.charset = code === 0x0e; continue; }
+        if (code < 0x20) continue;                     /* other C0: ignored */
+        this.put(ch, code);
+        continue;
+      }
+      if (this.state === "esc") {
+        this.state = "ground";
+        if (ch === "[") {
+          this.priv = ""; this.inter = ""; this.params = "";
+          this.state = "csi"; continue;
+        }
+        if (ch === "]") { this.osc = ""; this.state = "osc"; continue; }
+        if (ch === "P" || ch === "^" || ch === "_") { this.state = "dcs"; continue; }
+        if (ch === "X" || ch === "Z") { this.state = "skip2"; continue; }
+        switch (ch) {
+          case "7": this.save(); break;
+          case "8": this.restore(); break;
+          case "D": this.lineFeed(); break;
+          case "E": this.x = 0; this.lineFeed(); break;
+          case "M": this.reverseIndex(); break;
+          case "c": this.reset(); break;
+          case "=": case ">": this.appKeypad = false; break;
+          case "(": case ")": case "*": case "+": case "-": case ".":
+            this.state = "charset"; break;
+          default: break;                              /* unknown: swallowed */
+        }
+        continue;
+      }
+      if (this.state === "skip2") { this.state = "ground"; continue; }
+      if (this.state === "charset") {                    /* ESC ( 0 and friends */
+        this.charset = (ch === "0");
+        this.state = "ground";
+        continue;
+      }
+      if (this.state === "osc") {
+        if (ch === "\u0007") { this.oscDone(this.osc); this.state = "ground"; continue; }
+        if (ch === "\u001b") { this.state = "osc_esc"; continue; }
+        this.osc += ch;
+        continue;
+      }
+      if (this.state === "osc_esc") {              /* OSC terminated by ST */
+        if (ch === "\\") this.oscDone(this.osc);
+        this.state = "ground";
+        continue;
+      }
+      if (this.state === "dcs") {
+        if (ch === "\u0007") { this.state = "ground"; continue; }
+        if (ch === "\u001b") { this.state = "dcs_esc"; continue; }
+        continue;
+      }
+      if (this.state === "dcs_esc") { this.state = "ground"; continue; }
+      if (this.state === "csi") {
+        /* xterm's own byte classes: 0x30-0x3F are parameters (which is where
+           `?`, `<`, `=`, `>` and `:` live), 0x20-0x2F are intermediates (`$`
+           among them — DECRQM), 0x40-0x7E end the sequence. */
+        const code = ch.codePointAt(0);
+        if (code >= 0x30 && code <= 0x3f) {
+          if ((ch === "?" || ch === "<" || ch === "=" || ch === ">") && this.params === "" && this.inter === "") {
+            this.priv = ch;
+          } else {
+            this.params += ch === ":" ? ";" : ch;
+            /* A parameter past the point where nothing sane is left: stop
+               collecting rather than grow a buffer a hostile shell chose. */
+            if (this.params.length > 64) { this.state = "ground"; continue; }
+          }
+          continue;
+        }
+        if (code >= 0x20 && code <= 0x2f) { this.inter += ch; continue; }
+        if (code >= 0x40 && code <= 0x7e) { this.csi(ch); this.state = "ground"; }
+        else this.state = "ground";                    /* anything else cancels */
+        continue;
+      }
+    }
+    /* A chunk that ends mid-sequence leaves the parser where it was; the page
+       simply sends the rest. */
+  }
+
+  /* The bytes the shell asked the terminal for (a cursor position report, a
+     device attributes reply, a colour query) and that have to go back down the
+     pty, or an application that queries waits for an answer that never comes. */
+  takeOutput() { const r = this.reply; this.reply = ""; return r; }
+
+  /* ------------------------------------------------------------- writing */
+
+  put(ch, code) {
+    /* The numeric test first: a combining mark never lives below U+0300, and
+       the overwhelmingly common character is ASCII, so the property test (a
+       regex match, per glyph) is never reached for it. */
+    if (code >= 0x0300 && /\p{M}/u.test(ch)) {
+      /* A mark belongs to the glyph the cursor sits on — the one it just wrote,
+         or the one under it while a wrap is pending and the cursor is still on
+         the last cell, which is what xterm and pyte both do. Thai tone marks
+         and vowel signs stay on their consonant instead of taking a cell each. */
+      const at = this.wrap ? this.x : this.x - 1;
+      if (at >= 0) {
+        const ln = this.lines[this.y];
+        ln.ch[at] += ch;
+        ln.at[at] = this.attr;
+        return;
+      }
+    }
+    if (this.charset && DEC_GRAPHICS[ch] !== undefined) ch = DEC_GRAPHICS[ch];
+    if (this.wrap) { this.x = 0; this.lineFeed(); this.wrap = false; }
+    const ln = this.lines[this.y];
+    ln.ch[this.x] = ch;
+    ln.at[this.x] = this.attr;
+    if (this.x >= this.cols - 1) this.wrap = true;    /* deferred wrap */
+    else this.x++;
+  }
+
+  backspace() {
+    if (this.wrap) { this.wrap = false; return; }
+    if (this.x > 0) this.x--;
+  }
+
+  tab() {
+    this.wrap = false;
+    const next = Math.min(this.cols - 1, (Math.floor(this.x / this.tabs) + 1) * this.tabs);
+    this.x = next;
+  }
+
+  lineFeed() {
+    this.wrap = false;
+    if (this.y === this.bottom) this.scrollUp(this.top);
+    else if (this.y < this.rows - 1) this.y++;
+  }
+
+  reverseIndex() {
+    this.wrap = false;
+    if (this.y === this.top) this.scrollDown(this.top);
+    else if (this.y > 0) this.y--;
+  }
+
+  scrollUp(top) {
+    const [t, b] = top <= this.bottom ? [top, this.bottom] : [0, this.rows - 1];
+    this.lines.splice(t, 1);                  /* the region's top line leaves */
+    this.lines.splice(b, 0, blankLine(this.cols));
+  }
+
+  scrollDown(top) {
+    const [t, b] = top <= this.bottom ? [top, this.bottom] : [0, this.rows - 1];
+    this.lines.splice(t, 0, blankLine(this.cols));
+    this.lines.splice(b + 1, 1);              /* and its bottom line leaves */
+  }
+
+  blank(y) { return this.lines[y]; }
+
+  eraseRange(y, from, to) {
+    const ln = this.blank(y);
+    for (let c = from; c <= to && c < this.cols; c++) {
+      if (c < 0) continue;
+      ln.ch[c] = " ";
+      ln.at[c] = this.attr;      /* EDA/EL use the current background, as xterm does */
+    }
+  }
+
+  /* Erase in line: 0 to the end, 1 to the start, 2 the whole line. readline's
+     own redraw is a CR plus this, so the completion menu that replaces what you
+     typed depends on it being right. */
+  eraseLine(mode) {
+    if (mode === 1) this.eraseRange(this.y, 0, this.x);
+    else if (mode === 2) this.eraseRange(this.y, 0, this.cols - 1);
+    else this.eraseRange(this.y, this.x, this.cols - 1);
+  }
+
+  /* Erase in display, same three directions over the whole screen. */
+  eraseDisplay(mode) {
+    if (mode === 1) {
+      this.eraseLine(1);
+      for (let r = 0; r < this.y; r++) this.eraseRange(r, 0, this.cols - 1);
+    } else if (mode === 2 || mode === 3) {
+      for (let r = 0; r < this.rows; r++) this.eraseRange(r, 0, this.cols - 1);
+      if (mode === 3) this.wrap = false;        /* xterm's 3 also clears history */
+    } else {
+      this.eraseLine(0);
+      for (let r = this.y + 1; r < this.rows; r++) this.eraseRange(r, 0, this.cols - 1);
+    }
+  }
+
+  insertLines(n) {
+    if (this.y < this.top || this.y > this.bottom) return;
+    for (let i = 0; i < n; i++) {
+      this.lines.splice(this.y, 0, blankLine(this.cols));
+      this.lines.splice(this.bottom + 1, 1);
+    }
+    this.wrap = false;
+  }
+
+  deleteLines(n) {
+    if (this.y < this.top || this.y > this.bottom) return;
+    for (let i = 0; i < n; i++) {
+      this.lines.splice(this.y, 1);
+      this.lines.splice(this.bottom + 1, 0, blankLine(this.cols));
+    }
+    this.wrap = false;
+  }
+
+  /* ------------------------------------------------------------ sequences */
+
+  /* CSI parameters, with the defaults an absent parameter means. A parameter
+     of exactly 0 is kept as 0, because the erase modes read it as a direction;
+     the places where 0 has to mean 1 clamp it themselves. */
+  p(i, dflt) {
+    const raw = this.params.split(";")[i];
+    if (raw === undefined || raw === "") return dflt;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : (n === 0 ? 0 : dflt);
+  }
+
+  csi(final) {
+    /* Anything with a private marker the page does not implement is dropped
+       rather than echoed; with an intermediate it is usually a query this page
+       answers as "no" or does not answer at all. */
+    const priv = this.priv, inter = this.inter;
+    if (inter === "$") {
+      /* DECRQM: "is mode N set?" Answer not-recognised for everything the page
+         does not implement, which is the truthful answer and unblocks the
+         applications that ask (fish asks about synchronized output). */
+      if (final === "p") this.reply += "\u001b[?" + this.p(0, 0) + ";0$y";
+      return;
+    }
+    if (priv === "?") {
+      if (final === "h" || final === "l") { this.decMode(final === "h"); return; }
+      if (final === "u") {                      /* kitty keyboard protocol query */
+        this.reply += "\u001b[?0u";
+        return;
+      }
+      if (final === "r") { this.top = 0; this.bottom = this.rows - 1; return; }
+      return;
+    }
+    if (priv === ">") {
+      if (final === "c") { this.reply += "\u001b[>1;1985;0c"; return; }   /* secondary DA */
+      if (final === "q") {                    /* XTVERSION: who am I */
+        this.reply += "\u001bP>|jonnyq console\u001b\\";
+        return;
+      }
+      return;
+    }
+    switch (final) {
+      case "m": this.sgr(); return;
+      case "H": case "f":
+        this.y = Math.min(this.rows, Math.max(1, this.p(0, 1))) - 1;
+        this.x = Math.min(this.cols, Math.max(1, this.p(1, 1))) - 1;
+        this.wrap = false;
+        return;
+      case "A": this.y = Math.max(this.top, this.y - Math.max(1, this.p(0, 1))); this.wrap = false; return;
+      case "B": this.y = Math.min(this.bottom, this.y + Math.max(1, this.p(0, 1))); this.wrap = false; return;
+      case "C": this.x = Math.min(this.cols - 1, this.x + Math.max(1, this.p(0, 1))); this.wrap = false; return;
+      case "D": this.x = Math.max(0, this.x - Math.max(1, this.p(0, 1))); this.wrap = false; return;
+      case "E": this.x = 0; this.y = Math.min(this.bottom, this.y + Math.max(1, this.p(0, 1))); return;
+      case "F": this.x = 0; this.y = Math.max(this.top, this.y - Math.max(1, this.p(0, 1))); return;
+      case "G": this.x = Math.min(this.cols - 1, Math.max(1, this.p(0, 1)) - 1); this.wrap = false; return;
+      case "d": this.y = Math.min(this.rows, Math.max(1, this.p(0, 1))) - 1; this.wrap = false; return;
+      case "J": this.eraseDisplay(this.p(0, 0)); return;
+      case "K": this.eraseLine(this.p(0, 0)); return;
+      case "L": this.insertLines(Math.max(1, this.p(0, 1))); return;
+      case "M": this.deleteLines(Math.max(1, this.p(0, 1))); return;
+      case "P": {                                     /* delete chars */
+        const n = Math.max(1, this.p(0, 1)), ln = this.blank(this.y);
+        for (let c = this.x; c < this.cols; c++) {
+          const src = c + n;
+          ln.ch[c] = src < this.cols ? ln.ch[src] : " ";
+          ln.at[c] = src < this.cols ? ln.at[src] : "";
+        }
+        for (let c = Math.max(0, this.cols - n); c < this.cols; c++) { ln.ch[c] = " "; ln.at[c] = ""; }
+        this.wrap = false;
+        return;
+      }
+      case "@": {                                     /* insert blanks */
+        const n = Math.max(1, this.p(0, 1)), ln = this.blank(this.y);
+        for (let c = this.cols - 1; c >= this.x; c--) {
+          const src = c - n;
+          ln.ch[c] = src >= this.x ? ln.ch[src] : " ";
+          ln.at[c] = src >= this.x ? ln.at[src] : "";
+        }
+        this.wrap = false;
+        return;
+      }
+      case "X": {                                     /* erase chars */
+        const n = Math.max(1, this.p(0, 1));
+        this.eraseRange(this.y, this.x, this.x + n - 1);
+        return;
+      }
+      case "r": {                                     /* DECSTBM */
+        const t = Math.max(1, this.p(0, 1)) - 1;
+        const b = Math.min(this.rows, Math.max(1, this.p(1, this.rows))) - 1;
+        if (t < b) { this.top = t; this.bottom = b; this.x = 0; this.y = this.top; }
+        return;
+      }
+      case "s": this.save(); return;
+      case "u": this.restore(); return;
+      case "h": case "l": return;                     /* non-private modes: ignored */
+      case "n": {                                     /* DSR */
+        if (this.p(0, 0) === 6) this.reply += "\u001b[" + (this.y + 1) + ";" + (this.x + 1) + "R";
+        else if (this.p(0, 0) === 5) this.reply += "\u001b[0n";
+        return;
+      }
+      case "c": this.reply += "\u001b[?62;22c"; return;   /* primary DA, VT220 */
+      case "t": return;                               /* window ops: ignored */
+      default: return;
+    }
+  }
+
+  decMode(on) {
+    const want = (n) => this.params.split(";").includes(String(n));
+    /* Every mode this page understands is answered here; the ones it does not
+       are accepted and ignored, so an application that sets one is not left
+       waiting for a mode report. */
+    if (want(25)) this.visible = on;
+    else if (want(1)) this.decckm = on;
+    else if (want(2004) || want(2000)) this.bracketed = on;
+    else if (want(1049) || want(1047) || want(47)) this.altScreen(on, want(1049));
+    else if (want(2026)) this.sync = on;             /* synchronized output */
+  }
+
+  /* The alternate screen: `vim`, `less`, `man` and `htop` draw over it and come
+     back to what was there. `1049` also clears on entry and restores the cursor. */
+  altScreen(on, clears) {
+    if (on && !this.altActive) {
+      this.alt = {
+        lines: this.lines, top: this.top, bottom: this.bottom,
+        attr: this.attr, saved: this.saved,
+      };
+      this.altActive = true;
+      this.lines = [];
+      for (let r = 0; r < this.rows; r++) this.lines.push(blankLine(this.cols));
+      if (clears) { this.x = 0; this.y = 0; this.attr = ""; }
+      this.top = 0; this.bottom = this.rows - 1;
+      this.wrap = false;
+    } else if (!on && this.altActive) {
+      this.lines = this.alt.lines;
+      this.top = this.alt.top; this.bottom = this.alt.bottom;
+      this.attr = this.alt.attr; this.saved = this.alt.saved;
+      if (this.lines.length !== this.rows) {
+        this.lines = [];
+        for (let r = 0; r < this.rows; r++) this.lines.push(blankLine(this.cols));
+      }
+      this.altActive = false;
+      this.alt = null;
+      this.x = Math.min(this.x, this.cols - 1);
+      this.y = Math.min(this.y, this.rows - 1);
+      this.wrap = false;
+    }
+  }
+
+  oscDone(body) {
+    /* Colour queries (`OSC 10 ?` asks for the foreground colour) have to be
+       answered, or a shell that checks before painting waits; every other OSC
+       is a title or a hyperlink and is dropped. */
+    const q = body.match(/^(\d+);\?$/);
+    if (!q) return;
+    const n = +q[1];
+    const rgb = (hex) => {
+      const v = hex.replace("#", "");
+      return "rgb:" + v.slice(0, 2) + "/" + v.slice(2, 4) + "/" + v.slice(4, 6);
+    };
+    if (n === 10) this.reply += "\u001b]10;" + rgb("#ebdbb2") + "\u001b\\";
+    else if (n === 11) this.reply += "\u001b]11;" + rgb("#1d2021") + "\u001b\\";
+    else if (n === 4 || n === 12) this.reply += "\u001b]" + n + ";?\u001b\\";
+  }
+
+  save() { this.saved = { x: this.x, y: this.y, attr: this.attr }; }
+
+  restore() {
+    if (!this.saved) return;
+    this.x = Math.min(this.saved.x, this.cols - 1);
+    this.y = Math.min(this.saved.y, this.rows - 1);
+    this.attr = this.saved.attr;
+    this.wrap = false;
+  }
+
+  /* ----------------------------------------------------------------- SGR */
+  sgr() {
+    const raw = this.params === "" ? ["0"] : this.params.split(";");
+    const codes = raw.map((c) => (c === "" ? 0 : +c));
+    let a = parseAttr(this.attr);
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i];
+      if (c === 0) a = { b: 0, dim: 0, i: 0, u: 0, inv: 0, strike: 0, fg: "", bg: "" };
+      else if (c === 1) a.b = 1;
+      else if (c === 2) a.dim = 1;
+      else if (c === 3) a.i = 1;
+      else if (c === 4) a.u = 1;
+      else if (c === 5 || c === 6) a.blink = 1;
+      else if (c === 7) a.inv = 1;
+      else if (c === 8) a.strike = 1;
+      else if (c === 22) { a.b = 0; a.dim = 0; }
+      else if (c === 23) a.i = 0;
+      else if (c === 24) a.u = 0;
+      else if (c === 25) a.blink = 0;
+      else if (c === 27) a.inv = 0;
+      else if (c === 28) a.strike = 0;
+      else if (c === 39) a.fg = "";
+      else if (c === 49) a.bg = "";
+      else if (c === 38 || c === 48) {
+        const key = c === 38 ? "fg" : "bg";
+        const mode = codes[i + 1];
+        if (mode === 5 && codes.length > i + 2) {
+          const n = codes[i + 2];
+          /* 0..15 are the colours the page already themes, so they go through
+             the same classes the rest of the console uses — a program asking
+             for red gets gruvbox red, not the xterm default. */
+          a[key] = n < 16 ? "c" + (n < 8 ? 30 + n : 90 + n - 8) : "p" + n;
+          i += 2;
+        } else if (mode === 2 && codes.length > i + 4) {
+          const [r, g, b] = [codes[i + 2], codes[i + 3], codes[i + 4]];
+          a[key] = "#" + [r, g, b].map((x) => (x & 255).toString(16).padStart(2, "0")).join("");
+          i += 4;
+        }
+      } else if (c >= 30 && c <= 37) a.fg = "c" + c;
+      else if (c >= 40 && c <= 47) a.bg = "c" + (c + 10);
+      else if (c >= 90 && c <= 97) a.fg = "c" + c;
+      else if (c >= 100 && c <= 107) a.bg = "c" + c;
+    }
+    this.attr = attrKey(a);
+  }
+
+  /* -------------------------------------------------------------- render */
+
+  /* The screen as HTML: one line per row inside a `pre`, cells grouped into a
+     span per run of equal attributes, the cursor drawn as a block over the
+     glyph it sits on. Escaped, so shell output can never be markup. */
+  render() {
+    let out = "";
+    for (let r = 0; r < this.lines.length; r++) {
+      if (r) out += "\n";
+      const ln = this.lines[r];
+      let c = 0;
+      while (c < this.cols) {
+        const here = r === this.y && c === this.x && this.visible;
+        const a = ln.at[c];
+        let j = c;
+        const text = [];
+        /* One run: equal attributes, and the cursor's cell always stands alone
+           so its block can be drawn over exactly one glyph. */
+        while (j < this.cols && ln.at[j] === a) {
+          const atCursor = r === this.y && j === this.x && this.visible;
+          if (atCursor !== here) break;
+          text.push(ln.ch[j]);
+          j++;
+          if (here) break;
+        }
+        const body = esc(text.join(""));
+        const cls = classesFor(a, here);
+        const style = styleFor(a);
+        if (body === "" && !cls && !style) { /* nothing to draw */ }
+        else if (cls || style) {
+          out += "<span" + (cls ? ' class="' + cls + '"' : "") +
+                 (style ? ' style="' + style + '"' : "") + ">" + body + "</span>";
+        } else out += body;
+        c = j;
+      }
+    }
+    return out;
+  }
+
+  /* Plain text, for a test or for copying the pane. */
+  text() {
+    return this.lines.map((ln) => ln.ch.join("").replace(/\s+$/, "")).join("\n").replace(/\n+$/, "");
+  }
+}
+
+function parseAttr(key) {
+  const a = { b: 0, dim: 0, i: 0, u: 0, inv: 0, strike: 0, blink: 0, fg: "", bg: "" };
+  if (!key) return a;
+  for (const t of key.split(" ")) {
+    if (t === "b") a.b = 1; else if (t === "d") a.dim = 1;
+    else if (t === "i") a.i = 1; else if (t === "u") a.u = 1;
+    else if (t === "v") a.inv = 1; else if (t === "s") a.strike = 1;
+    else if (t === "k") a.blink = 1;
+    else if (t.startsWith("f")) a.fg = t.slice(1);
+    else if (t.startsWith("g")) a.bg = t.slice(1);
+  }
+  return a;
+}
+
+/* A stable key for one set of attributes, so equal attributes compare equal and
+   the renderer can group runs. */
+function attrKey(a) {
+  const bits = [];
+  if (a.b) bits.push("b");
+  if (a.dim) bits.push("d");
+  if (a.i) bits.push("i");
+  if (a.u) bits.push("u");
+  if (a.inv) bits.push("v");
+  if (a.strike) bits.push("s");
+  if (a.blink) bits.push("k");
+  if (a.fg) bits.push("f" + a.fg);
+  if (a.bg) bits.push("g" + a.bg);
+  return bits.join(" ");
+}
+
+/* Classes for the attributes, from the page's own palette; `pN` is a 256-colour
+   index the page has no class for, and `styleFor` turns it into a colour. */
+function classesFor(attr, cursor) {
+  const a = parseAttr(attr);
+  const cls = [];
+  if (a.b) cls.push("c1");
+  if (a.i) cls.push("ti");
+  if (a.u) cls.push("tu");
+  if (a.strike) cls.push("ts");
+  if (a.inv || cursor) cls.push("tv");
+  if (a.fg && a.fg.startsWith("c")) cls.push(a.fg);
+  if (a.bg && a.bg.startsWith("c")) cls.push("b" + a.bg);
+  return cls.join(" ");
+}
+
+function styleFor(attr) {
+  const a = parseAttr(attr);
+  const out = [];
+  const colour = (v, prop) => {
+    if (!v || v.startsWith("c")) return;
+    if (v.startsWith("p")) { const h = xterm256(+v.slice(1)); if (h) out.push(prop + ":" + h); return; }
+    if (v.startsWith("#")) out.push(prop + ":" + v);
+  };
+  if (a.fg) colour(a.fg, "color");
+  if (a.bg) colour(a.bg, "background-color");
+  if (a.dim) out.push("opacity:.6");
+  return out.join(";");
+}
+
+
+/* ------------------------------------------------------------- terminals
+   A terminal tab is a PTY on the server with an interactive shell in it, and
+   this is the window onto it. Bytes travel both ways over the console's own
+   websocket: shell output arrives as binary frames (output is arbitrary bytes
+   and a JSON string is UTF-8-only), and everything else — open, keystrokes,
+   resize, close — is JSON like the rest of the protocol. See
+   [`crate::web::term`] for the other end.
+
+   Three things make this more than a text box:
+
+   * the *screen*, because PTY output is cursor movement and erase, not lines
+     (`TermScreen` above);
+   * the *size*, because a terminal has to tell the shell how big it is before
+     `vim` wraps a line wrong — measured from the pane's own pixels, in the
+     font's own cell width, so the grid and the CSS cannot disagree;
+   * the *answers*, because a program that asks the terminal a question (where
+     is the cursor, what colours do you use, do you support this mode) waits
+     for a reply. `TermScreen` collects those and `termFlush` sends them back. */
+
+/* A tab's shell, by the id the server gave it: one websocket carries every
+   terminal tab, and a binary output frame names the shell it belongs to. */
+const termTabs = new Map();
+
+/* Longest paste accepted in one message, matching the server's cap. A paste
+   bigger than this is sent in pieces rather than refused. */
+const TERM_MAX_WRITE = 64 * 1024;
+
+/* How often the pane is looked at for a size change. ResizeObserver does the
+   real work where the browser has it; this is the fallback for one that does
+   not, and the interval is deliberately slow because it is a layout read. */
+const TERM_FIT_POLL = 400;
+
+/* Everything a pane needs that is not the shell: its screen, its size as last
+   told to the shell, and the handles to let go of when the tab closes. Called
+   from `makeTab`, so a tab is wired before anything can happen to it. */
+function wireTerm(t) {
+  const out = t.el.querySelector(".term-out");
+  const ta = t.el.querySelector(".term-input");
+  const me = t.term = {
+    session: null,        /* the server's id, until `term_open` answers */
+    screen: new TermScreen(80, 24),
+    cols: 0, rows: 0,     /* what the shell was last told */
+    dead: false,
+    pending: "",          /* bytes owed to the shell (a query reply) */
+    queue: "",            /* bytes for the shell, waiting on its id */
+    grid: t.el.querySelector(".term-grid"),
+    size: t.el.querySelector(".term-size"),
+    input: ta,
+    dirty: false,
+  };
+  /* The textarea is what has focus — a browser only starts an IME composition,
+   honours a layout's dead keys, or raises a soft keyboard on a phone when there
+   is a text field to type into, and the pane it belongs to is what gets clicked.
+   It sits beside the pane rather than inside it because an element inside a
+   scrolling container has the pane's scroll yanked to it when focused. */
+  ta.addEventListener("keydown", (e) => termKey(t, e));
+  ta.addEventListener("compositionstart", () => { termComposing = true; });
+  ta.addEventListener("compositionend", () => { termComposing = false; });
+  ta.addEventListener("input", (e) => termInput(t, e));
+  ta.addEventListener("paste", (e) => termPaste(t, e));
+  ta.addEventListener("copy", (e) => termCopy(t, e));
+  ta.addEventListener("blur", () => { termComposing = false; });
+  out.addEventListener("mousedown", (e) => {
+    /* A middle-click paste of the X selection arrives as a `paste` event on
+       Firefox and as nothing at all on Chrome; keeping the input focused is
+       the part that is always in our hands. */
+    if (!e.shiftKey) { e.preventDefault(); ta.focus(); }
+  });
+  /* Every click in the pane means "I am typing into this shell now". */
+  t.el.addEventListener("focusin", () => { if (!t.term.dead) ta.focus(); });
+  t.el.querySelector(".new").addEventListener("click", () => termOpen(t.path));
+  t.el.querySelector(".kill").addEventListener("click", () => termKill(t));
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => termFit(t));
+    ro.observe(out);
+    t.term.ro = ro;
+  } else {
+    t.term.timer = setInterval(() => termFit(t), TERM_FIT_POLL);
+  }
+}
+
+/* Open a shell, in the working directory or in the folder asked for (a terminal
+   opened from a folder in the file tree). */
+function termOpen(path) {
+  const t = makeTab("terminal", "term", path || null);
+  select(t.id);
+  termStart(t);
+  return t;
+}
+
+/* Another shell in a tab whose shell has exited: the same tab, the same pane,
+   the scrollback kept (what the last command printed is still worth reading),
+   and a screen cleared by the new shell's own prompt rather than by this page
+   deciding what to erase. */
+function termRestart(t) {
+  const me = t.term;
+  if (!me || !me.dead) return;
+  me.dead = false;
+  me.session = null;
+  me.queue = "";
+  me.pending = "";
+  t.tab.classList.remove("dead");
+  if (me.note) { me.note.remove(); me.note = null; }
+  termStart(t);
+}
+
+async function termStart(t) {
+  const me = t.term;
+  try {
+    const m = await rpc({ type: "term_open", path: t.path || "" });
+    if (!m.ok) { termDead(t, m.error || "cannot start a shell"); return; }
+    me.session = m.session;
+    termTabs.set(m.session, t);
+    /* Whatever the shell asked for before it had a name, sent now. */
+    if (me.queue) { const q = me.queue; me.queue = ""; termSend(t, q); }
+    t.path = m.dir;
+    t.el.querySelector(".dir").textContent = m.dir || "";
+    t.el.querySelector(".dir").title = m.dir || "";
+    t.el.querySelector(".shell").textContent = m.shell || "";
+    t.tab.querySelector(".name").textContent = "sh:" + shortDir(m.dir);
+    termDraw(t);
+    termFit(t, true);
+    const out = t.el.querySelector(".term-out");
+    out.focus();
+    /* A shell that is already gone by the time the answer lands (a `$SHELL`
+       that exits immediately) has nothing else to say, so say it here. */
+    if (me.dead) return;
+  } catch (e) {
+    termDead(t, "cannot start a shell: " + (e && e.message ? e.message : e));
+  }
+}
+
+function shortDir(d) {
+  if (!d) return "?";
+  const parts = String(d).replace(/\/+$/, "").split("/");
+  return parts[parts.length - 1] || d;
+}
+
+/* Tell the shell how big its window is, from the pane's own pixels. `force`
+   re-sends the size the shell already has, which is what a tab that was just
+   shown needs: a hidden pane measures 0, and the size sent before then was
+   measured from nothing. */
+function termFit(t, force) {
+  const me = t.term;
+  if (!me || me.dead) return;
+  const out = t.el.querySelector(".term-out");
+  const size = me.size;
+  /* The cell's width and height, measured in the pane's own font: 80 of one
+     glyph (a long word, so no kerning or line-break rules interfere) and 8
+     lines of the same leading. `scrollWidth` of a `white-space: pre` span is
+     the exact advance of those 80 glyphs. */
+  size.textContent = "M".repeat(80) + "\n".repeat(8) + "M";
+  const cs = getComputedStyle(out);
+  const w = size.scrollWidth / 80;
+  const h = size.scrollHeight / 9;
+  if (!(w > 0) || !(h > 0)) return;
+  const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  /* The scroll bar takes room the grid cannot use, and it is only there once
+     the content overflows — hence clientWidth rather than offsetWidth. */
+  const cols = Math.max(20, Math.floor((out.clientWidth - padX) / w));
+  const rows = Math.max(4, Math.floor((out.clientHeight - padY) / h));
+  if (cols === me.cols && rows === me.rows && !force) return;
+  me.cols = cols; me.rows = rows;
+  me.screen.resize(cols, rows);
+  termDraw(t);
+  if (!me.session) return;
+  rpc({ type: "term_resize", session: me.session, cols, rows })
+    .catch(() => {});        /* a shell that went in the meantime is reported by term_exit */
+}
+
+/* Queue bytes for the shell. */
+function termFeed(t, bytes) {
+  const me = t.term;
+  me.pending += bytes;
+  if (!me.flush) me.flush = setTimeout(() => termFlush(t), 0);
+}
+
+/* Send what the screen collected. A query answer goes as one `term_in` like any
+   other input, because to the pty it is exactly that: the bytes a terminal
+   would have put back on the wire. */
+function termFlush(t) {
+  const me = t.term;
+  me.flush = null;
+  if (!me.pending) return;
+  const data = me.pending;
+  me.pending = "";
+  if (me.dead || !me.session) return;
+  termSend(t, data);
+}
+
+/* Bytes for the shell.
+
+   A program that queries the terminal does it in its first microseconds, which
+   can be before the `term_open` reply that carries the shell's id has landed.
+   Those bytes are queued rather than dropped, and flushed by `termStart`: a
+   page that threw the question away would leave the program waiting for an
+   answer only this page can give. */
+const TERM_QUEUE_MAX = 256 * 1024;
+
+function termSend(t, str) {
+  const me = t.term;
+  if (!me || me.dead) return;
+  if (!me.session) {
+    if (me.queue.length < TERM_QUEUE_MAX) me.queue += str;
+    return;                       /* termStart flushes it when the id arrives */
+  }
+  const bytes = new TextEncoder().encode(str);
+  /* A paste longer than one message is sent in pieces, in order, rather than
+     refused: the shell reads a stream and cannot tell the difference. */
+  for (let i = 0; i < bytes.length; i += TERM_MAX_WRITE) {
+    const part = bytes.subarray(i, Math.min(bytes.length, i + TERM_MAX_WRITE));
+    let bin = "";
+    for (let j = 0; j < part.length; j++) bin += String.fromCharCode(part[j]);
+    rpc({ type: "term_in", session: me.session, data: btoa(bin) }).catch(() => {});
+  }
+}
+
+/* Keystrokes. The rule is what a terminal emulator does: a printable character
+   is sent as UTF-8 text and everything else is a control byte or an escape
+   sequence, with the *modifier* deciding which — because Alt-2 is a character
+   on some layouts and Meta-2 is a tab everywhere, and `e.key` knows the
+   difference in a way `e.keyCode` never did. */
+function termKey(t, e) {
+  const me = t.term;
+  if (me.dead) {
+    /* Enter in a pane whose shell has exited starts another one, the way
+       pressing Return at a closed terminal window does. */
+    if (e.key === "Enter") { e.preventDefault(); termRestart(t); }
+    return;
+  }
+  /* The page's own Alt-<n> tab switch wins over the shell wanting Alt-1. */
+  if (e.altKey && (e.ctrlKey || e.metaKey)) return;
+  if (e.altKey && !e.ctrlKey && !e.metaKey && /^[0-9]$/.test(e.key)) return;
+  if (e.key === "Tab") { e.preventDefault(); termSend(t, "\t"); termDone(t); return; }
+  if (e.key === "Enter") {
+    /* The IME guard is not decoration: with Thai input, Enter commits a
+       composition, and sending a CR then would run a half-typed command. */
+    if (e.isComposing || termComposing) { e.preventDefault(); return; }
+    e.preventDefault();
+    termSend(t, e.ctrlKey || e.altKey ? "\x1b\r" : "\r");
+    termDone(t);
+    return;
+  }
+  if (e.key === "Backspace") { e.preventDefault(); termSend(t, "\x7f"); termDone(t); return; }
+  if (e.key === "Escape") { e.preventDefault(); termSend(t, "\x1b"); termDone(t); return; }
+  /* The names are the DOM's (`ArrowUp`, not `Up`) — a map keyed by what the
+     escape sequence wants, not by what the browser calls the key, is a map
+     that silently sends nothing for every arrow. */
+  const arrow = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D",
+                  Home: "H", End: "F", PageUp: "5~", PageDown: "6~",
+                  Insert: "2~", Delete: "3~" }[e.key];
+  if (arrow) {
+    e.preventDefault();
+    termSend(t, termCsi(arrow, e, me.screen.decckm));
+    termDone(t);
+    return;
+  }
+  if (e.key === "F1" || e.key === "F2" || e.key === "F3" || e.key === "F4") {
+    e.preventDefault();
+    const app = me.screen.decckm ? "\x1bO" : "\x1b[";
+    termSend(t, app + "PQRS"[+e.key[1] - 1]);
+    termDone(t);
+    return;
+  }
+  /* A selection and Ctrl-C means copy, which is what the pane's `copy` handler
+     does; with no selection the same keys are the shell's interrupt. */
+  if (e.ctrlKey && (e.key === "c" || e.key === "C") && String(window.getSelection())) {
+    return;
+  }
+  if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+    /* Ctrl-C, Ctrl-D, Ctrl-R and the rest are control bytes: the same thing the
+       terminal sends, so the line discipline turns Ctrl-C into SIGINT for the
+       foreground group exactly as it does at a real terminal. */
+    const c = e.key.toUpperCase().charCodeAt(0);
+    if (c >= 64 && c <= 95) {
+      e.preventDefault();
+      termSend(t, String.fromCharCode(c === 63 ? 127 : c & 0x1f));
+      termDone(t);
+      return;
+    }
+  }
+  if (e.ctrlKey || e.metaKey) return;      /* the browser's (Ctrl-R reload and friends) */
+  if (e.key.length > 1) return;            /* a named key with no mapping */
+  if (e.altKey) {
+    /* Alt plus a character is escape-then-character, the convention every
+       terminal uses and what `M-x` means in an editor that has one. AltGr —
+       Ctrl-Alt on the layouts that need it for real characters — is excluded
+       above, so this cannot eat the character AltGr is there to produce. */
+    e.preventDefault();
+    termSend(t, "\x1b" + e.key);
+    termDone(t);
+    return;
+  }
+  /* Printable keys are not sent from keydown at all: the field's own `input`
+     event carries exactly the same character, and it is the one event that
+     also fires for a dead key or a composed one. Sending here as well would
+     type every ordinary letter twice. */
+  /* Nothing else is preventDefault()ed, so the field keeps collecting what the
+     layout produced and `input` sends it. */
+}
+
+function termCsi(code, e, decckm) {
+  /* xterm's modifier encoding: Shift 2, Alt 4, Ctrl 8, plus one. It is what
+     makes Shift-Right a selection and Ctrl-Right a word jump in programs that
+     ask for it, and harmless in the ones that do not. */
+  const mod = 1 + (e.shiftKey ? 1 : 0) + (e.altKey ? 4 : 0) + (e.ctrlKey ? 8 : 0);
+  if (code.endsWith("~")) {
+    /* PageUp/PageDown/Insert/Delete: `CSI n ~`, with the modifier as the second
+       parameter. */
+    return mod === 1 ? "\x1b[" + code : "\x1b[" + code.slice(0, -1) + ";" + mod + "~";
+  }
+  /* Arrows and Home/End: `ESC O` in application cursor keys (DECCKM, which
+     `vim` and `less` switch on and expect the keys to follow) and `ESC [`
+     otherwise. A cursor key that ignores DECCKM is a `vim` whose arrow keys
+     leave it in normal mode. */
+  const csi = decckm ? "\x1bO" : "\x1b[";
+  return mod === 1 ? csi + code : "\x1b[1;" + mod + code;
+}
+
+/* Whether an IME is composing right now, across the whole page: only one
+   surface can hold a composition at a time, and a tab that lost focus has lost
+   it with it. */
+let termComposing = false;
+
+/* What the invisible field collected. On a normal keystroke this is the
+   character the layout produced (identical to what `keydown` sends, so it is
+   thrown away); on an IME composition or a dead key it is the only place the
+   committed string appears — a Thai word chosen from a candidate list arrives
+   here and nowhere else. */
+function termInput(t, e) {
+  const me = t.term;
+  const added = String(e.data || me.input.value || "");
+  me.input.value = "";
+  if (me.dead || !added) return;
+  termComposing = false;
+  termSend(t, added);
+  termDone(t);
+}
+
+function termDone(t) {
+  const out = t.el.querySelector(".term-out");
+  out.scrollTop = out.scrollHeight;         /* typing always shows what you typed */
+}
+
+function termPaste(t, e) {
+  const text = (e.clipboardData || window.clipboardData).getData("text");
+  if (!text) return;
+  e.preventDefault();
+  const me = t.term;
+  if (me.dead) return;
+  /* Bracketed paste is a promise the shell asked for: the pasted text arrives
+     between the markers so a shell can decide not to run it the way it would
+     run typed keys. Without the mode, the text is typed as-is. */
+  termSend(t, me.screen.bracketed ? "\x1b[200~" + text + "\x1b[201~" : text);
+  termDone(t);
+}
+
+function termCopy(t, e) {
+  const sel = String(window.getSelection());
+  if (!sel) return;
+  e.preventDefault();
+  e.clipboardData.setData("text/plain", sel);
+}
+
+/* Ctrl-C belongs to the shell while the pane has focus, and to nothing while it
+   does not. The copy case is the one that has to keep working, and it does: a
+   selection means the user is not typing, and the pane's own keydown never
+   sees Ctrl-C (it is not a printable key and the handler returns early on
+   ctrlKey for anything but a control byte). */
+function termKill(t) {
+  const me = t.term;
+  if (!me || !me.session) return;
+  rpc({ type: "term_close", session: me.session }).catch(() => {});
+}
+
+/* The tab is going: the shell goes with it, now rather than at the server's
+   next poll of a connection that is still open because other tabs are using it. */
+function termClose(t) {
+  const me = t.term;
+  if (!me) return;
+  if (me.ro) me.ro.disconnect();
+  if (me.timer) clearInterval(me.timer);
+  if (me.flush) clearTimeout(me.flush);
+  if (me.note) { me.note.remove(); me.note = null; }
+  if (me.session) {
+    termTabs.delete(me.session);
+    rpc({ type: "term_close", session: me.session }).catch(() => {});
+  }
+}
+
+/* The shell is gone. The tab stays — it is the record that there *was* a shell
+   there, and the pane still shows what it was showing when it went. */
+function termDead(t, why) {
+  const me = t.term;
+  if (me.dead) return;
+  me.dead = true;
+  if (me.session) termTabs.delete(me.session);
+  me.session = null;
+  t.tab.classList.add("dead");
+  const head = t.el.querySelector(".term-head");
+  head.querySelector(".shell").textContent = "";
+  const note = document.createElement("span");
+  note.className = "gone";
+  note.textContent = (why || "shell exited") + " — Enter for another";
+  head.querySelector(".spacer").after(note);
+  me.note = note;
+  /* Keystrokes belong to nobody now, so the pane stops looking like a target. */
+  if (me.input) me.input.blur();
+  termDraw(t);
+}
+
+/* One output frame: `[ id length ][ session id ][ output ]`. A frame whose
+   length byte lies, or that names a tab that has closed, is dropped — there is
+   nothing to answer it with, and a shell that outlived its tab is reported by
+   the server rather than by this page. */
+function termFrame(buf) {
+  const all = new Uint8Array(buf);
+  if (!all.length) return;
+  const n = all[0];
+  if (n + 1 > all.length) return;
+  let id = "";
+  for (let i = 1; i <= n; i++) id += String.fromCharCode(all[i]);
+  const t = termTabs.get(id);
+  if (!t) return;
+  termOutput(t, all.subarray(1 + n));
+}
+
+/* Shell output. */
+function termOutput(t, bytes) {
+  const me = t.term;
+  if (me.dead) return;
+  let text = "";
+  try { text = new TextDecoder("utf-8", { fatal: false }).decode(bytes); }
+  catch { text = ""; }
+  me.screen.write(text);
+  const back = me.screen.takeOutput();
+  if (back) termFeed(t, back);
+  termDraw(t);
+  const out = t.el.querySelector(".term-out");
+  /* Follow the output only when already at the bottom, so a `cat` of a long
+     file does not drag a scroll-up back down — the same rule the console uses. */
+  if (out.scrollTop + out.clientHeight >= out.scrollHeight - 30) out.scrollTop = out.scrollHeight;
+}
+
+/* Draw the screen. Coalesced into one frame: a `cat` of a big file arrives in
+   many chunks and repainting per chunk is a layout per chunk for something the
+   browser can only show once per frame anyway.
+
+   The rAF callback re-reads `t.term` rather than closing over its contents, and
+   the grid over `me.grid`, because this runs after the tab may have been
+   closed: painting into a detached node is harmless, but reading a screen the
+   tab no longer has is a TypeError in a callback nobody can see coming. */
+function termDraw(t) {
+  const me = t.term;
+  if (!me || me.dirty) return;
+  me.dirty = true;
+  const grid = me.grid;
+  requestAnimationFrame(() => {
+    const now = t.term;
+    if (now) now.dirty = false;
+    if (grid) grid.innerHTML = t.term ? t.term.screen.render() : "";
+  });
+}
+
 /* ---------------------------------------------------------------- tabs */
 function makeTab(name, kind, path) {
   const id = "t" + (++seq);
   const tab = document.createElement("div");
   tab.className = "tab";
   tab.dataset.id = id;
-  tab.innerHTML = '<span class="name"></span>' + (kind === "file" ? '<span class="x" title="close">&times;</span>' : "");
+  tab.innerHTML = '<span class="dot"></span><span class="name"></span>' +
+    (kind === "console" ? "" : '<span class="x" title="close">&times;</span>');
+  /* The console tab has nothing to signal: it is never closed and its tab has
+     no close button to be a click target, so the dot is dropped there rather
+     than sitting in the strip as decoration that means nothing. */
+  if (kind === "console") tab.querySelector(".dot").remove();
   tab.querySelector(".name").textContent = name;
   const panel = document.createElement("div");
   panel.className = "panel";
@@ -679,7 +1869,18 @@ function makeTab(name, kind, path) {
       '<textarea id="prompt" spellcheck="false" wrap="soft"></textarea>' +
       '<div id="prompt-row">' +
       '<button id="stop" title="cancel the turn in flight, like Ctrl-C in the terminal">Stop</button>' +
+      '<button id="term" title="open a shell in the working directory">Terminal</button>' +
       '<button id="send">Send (Enter)</button></div></div>';
+  } else if (kind === "term") {
+    panel.innerHTML =
+      '<div class="term-head"><span class="dir"></span><span class="shell"></span>' +
+      '<span class="spacer"></span><button class="new">New</button>' +
+      '<button class="kill">Kill</button></div>' +
+      '<div class="term-out"><pre class="term-grid"></pre>' +
+      '<span class="term-size" aria-hidden="true"></span></div>' +
+      '<textarea class="term-input" tabindex="0" spellcheck="false" wrap="off" ' +
+      'autocapitalize="off" autocorrect="off" autocomplete="off" ' +
+      'aria-label="terminal input"></textarea>';
   } else {
     /* A file view keeps its own monospaced face (source is read by its
        columns) and takes only the chosen size — the CSS on .file-out says so,
@@ -695,6 +1896,7 @@ function makeTab(name, kind, path) {
     select(t.id);
   });
   if (kind === "console") wireConsole(panel);
+  else if (kind === "term") wireTerm(t);
   else t.el.querySelector(".file-out").addEventListener("wheel", (e) => {
     /* horizontal scroll with shift, like the terminal panes people expect */
     if (e.shiftKey) { t.el.querySelector(".file-out").scrollLeft += e.deltaY; e.preventDefault(); }
@@ -704,6 +1906,7 @@ function makeTab(name, kind, path) {
 
 function closeTab(t) {
   if (t.kind === "console") return;           /* the console always stays */
+  if (t.kind === "term") termClose(t);        /* the shell goes with the tab */
   const i = tabs.indexOf(t);
   if (i >= 0) tabs.splice(i, 1);
   t.tab.remove();
@@ -720,6 +1923,9 @@ function select(id) {
   }
   const t = byId(id);
   if (t && t.kind === "console") { autoScroll = true; scrollToBottom(); }
+  /* A pane measured while hidden reports 0, so the size of the one just shown
+     is taken now — the window it had until then was a guess. */
+  if (t && t.kind === "term") termFit(t, true);
   treeSelection();
 }
 const byId = (id) => tabs.find((t) => t.id === id) || null;
@@ -796,6 +2002,9 @@ function wireConsole(panel) {
   /* Not `sendStop` itself: as a listener it would be handed the click event as
      its button argument. */
   panel.querySelector("#stop").addEventListener("click", () => sendStop());
+  /* The shell is jonnyq's, not the model's: nothing here goes through a turn,
+     and the tab stays when the console's session ends. */
+  panel.querySelector("#term").addEventListener("click", () => termOpen(null));
   makeResizable(panel);
 }
 
@@ -1298,6 +2507,10 @@ async function requestTree(path) {
 }
 
 function onMessage(ev) {
+  /* Shell output is a binary frame: arbitrary bytes, and a JSON string is
+     UTF-8-only. `[ id length ][ session id ][ output ]`, because one socket
+     carries several tabs and a binary frame has no other way to say which. */
+  if (typeof ev.data !== "string") { termFrame(ev.data); return; }
   let m; try { m = JSON.parse(ev.data); } catch { return; }
   if (m.id && pending.has(m.id)) {
     const p = pending.get(m.id);
@@ -1329,6 +2542,17 @@ function onMessage(ev) {
       wdEl.title = wd;
       break;
     }
+    case "term_exit": {
+      const t = termTabs.get(m.session);
+      if (t) termDead(t, m.code === null || m.code === undefined
+        ? "shell exited" : "shell exited (" + m.code + ")");
+      break;
+    }
+    case "term_reset":
+      /* A new connection: the shells the old one owned are gone with it, so
+         every terminal tab this page has is a pane over nothing. */
+      for (const t of tabs) if (t.kind === "term") termDead(t, "connection lost");
+      break;
     case "notice": popup(m.title || "jonnyq", m.body || ""); break;
     case "ask": onAskMessage(m); break;
     case "ask_close": onAskClose(m); break;
@@ -1351,12 +2575,16 @@ function onMessage(ev) {
 function connect() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(proto + "//" + location.host + "/ws");
+  ws.binaryType = "arraybuffer";      /* so shell output arrives as bytes, not a Blob */
   ws.onopen = () => { $("conn").textContent = "connected"; $("conn").className = "on"; };
   ws.onmessage = onMessage;
   ws.onclose = () => {
     $("conn").textContent = "offline - reconnecting";
     $("conn").className = "off";
     setReady(false, "connection to jonnyq lost");
+    /* The shells died with the socket: a shell nobody can type into is not one
+       worth keeping, so the server took them down. Their tabs say so. */
+    for (const t of tabs) if (t.kind === "term") termDead(t, "connection lost");
     /* Drop the questions this tab will not hear the endings of: the greeting
        of the next connection replays whatever jonnyq is still waiting for, so
        anything answered or withdrawn while we were offline disappears instead
@@ -1391,7 +2619,7 @@ window.addEventListener("keydown", (e) => {
 
 #[cfg(test)]
 mod tests {
-    use super::INDEX_HTML;
+    use super::{INDEX_HTML, PAGE_SCRIPT};
 
     /// The page is served inline, so a broken tag or an unbalanced brace is a
     /// runtime bug nobody sees until the browser is open. These are the cheap
@@ -2309,6 +3537,75 @@ mod tests {
         assert!(
             info.contains("!!m.busy") && info.contains("syncStop()"),
             "the status line re-reads the flag too: {info}"
+        );
+    }
+
+    /// The terminal tab is JS in a string, so Rust cannot test it directly —
+    /// this runs it. `page_harness.js` is the fake DOM, the page's own
+    /// `<script>` spliced in, and the assertions after it; node executes the
+    /// whole thing and prints `N passed, M failed`.
+    ///
+    /// Spliced rather than duplicated, so a test cannot pass while the shipped
+    /// page is broken: the emulator, the key handler, the frame decoder and the
+    /// resize are the ones in [`INDEX_HTML`], in the page's own scope.
+    #[test]
+    fn the_terminal_emulation_and_the_tab_are_tested_through_node() {
+        let harness = include_str!("page_harness.js");
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let joined = harness.replace(PAGE_SCRIPT, script);
+        assert!(!joined.contains(PAGE_SCRIPT), "the harness lost its splice point");
+
+        let dir = crate::testsupport::TempDir::new("page-harness");
+        let js = dir.path().join("harness.js");
+        if let Err(e) = std::fs::write(&js, joined.as_bytes()) {
+            panic!("cannot write the harness: {e}");
+        }
+        let run = std::process::Command::new("node")
+            .arg(&js)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        // Skipped where node is not installed; asserted wherever it is.
+        let Ok(child) = run else {
+            eprintln!("node is not installed, skipping the terminal page tests");
+            return;
+        };
+        let out = match child.wait_with_output() {
+            Ok(o) => o,
+            // The JS itself is checked elsewhere by `node --check`; a harness
+            // that cannot start is the toolchain's problem, not the page's.
+            Err(e) => {
+                eprintln!("cannot run node ({e}), skipping the terminal page tests");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "the terminal page tests failed (exit {:?})\n{}{}\nharness written to {}",
+            out.status.code(),
+            stdout,
+            stderr,
+            js.display()
+        );
+        // A harness that ran nothing is not a pass: the count is checked, not
+        // just the exit status, so a silently-empty suite cannot look green.
+        let counts = stdout
+            .lines()
+            .last()
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(
+            counts >= 60,
+            "the terminal page tests ran only {counts} assertions:\n{stdout}"
         );
     }
 

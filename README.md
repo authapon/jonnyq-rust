@@ -334,6 +334,7 @@ the browser's own sans-serif.
 |---|---|
 | **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **font** and **size** pickers described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
+| **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
 | **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **Stop button** (next to Send) | The browser's Ctrl-C: it cancels the turn in flight and is enabled only while there is one. It presses the same cancellation as Ctrl-C at the terminal, so the model's stream is dropped, a running command's process group is killed and a pending `ask_user` question is withdrawn — and the session survives to take the next prompt, with `[cancelled]` in the transcript. The popup carries its own copy, since a question covers the prompt box |
@@ -372,6 +373,36 @@ working directory failing outright is the one case that does pop up, and it says
 it once per distinct reason rather than once per tick. A hidden tab is not polled,
 and neither is an offline one, so closing the laptop lid costs nothing and a
 reconnect picks the listing back up.
+
+**Terminal tabs.** The **Terminal** button under the prompt box opens a shell in
+the browser, in the session's working directory — a real PTY with a real
+interactive shell behind it, so `git`, `cargo`, `less`, `vim` and tab completion
+all behave as they do at the terminal, colours and cursor movement included. It
+is the same shell you would have had in that folder: it reads your own profile
+and starts in `$SHELL` (falling back to `/bin/sh`), with `TERM=xterm-256color`
+and its own window size.
+
+* **Many at once.** Every tab is its own shell, so `cargo build` in one can run
+  while you read a log in another. `Alt-1`…`Alt-9` switch tabs, and each tab has
+  **New** (another shell) and **Kill**. `Ctrl-C` in a terminal tab interrupts the
+  *shell's* command, not the agent's turn — the console's **Stop** button is the
+  one that cancels a turn.
+* **Where it starts.** In the working directory, and in a subfolder of it on
+  request: `term_open` takes a path, and a path that would climb out of the
+  working directory is refused rather than opened. A shell is never started
+  somewhere the session itself cannot see.
+* **Resizing.** The pane measures itself, so the shell is told how big its window
+  is and a full-screen program redraws rather than wrapping wrong. Shrinking the
+  browser window resizes the shell.
+* **When it ends.** Typing `exit`, or a **Kill**, closes that one shell; the tab
+  says the shell is gone and Enter starts another in the same tab, keeping the
+  scrollback. Closing the browser tab, reloading the page or ending the session
+  closes the shells with it — no orphaned process is left holding the folder.
+* **What runs there is yours.** There is no sandbox: a shell in the browser is a
+  shell on the machine, with the same rights as the one that started jonnyq. The
+  page is served on `127.0.0.1` and the terminal is off unless `-web` is given,
+  so the console port is the trust boundary — do not expose it to a network you
+  do not control.
 
 A prompt typed in the browser goes onto a queue that the REPL's own loop reads,
 which is why the answer appears in *both* windows, and why a browser prompt, a
