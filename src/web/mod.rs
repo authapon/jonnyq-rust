@@ -21,6 +21,13 @@
 //!   conversable at all. The console is one of that tool's three channels
 //!   (terminal, ntfy, browser), raced against each other: see
 //!   [`crate::tools::ask_user`] and [`WebConsole::show_question`].
+//! * **Stop button** — beside the Send button (and again inside the ask
+//!   popup, which covers the prompt box), live whenever a turn is in flight.
+//!   It is the browser's Ctrl-C: it cancels the same [`CancellationToken`] the
+//!   terminal's SIGINT cancels, so the model's stream is dropped, a running
+//!   command's process group is killed and a pending `ask_user` question is
+//!   withdrawn — and the session survives to take the next prompt. See
+//!   [`WebConsole::request_stop`].
 //! * **status line** — the `model | ctx … | mode` string `main` builds from the
 //!   agent ([`StatusFn`]). It tracks a moving value, so it is re-asked on a
 //!   ticker ([`STATUS_INTERVAL`]) as well as at every readiness flip and turn
@@ -100,6 +107,17 @@ pub const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Builds the one-line session description the page shows (`model · ctx …`).
 /// Supplied by `main` because only it can see both the agent and the config.
 pub type StatusFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// Cancels the turn in flight — what the page's **Stop** button is: the
+/// browser's Ctrl-C. Returns whether there was a turn to cancel, so the button
+/// can say "already finished" instead of pretending it stopped something.
+///
+/// Supplied by the REPL ([`crate::repl::Repl::set_web`]) and deliberately *not*
+/// a copy of the cancellation token: the terminal's SIGINT and the browser's
+/// Stop button cancel one and the same token, so a stopped turn behaves
+/// identically whichever way it was stopped (stream dropped, command's process
+/// group killed, `ask_user` withdrawn, `[cancelled]` printed, session alive).
+pub type StopFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// The tail of the transcript log, for seeding the console's replay buffer (see
 /// [`WebConsole::bind`]).
@@ -201,6 +219,10 @@ pub struct WebConsole {
     /// Canonical path of the working directory the tree shows.
     work_dir: String,
     status: StatusFn,
+    /// The REPL's handle on the in-flight turn, for the Stop button. `None`
+    /// until the REPL wires it in ([`WebConsole::set_stop`]) — which is also
+    /// the honest answer to a stop request before the loop has started.
+    stop: RwLock<Option<StopFn>>,
     port: u16,
     /// Bound in [`bind`](Self::bind) — so "port already in use" is reported
     /// before a session starts — and handed to the reactor in
@@ -222,6 +244,11 @@ pub struct WebConsole {
     /// as one flag because the textarea must be enabled only when all hold.
     model_ready: AtomicBool,
     busy: AtomicBool,
+    /// Whether the last `ready` frame the tabs were sent carried the same
+    /// `busy` value (see [`WebConsole::publish_ready`]): the Stop button reads
+    /// that flag rather than inferring it from `ready`, so a change in it alone
+    /// has to earn a frame.
+    published_busy: AtomicBool,
     closing: AtomicBool,
     published: AtomicBool,
     note: RwLock<String>,
@@ -290,6 +317,7 @@ impl WebConsole {
             ui: ui.clone(),
             work_dir: dir,
             status,
+            stop: RwLock::new(None),
             port,
             listener: Mutex::new(Some(std_listener)),
             hub: Mutex::new(Vec::new()),
@@ -299,6 +327,7 @@ impl WebConsole {
             wake: Mutex::new(None),
             model_ready: AtomicBool::new(false),
             busy: AtomicBool::new(false),
+            published_busy: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             published: AtomicBool::new(false),
             note: RwLock::new(String::from("jonnyq is starting")),
@@ -329,6 +358,51 @@ impl WebConsole {
     /// than whenever the person at the keyboard next presses Enter.
     pub fn set_wake(&self, wake: Arc<crate::input::Wake>) {
         *self.wake.lock().unwrap() = Some(wake);
+    }
+
+    /// Receives the REPL's handle on the in-flight turn, which is what the
+    /// page's **Stop** button presses. Wired in by
+    /// [`crate::repl::Repl::set_web`] — the console has no agent and no turn of
+    /// its own, so only the loop can say what "cancel" means here.
+    pub fn set_stop(&self, stop: StopFn) {
+        *self.stop.write().unwrap() = Some(stop);
+    }
+
+    /// Press the page's **Stop** button: cancel the turn in flight, exactly as
+    /// Ctrl-C at the terminal does. Returns whether there was a turn to cancel,
+    /// so a caller (the button, a test) can tell "stopped it" from "it had
+    /// already finished" instead of assuming the press did something.
+    pub fn request_stop(&self) -> bool {
+        match self.stop.read().unwrap().as_ref() {
+            Some(stop) => stop(),
+            // No REPL wired in (a console bound before the loop started, or a
+            // test's console): there is nothing here to cancel.
+            None => false,
+        }
+    }
+
+    /// The `stop` message: press the browser's Ctrl-C.
+    ///
+    /// Cancelling is done *first*, so the answer cannot be raced by a turn that
+    /// finished in the meantime; the `busy` figure is read afterwards, so it
+    /// reports what is left rather than what was there when the button was
+    /// pressed. It is a repeatable request: a turn that ignores the
+    /// cancellation (a tool that does not watch the token) can be stopped at
+    /// again, and the second press is not an error.
+    fn stop_value(&self, id: &str) -> Value {
+        let stopped = self.request_stop();
+        let mut v = json!({
+            "type": "stop", "ok": true,
+            "stopped": stopped,
+            // Still working? A turn that stops on the spot says false, and the
+            // page's button greys itself out with the `ready` frame that
+            // follows; a turn still unwinding says true, so the button stays.
+            "busy": self.busy.load(Ordering::SeqCst),
+        });
+        if !id.is_empty() {
+            v["id"] = json!(id);
+        }
+        v
     }
 
     /// The queue of prompts typed in the browser, handed to the REPL loop
@@ -481,6 +555,12 @@ impl WebConsole {
         self.publish_status();
     }
 
+    /// Whether a turn is in flight — i.e. whether there is anything for the
+    /// page's Stop button to cancel.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// A turn started/finished: the textarea must freeze and thaw with it.
     pub fn set_busy(&self, busy: bool) {
         self.busy.store(busy, Ordering::SeqCst);
@@ -526,14 +606,24 @@ impl WebConsole {
 
     fn publish_ready(&self) {
         let ready = self.ready_now();
-        if self.published.swap(ready, Ordering::SeqCst) == ready {
+        // `busy` travels with it because "not ready" has several reasons and
+        // only one of them has something to stop: the page's Stop button lights
+        // off this flag, not off the textarea being greyed out (which also
+        // covers "no model yet", "connecting" and "offline"). Either half
+        // changing is worth a frame — a session that is already not-ready for
+        // some other reason still has to be told a turn started, or the button
+        // would never light up.
+        let busy = self.busy.load(Ordering::SeqCst);
+        let ready_changed = self.published.swap(ready, Ordering::SeqCst) != ready;
+        let busy_changed = self.published_busy.swap(busy, Ordering::SeqCst) != busy;
+        if !ready_changed && !busy_changed {
             return;
         }
         let note = self.note.read().unwrap().clone();
         let msg = if ready {
-            json!({"type": "ready", "ready": true})
+            json!({"type": "ready", "ready": true, "busy": busy})
         } else {
-            json!({"type": "ready", "ready": false, "note": note})
+            json!({"type": "ready", "ready": false, "busy": busy, "note": note})
         };
         self.send_all(&msg.to_string());
     }
@@ -786,6 +876,9 @@ impl WebConsole {
                     "work_dir": self.work_dir,
                     "clients": self.clients(),
                     "ready": self.ready_now(),
+                    // A turn is in flight — i.e. there is something for the
+                    // page's Stop button (or a `stop` message) to cancel.
+                    "busy": self.busy.load(Ordering::SeqCst),
                     // How many `ask_user` questions are on screen unanswered:
                     // a session blocked on one is the first thing a script or
                     // a human checking in wants to know.
@@ -828,7 +921,16 @@ impl WebConsole {
         let _ = conn.send(&self.info_value(None).to_string());
         let note = self.note.read().unwrap().clone();
         let _ = conn.send(
-            &json!({"type": "ready", "ready": self.ready_now(), "note": json!(note)}).to_string(),
+            &json!({
+                "type": "ready",
+                "ready": self.ready_now(),
+                // The Stop button's own flag: a tab opened while a turn is in
+                // flight must light it, and `ready` alone cannot say which of
+                // the several reasons for not-ready has something to stop.
+                "busy": self.busy.load(Ordering::SeqCst),
+                "note": json!(note),
+            })
+            .to_string(),
         );
         // A tab opened or reloaded while a question is on screen gets it back —
         // otherwise a refresh during a long run would silently lose the
@@ -907,6 +1009,7 @@ impl WebConsole {
                 }
             }
             "prompt" => self.enqueue_prompt(&msg, &id),
+            "stop" => self.stop_value(&id),
             "answer" => {
                 let qid = string_field(&msg, "ask");
                 let text = string_field(&msg, "text");
@@ -940,6 +1043,10 @@ impl WebConsole {
             "status": status,
             "work_dir": self.work_dir,
             "ready": self.ready_now(),
+            // Same flag the `ready` frame carries, so a tab that reloads has
+            // the Stop button's state from the greeting's info as well as from
+            // the ready frame that follows it.
+            "busy": self.busy.load(Ordering::SeqCst),
             "note": *self.note.read().unwrap(),
             "url": self.url(),
             "clients": self.clients(),
@@ -2007,6 +2114,112 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
     /// A ready session must actually hand the prompt to the REPL. The REPL is
     /// not attached in a unit test (it needs an agent), so the queue is checked
     /// directly: accepted means queued, and the drain task is what runs it.
+    /// The **Stop** button over a live socket: one `stop` message presses the
+    /// handle the REPL wired in, the reply says whether it found a turn to
+    /// cancel, and the button's own `busy` flag reaches the tab on the frames
+    /// that carry it (greeting, `ready`, `info`) so it lights and greys itself
+    /// without the page having to guess from the textarea.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_message_cancels_the_turn_in_flight() {
+        let web = console(".");
+        let pressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = pressed.clone();
+        web.set_stop(Arc::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            true
+        }));
+        web.set_waiting(true, "");
+        web.start().unwrap();
+        let port = web.port();
+        let tab = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            use std::io::Write;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            // One press, answered to its id: the greeting's frames are skipped
+            // on the way to it.
+            s.write_all(&client_frame(r#"{"type":"stop","id":"s1"}"#))
+                .unwrap();
+            let mut reply = None;
+            for _ in 0..8 {
+                let f = read_server_frame(&mut s).unwrap();
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("stop") {
+                    reply = Some(v);
+                    break;
+                }
+            }
+            reply.expect("no stop reply")
+        });
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), tab)
+            .await
+            .expect("no stop reply")
+            .unwrap();
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(reply["stopped"], json!(true), "{reply}");
+        assert_eq!(reply["id"], json!("s1"), "the reply answers the press");
+        assert!(
+            pressed.load(Ordering::SeqCst),
+            "the message must reach the REPL's handle"
+        );
+    }
+
+    /// A console with no REPL behind it (bound, but the loop never wired
+    /// itself in) has nothing to cancel, and says so instead of pretending.
+    #[test]
+    fn a_stop_with_no_turn_says_so() {
+        let web = console(".");
+        assert!(!web.request_stop(), "no closure wired in is not a stop");
+        web.set_stop(Arc::new(|| false));
+        assert!(!web.request_stop(), "no turn in flight is not a stop");
+        let v = web.stop_value("s1");
+        assert_eq!(v["stopped"], json!(false), "{v}");
+        assert_eq!(v["busy"], json!(false), "{v}");
+    }
+
+    /// A turn beginning while a tab is open has to light the Stop button —
+    /// including when the session was *already* not-ready for another reason
+    /// (no model yet), which is the case a `ready`-only comparison misses: the
+    /// flag moved but `ready` did not, so a page driven off `ready` alone would
+    /// never learn there is now something to cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_beginning_lights_stop_even_when_already_not_ready() {
+        let web = console(".");
+        // Deliberately no set_waiting: `ready` is false the whole time.
+        web.start().unwrap();
+        let port = web.port();
+        let frames = tokio::task::spawn_blocking(move || {
+            let mut s = connect_to(port);
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
+            // The greeting's ready frame, then the one the turn beginning must
+            // produce.
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                let f = read_server_frame(&mut s).unwrap();
+                let v: Value = serde_json::from_str(&f).unwrap();
+                if v["type"] == json!("ready") {
+                    seen.push((v["ready"].clone(), v["busy"].clone()));
+                }
+            }
+            seen
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        web.set_busy(true);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), frames)
+            .await
+            .expect("no ready frames")
+            .unwrap();
+        assert_eq!(seen[0], (json!(false), json!(false)), "{seen:?}");
+        assert_eq!(
+            seen[1],
+            (json!(false), json!(true)),
+            "a not-ready session that starts working must say so"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_prompt_is_queued_when_a_model_is_ready() {
         let web = console(".");

@@ -25,6 +25,9 @@
 //!
 //! The prompt textarea is disabled unless the session says it is ready for a
 //! prompt, and is resizable (`resize: vertical` plus a draggable splitter).
+//! Beside it sits **Stop**, enabled exactly while the session says a turn is in
+//! flight; pressing it sends one `stop` message, which cancels the same token
+//! the terminal's Ctrl-C cancels (see [`crate::web::WebConsole::request_stop`]).
 
 pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
@@ -165,11 +168,24 @@ body {
 #prompt:focus { border-color: var(--bg4); }
 #prompt:disabled { color: var(--fg4); background: var(--bg0); cursor: progress; }
 #send {
-  align-self: flex-end; background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
+  background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
   border-radius: 4px; padding: 3px 12px; font: inherit; font-size: 12px; cursor: pointer;
 }
 #send:hover:enabled { border-color: var(--accent); color: var(--accent); }
 #send:disabled { color: var(--fg4); cursor: progress; }
+/* The two buttons under the textarea share a row so Stop sits next to Send
+   rather than stacking a second right-aligned line under it. */
+#prompt-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+/* Stop is the browser's Ctrl-C, so it is drawn as the destructive control it
+   is (gruvbox red) and only ever looks pressable while a turn is in flight:
+   the server's busy flag drives `disabled`, and a disabled one is greyed like
+   the textarea it belongs to, so there is no "why did nothing happen". */
+#stop {
+  background: var(--bg1); color: var(--f0); border: 1px solid var(--f0);
+  border-radius: 4px; padding: 3px 12px; font: inherit; font-size: 12px; cursor: pointer;
+}
+#stop:hover:enabled { background: var(--f0); color: var(--bg0h); }
+#stop:disabled { color: var(--fg4); border-color: var(--bg2); cursor: progress; }
 
 /* --- ANSI colours, one class per SGR code so bold can pick the bright
        variant the way a terminal does --- */
@@ -270,6 +286,19 @@ body {
 }
 #ask-send:hover:enabled { border-color: var(--accent); color: var(--accent); }
 #ask-send:disabled { color: var(--fg4); cursor: progress; border-color: var(--bg2); }
+/* The same Stop, in the row of the popup that covers it. A question is the one
+   thing that leaves a session blocked with the prompt box underneath the mask,
+   so "cancel this turn" has to be reachable from in front of the mask too —
+   otherwise the only way out of an unwanted question is a terminal that a
+   headless session does not have. Cancelling closes the popup from the server
+   (`ask_close`), so this is not a second way to hide a question: the question
+   goes away because nothing is asking it any more. */
+#ask-stop {
+  flex: 0 0 auto; background: var(--bg1); color: var(--f0); border: 1px solid var(--f0);
+  border-radius: 4px; padding: 4px 14px; font: inherit; font-size: 13px; cursor: pointer;
+}
+#ask-stop:hover:enabled { background: var(--f0); color: var(--bg0h); }
+#ask-stop:disabled { color: var(--fg4); border-color: var(--bg2); cursor: progress; }
 </style>
 </head>
 <body>
@@ -306,6 +335,7 @@ body {
     placeholder="Type your answer. Enter sends, Shift-Enter adds a newline."></textarea>
   <div id="ask-row">
     <span id="ask-note"></span>
+    <button id="ask-stop" title="cancel the turn that is asking, like Ctrl-C in the terminal">Stop</button>
     <button id="ask-send">Send answer</button>
   </div>
 </div></div>
@@ -319,6 +349,7 @@ const pending = new Map();     /* id -> resolve, awaiting a response          */
 const tabs = [];               /* {id, name, kind, path, el, tab}             */
 let active = null;             /* tab id                                        */
 let ready = false;             /* the session will accept a prompt              */
+let busy = false;              /* a turn is in flight, so there is something to stop */
 let autoScroll = true;         /* follow the transcript unless scrolled up      */
 let consoleTab = null;
 let treeRefresh = null;        /* the listing in flight, so two are never asked for */
@@ -474,6 +505,11 @@ function renderAsk() {
   ta.value = askDrafts.get(q.id) || "";
   ta.disabled = askBusy;
   $("ask-send").disabled = askBusy;
+  /* The popup's Stop follows the same flag as the prompt box's, and has to be
+     re-synced here: the popup can appear without a ready/info frame ever
+     having been seen (a reload mid-ask, or a question arriving in a tab that
+     was opened while nothing ran). */
+  syncStop();
   if (document.activeElement !== ta) ta.focus();
 }
 
@@ -561,6 +597,12 @@ function wireAsk() {
   });
   ta.addEventListener("input", () => { if (asks[0]) askDrafts.set(asks[0].id, ta.value); });
   $("ask-send").addEventListener("click", sendAsk);
+  /* Stop belongs in this row because the mask covers the prompt box: a session
+     blocked on a question would otherwise be uncancellable from the browser,
+     and in a headless session there is no terminal to press Ctrl-C at. It does
+     not hide or dismiss anything — cancelling ends the turn, and the server's
+     ask_close takes the popup away with the question it was holding. */
+  $("ask-stop").addEventListener("click", (e) => sendStop(e.currentTarget));
   /* Nothing here hides or closes the box, and no key does either. It holds the
      question jonnyq is blocked on, and every way of tucking it away was a way
      of losing the answer field with it: the server's `ask_close` is the only
@@ -635,7 +677,9 @@ function makeTab(name, kind, path) {
       '<div id="prompt-box">' +
       '<div id="prompt-hint"><span class="mode"></span><span id="prompt-note"></span></div>' +
       '<textarea id="prompt" spellcheck="false" wrap="soft"></textarea>' +
-      '<button id="send">Send (Enter)</button></div>';
+      '<div id="prompt-row">' +
+      '<button id="stop" title="cancel the turn in flight, like Ctrl-C in the terminal">Stop</button>' +
+      '<button id="send">Send (Enter)</button></div></div>';
   } else {
     /* A file view keeps its own monospaced face (source is read by its
        columns) and takes only the chosen size — the CSS on .file-out says so,
@@ -749,7 +793,62 @@ function wireConsole(panel) {
     sendPrompt();
   });
   btn.addEventListener("click", sendPrompt);
+  /* Not `sendStop` itself: as a listener it would be handed the click event as
+     its button argument. */
+  panel.querySelector("#stop").addEventListener("click", () => sendStop());
   makeResizable(panel);
+}
+
+/* The browser's Ctrl-C. One request, and the session's own `ready`/`busy`
+   frames do the rest: the console shows `[cancelled]` because a cancelled turn
+   prints it, exactly as it does when the human presses Ctrl-C at the terminal.
+   Nothing here invents a message of its own — the transcript is the only
+   account of what happened, and a browser that claimed "stopped" while the
+   terminal said otherwise would be the page's word against jonnyq's. */
+function sendStop(btn) {
+  if (!busy) return;             /* nothing to cancel; the button is greyed anyway */
+  /* Greyed while the request is in flight, so one click cannot send three
+     cancels; the `ready` frame that a stopping turn produces re-enables it,
+     and a turn that will not be cancelled is told so below. Either Stop button
+     may be the one pressed - the prompt box's or the ask popup's - and both
+     label themselves, because the turn they are cancelling is one turn. */
+  const pressed = btn || (consoleTab && consoleTab.el.querySelector("#stop"));
+  if (pressed) {
+    pressed.disabled = true;
+    pressed.textContent = "stopping\u2026";
+  }
+  rpc({ type: "stop" }).then((m) => {
+    /* The reply carries the server's own figure for whether work is still
+       going: a turn that unwinds cleanly says no, one that is slow to notice
+       says yes, and that is the difference between greying the button out and
+       leaving it pressable, because pressing it again is the right move when
+       the first one did not take. */
+    busy = !!m.busy;
+    /* Say so only when the session really is idle. A press that lands while a
+       turn is still unwinding (its token already cancelled, `busy` not yet
+       dropped) arrived late rather than found nothing, and telling someone who
+       just stopped a turn that there was nothing to stop would be a lie about
+       the thing they just did. */
+    if (!m.stopped && !m.busy) {
+      popup("Nothing to stop", "The turn had already finished. It may have stopped on its own a moment ago - the console shows how it ended.");
+    }
+    restoreStop();
+  }, (e) => {
+    popup("The stop request was not sent", why(e));
+    restoreStop();
+  });
+}
+
+/* Put both Stop buttons back. Restored from `busy` rather than from the `ready`
+   frame that may or may not follow: a turn that never watches its token stays
+   working, and then the only correct next move is to press the button again. */
+function restoreStop() {
+  const t = consoleTab;
+  const btn = t ? t.el.querySelector("#stop") : null;
+  if (btn) btn.textContent = "Stop";
+  const askBtn = $("ask-stop");
+  if (askBtn) askBtn.textContent = "Stop";
+  syncStop();
 }
 
 function sendPrompt() {
@@ -757,7 +856,7 @@ function sendPrompt() {
   const ta = t.el.querySelector("#prompt");
   const text = ta.value;
   if (!text.trim()) return;
-  if (!ready) { popup("jonnyq is busy", "The session is not waiting for a prompt right now - wait for the turn in progress to finish (or press Ctrl-C in the terminal to cancel it)."); return; }
+  if (!ready) { popup("jonnyq is busy", busy ? "A turn is in progress. Stop it with the Stop button (the browser's Ctrl-C), or wait for it to finish." : "The session is not waiting for a prompt right now - wait for the turn in progress to finish (or press Ctrl-C in the terminal to cancel it)."); return; }
   /* The box clears straight away so a second Enter cannot send the same text
      twice, and the answer comes back as an ack (`ok`, or why it was refused).
      A prompt that never reached the socket - the link dropped in the moment
@@ -775,8 +874,13 @@ function sendPrompt() {
   });
 }
 
-function setReady(state, note) {
+function setReady(state, note, busyNow) {
   ready = !!state;
+  /* `busy` comes from the frame's own flag rather than from `!ready`: "not
+     ready" also means no model yet, still connecting, or the link dropped, and
+     none of those has anything to cancel. Absent (a call from boot or the
+     reconnect path, which has no server state to report) means not working. */
+  busy = !!busyNow;
   const t = consoleTab; if (!t) return;
   const ta = t.el.querySelector("#prompt");
   const btn = t.el.querySelector("#send");
@@ -785,9 +889,40 @@ function setReady(state, note) {
   ta.placeholder = ready ? "Type a prompt, or a /command. Enter sends, Shift-Enter adds a newline."
                         : "not ready - jonnyq is working";
   btn.disabled = !ready;
-  noteEl.textContent = note || (ready ? "" : "waiting for the current turn to finish");
-  if (ready) { noteEl.textContent = note || ""; if (document.activeElement !== ta) ta.focus(); }
-  else if (note) noteEl.textContent = note;
+  syncStop();
+  noteEl.textContent = promptNote(note);
+  if (ready && document.activeElement !== ta) ta.focus();
+}
+
+/* The greyed textarea already says it is not for typing; the line under it
+   says what the session is doing instead and - when it is a turn - that the
+   Stop button beside Send will end it. The busy case replaces the server's
+   note rather than appending to it: the note is what the loop said when it
+   last reached its prompt ("jonnyq is waiting for a prompt"), which is exactly
+   the opposite of what is happening while a turn runs. */
+function promptNote(note) {
+  if (busy) return "jonnyq is working - Stop cancels the turn, like Ctrl-C in the terminal";
+  return note || (ready ? "" : "waiting for the current turn to finish");
+}
+
+/* Stop is Send's mirror image: lit exactly while there is a turn to cancel,
+   and never while a stop request is already on its way (sendStop owns that
+   in-flight label, so a frame arriving mid-request must not undo it). Split out
+   so the status frames can re-sync it too — an `info` frame carries `busy`
+   alongside the status line, so a tab that missed a `ready` frame corrects
+   itself on the next tick instead of sitting on a stale button. The popup's
+   copy is driven from the same flag: it is the same turn being cancelled. */
+function syncStop() {
+  const t = consoleTab;
+  const stop = t ? t.el.querySelector("#stop") : null;
+  if (stop && stop.textContent !== "stopping\u2026") {
+    stop.disabled = !busy;
+    stop.title = busy
+      ? "cancel the turn in flight, like Ctrl-C in the terminal"
+      : "nothing is running - this cancels the turn in flight, like Ctrl-C in the terminal";
+  }
+  const askStop = $("ask-stop");
+  if (askStop && askStop.textContent !== "stopping\u2026") askStop.disabled = !busy;
 }
 
 /* Drag the bar above the textarea, or use its own resize handle: both change
@@ -1172,9 +1307,16 @@ function onMessage(ev) {
   }
   switch (m.type) {
     case "console": appendConsole(m.data || ""); break;
-    case "ready": setReady(m.ready, m.note || ""); break;
+    case "ready": setReady(m.ready, m.note || "", m.busy); break;
     case "info": {
       $("status").textContent = m.status || "";
+      /* The status tick carries the same busy flag the ready frames do, so a
+         tab that was not looking when a turn started or ended re-syncs the Stop
+         button here rather than waiting for a state change it has already
+         missed (a reconnect, or a frame dropped by a full queue). */
+      const wasBusy = busy;
+      busy = !!m.busy;
+      if (busy !== wasBusy) syncStop();
       const wd = m.work_dir || "";
       const wdEl = $("wd");
       /* A different working directory is a different tree — the cached
@@ -2054,6 +2196,120 @@ mod tests {
             .expect("the socket's close handler");
         assert!(onclose.contains("asks.length = 0"), "stale questions are dropped: {onclose}");
         assert!(onclose.contains("renderAsk()"), "and the popup is redrawn: {onclose}");
+    }
+
+    /// **Stop** (the browser's Ctrl-C): a button next to Send, live only while
+    /// a turn is in flight, that sends one `stop` message and leaves the
+    /// transcript to say how the turn ended.
+    ///
+    /// The state it lights from is the server's `busy` flag rather than
+    /// `!ready`, because "not ready" has several reasons and only one of them
+    /// has something to cancel — a button driven by the textarea's disabled
+    /// state would offer to stop a session that has no model set, or one whose
+    /// link has dropped.
+    #[test]
+    fn stop_is_the_pages_ctrl_c() {
+        for needle in [
+            "id=\"stop\"",             /* the button itself                 */
+            "sendStop",                /* what pressing it does             */
+            "type: \"stop\"",          /* the message it sends              */
+            "case \"ready\": setReady(m.ready, m.note || \"\", m.busy)",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+        // It sits with Send, and is greyed like it: `disabled` is what keeps a
+        // press from doing nothing at all.
+        let row = INDEX_HTML
+            .split("id=\"prompt-row\"")
+            .nth(1)
+            .and_then(|s| s.split(";").next())
+            .expect("the button row");
+        assert!(
+            row.contains("id=\"stop\"") && row.contains("id=\"send\""),
+            "Stop belongs beside Send: {row}"
+        );
+        assert!(
+            INDEX_HTML.contains("#stop:disabled"),
+            "and it has a greyed-out look"
+        );
+
+        // The same button has to exist inside the ask popup: the mask covers
+        // the prompt box, so a session blocked on a question would otherwise be
+        // uncancellable from the browser — and a headless session has no
+        // terminal to press Ctrl-C at.
+        assert!(
+            INDEX_HTML.contains("id=\"ask-stop\""),
+            "the popup must be able to stop the turn that is asking"
+        );
+        let wire = INDEX_HTML
+            .split("function wireAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("wireAsk");
+        assert!(
+            wire.contains("ask-stop") && wire.contains("sendStop"),
+            "and wired to the same request: {wire}"
+        );
+
+        let stop = INDEX_HTML
+            .split("function sendStop(btn)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("sendStop");
+        assert!(stop.contains("rpc({ type: \"stop\" })"), "it must send: {stop}");
+        // A press with nothing running is refused locally, not sent, so the
+        // button cannot be mistaken for something that just happened to do
+        // nothing.
+        assert!(stop.contains("if (!busy) return"), "idle press is a no-op: {stop}");
+        // A reply saying nothing was stopped says so, rather than going quiet.
+        assert!(
+            stop.contains("Nothing to stop"),
+            "a late press must explain itself: {stop}"
+        );
+    }
+
+    /// The button's lit/greyed state comes from the server's `busy` flag, on
+    /// every frame that carries it — and while a stop request is in flight the
+    /// in-flight label must survive a frame that arrives in between, or the
+    /// button would flicker back to "Stop" while the turn is unwinding.
+    #[test]
+    fn the_stop_button_tracks_the_servers_busy_flag() {
+        let set = INDEX_HTML
+            .split("function setReady(state, note, busyNow)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("setReady");
+        assert!(
+            set.contains("busy = !!busyNow"),
+            "ready frames carry the flag: {set}"
+        );
+        assert!(set.contains("syncStop()"), "and redraw the button: {set}");
+
+        let sync = INDEX_HTML
+            .split("function syncStop()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("syncStop");
+        assert!(
+            sync.contains("stop.disabled = !busy"),
+            "lit exactly while a turn runs: {sync}"
+        );
+        assert!(
+            sync.contains("stopping\\u2026"),
+            "a request in flight keeps its own label: {sync}"
+        );
+
+        // The status tick re-syncs it too, so a tab that missed a `ready` frame
+        // (a reconnect, a dropped frame) is not left on a stale button.
+        let info = INDEX_HTML
+            .split("case \"info\": {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the info handler");
+        assert!(
+            info.contains("!!m.busy") && info.contains("syncStop()"),
+            "the status line re-reads the flag too: {info}"
+        );
     }
 
     /// The script keeps its block comments balanced: `*/` inside one would

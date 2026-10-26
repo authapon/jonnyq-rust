@@ -107,7 +107,12 @@ pub struct Repl {
     /// Ctrl-C's handle on the in-flight turn (Go: `r.cancel` under a mutex);
     /// `None` when no turn is running. Arc'd so the signal task can hold its
     /// own handle without borrowing `self`.
-    turn: Arc<Mutex<Option<CancellationToken>>>,
+    ///
+    /// A plain (`std`) mutex rather than a tokio one because the browser
+    /// console's Stop button presses this from a synchronous closure (see
+    /// [`crate::web::StopFn`]) — and the critical sections below are
+    /// assignments and a clone, never an await.
+    turn: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     watcher: Mutex<Option<Watcher>>,
 
     /// The watcher -> loop trigger channel. The sender is kept here (so
@@ -153,7 +158,7 @@ impl Repl {
             agent,
             ui,
             run_command,
-            turn: Arc::new(Mutex::new(None)),
+            turn: Arc::new(std::sync::Mutex::new(None)),
             watcher: Mutex::new(None),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
@@ -166,9 +171,24 @@ impl Repl {
 
     /// Wires the browser console in ([`crate::web`], `-web <port>`). Gives it
     /// the wake flag so a browser prompt interrupts a parked terminal prompt,
-    /// and takes over announcing readiness to it.
+    /// the Stop handle so its **Stop** button cancels the turn in flight, and
+    /// takes over announcing readiness to it.
     pub async fn set_web(&self, web: Arc<WebConsole>) {
         web.set_wake(self.wake.clone());
+        // The page's Stop button is the browser's Ctrl-C: the same thing the
+        // signal task above does, so a stopped turn looks and behaves the same
+        // whichever keyboard it was stopped from. It reports whether there was
+        // a turn to stop, so the button can admit it arrived too late.
+        let turn = self.turn.clone();
+        web.set_stop(Arc::new(move || {
+            match turn.lock().unwrap().as_ref() {
+                Some(tok) => {
+                    tok.cancel();
+                    true
+                }
+                None => false,
+            }
+        }));
         *self.web.lock().await = Some(web);
     }
 
@@ -229,7 +249,7 @@ impl Repl {
                     if tokio::signal::ctrl_c().await.is_err() {
                         break;
                     }
-                    if let Some(tok) = turn.lock().await.clone() {
+                    if let Some(tok) = turn.lock().unwrap().clone() {
                         tok.cancel();
                     }
                 }
@@ -476,7 +496,7 @@ so it doesn't fire again.",
         Fut: Future<Output = (bool, R<()>)>,
     {
         let token = CancellationToken::new();
-        *self.turn.lock().await = Some(token.clone());
+        *self.turn.lock().unwrap() = Some(token.clone());
         // The browser textarea freezes for the duration of a turn: a second
         // prompt has nowhere to go while one is in flight.
         if let Some(web) = self.web().await {
@@ -486,7 +506,7 @@ so it doesn't fire again.",
         let (exit, err) = f(token.clone()).await;
         let was_cancelled = token.is_cancelled();
 
-        *self.turn.lock().await = None;
+        *self.turn.lock().unwrap() = None;
         token.cancel();
         if let Some(web) = self.web().await {
             web.set_busy(false);
@@ -1328,6 +1348,66 @@ mod tests {
         assert!(echoed.contains("/model other-model"), "prompt was not echoed: {echoed:?}");
         assert_eq!(t.repl.cfg.lock().await.model, "other-model");
         assert!(!t.repl.run_web_prompt("test-model", "   ").await, "blank prompt is dropped");
+    }
+
+    /// The console's **Stop** button is the browser's Ctrl-C, so the handle the
+    /// REPL hands it must be the very token the in-flight turn is running
+    /// under: cancelling through the console has to abort the same stream, the
+    /// same command and the same `ask_user` wait that a SIGINT would, and end
+    /// the turn the same way (`[cancelled]` in the transcript, session alive).
+    #[tokio::test]
+    async fn the_web_stop_handle_cancels_the_turn_in_flight() {
+        let t = new_test_repl().await;
+        let log = crate::testsupport::TestLog::new("repl-stop");
+        let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let web = crate::web::WebConsole::bind(port, ".", ui, Arc::new(String::new)).unwrap();
+        t.repl.set_web(web.clone()).await;
+
+        // Nothing running: the console is told so, because the button must be
+        // able to admit it arrived after the turn had already ended.
+        assert!(!web.request_stop());
+
+        // A turn that does nothing but wait to be cancelled, run through the
+        // loop's own path — the one that publishes the token, freezes the
+        // textarea and reports the outcome.
+        let turn = t.repl.run_cancellable(|cancel| async move {
+            cancel.cancelled().await;
+            (false, Err(AgentError::new("context canceled")))
+        });
+        tokio::pin!(turn);
+        // Drive it until it has published its token and announced itself busy,
+        // i.e. until the state a human pressing Stop would find is in place.
+        for _ in 0..10 {
+            if t.repl.turn.lock().unwrap().is_some() && web.busy() {
+                break;
+            }
+            if futures_util::poll!(turn.as_mut()).is_ready() {
+                break;
+            }
+        }
+        assert!(web.busy(), "the turn should be in flight");
+        let token = t.repl.turn.lock().unwrap().clone().expect("a token");
+
+        let reply = web.request_stop();
+        assert!(reply, "the button must report it stopped the turn");
+        assert!(
+            token.is_cancelled(),
+            "the stop handle must cancel the turn's own token"
+        );
+        // The turn ends exactly as a Ctrl-C'd one does.
+        assert!(!turn.await, "a cancelled turn is not an exit");
+        assert!(
+            t.log_contents().contains("[cancelled]"),
+            "the stop must be reported like Ctrl-C: {:?}",
+            t.log_contents()
+        );
+        // And with the slot cleared, a second press has nothing left to stop.
+        assert!(!web.request_stop());
     }
 
     #[tokio::test]

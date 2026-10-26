@@ -149,7 +149,7 @@ Until a model is set, jonnyq accepts slash commands only:
 
 **Editing keys** — the prompt is a full line editor: arrow keys recall previous commands (saved in `$HOME/.jonnyq_history`, shared across sessions), `Tab` completes slash commands, command arguments and file names, `Ctrl-A/E/W/U` work as in readline, `Ctrl-Z` suspends.
 
-**Ctrl-C cancels the current turn** (agent turn, running command, or a pending `ask_user` question) without quitting. `Ctrl-D` on an empty line, `/exit` or `/bye` quits.
+**Ctrl-C cancels the current turn** (agent turn, running command, or a pending `ask_user` question) without quitting — in the browser console (`-web`) the **Stop** button is the same cancellation. `Ctrl-D` on an empty line, `/exit` or `/bye` quits.
 
 **Example workflow:**
 
@@ -336,6 +336,7 @@ the browser's own sans-serif.
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
+| **Stop button** (next to Send) | The browser's Ctrl-C: it cancels the turn in flight and is enabled only while there is one. It presses the same cancellation as Ctrl-C at the terminal, so the model's stream is dropped, a running command's process group is killed and a pending `ask_user` question is withdrawn — and the session survives to take the next prompt, with `[cancelled]` in the transcript. The popup carries its own copy, since a question covers the prompt box |
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
 | **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
 
@@ -385,6 +386,22 @@ way the terminal showed it.
 keeps running as a browser-only session instead of exiting on EOF — the prompt
 echoes into the console, and `/exit` in a tab ends the session.
 
+**Stopping a turn from the page.** **Stop**, under the prompt box beside Send, is
+the browser's Ctrl-C: it sends one `stop` message and presses the very
+cancellation token the terminal's SIGINT presses, so there is no second, weaker
+kind of cancel — the model's stream is dropped, a `run_command` child has its
+whole process group killed, a pending `ask_user` question is withdrawn, and the
+turn ends the same way with `[cancelled]` in the transcript and the session
+alive for the next prompt. The button is enabled exactly while the session
+reports a turn in flight (not merely while the textarea is greyed out, which also
+covers *no model yet* and *the link dropped*), and that flag travels on the
+`ready`, `info` and `stop` frames as well as on `/health` as `busy`, so a tab that
+reloads or reconnects gets the button right immediately. Pressing it twice is
+fine — a turn that has not noticed the first one can be stopped at again — and a
+press that arrives after the turn had already finished says *Nothing to stop*
+rather than pretending. A turn that ignores the cancellation is not the page's
+problem to explain: the console shows what the turn is still doing.
+
 **Answering `ask_user` from the page.** A question the model asks is shown as a
 popup: the question, an answer field, and **Send answer** (Enter sends,
 Shift-Enter adds a newline). The terminal prints the same question, so you can
@@ -400,18 +417,23 @@ waiting): only the front one covers the screen, the rest are counted, and the
 popup hands itself over as each is answered. Nothing on the page hides or
 dismisses the box — it holds the question jonnyq is blocked on, and the "hide"
 button (and Escape) that used to tuck it away only ever took the answer field
-away with it — so the server's `ask_close` is the only thing that clears it. In a
-headless session the popup is the only channel, so it is also what makes `-web`
-usable without a terminal at all.
+away with it — so the server's `ask_close` is the only thing that clears it. Its
+own **Stop** is not a way of ducking a question: it cancels the turn that is
+asking, and the question goes away because nobody is asking it any more — without
+it, a session blocked on a question could not be stopped from the browser at all,
+since the popup covers the prompt box. In a headless session the popup is the
+only channel, so it is also what makes `-web` usable without a terminal at all.
 
 The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 `Origin`, when a browser sends one) names loopback, so it is a local interface
 and nothing else. `GET /health` reports the session as JSON, including `asks` —
 how many `ask_user` questions are unanswered, i.e. that jonnyq is waiting for a
-human rather than working. It is *not* a
+human rather than working — and `busy`, whether a turn is in flight and so
+whether there is anything for a `stop` message to cancel. It is *not* a
 boundary against something already running as you: any browser tab can read the
 working directory. Changing the model, provider, proxy or ntfy topic stays under
-the keyboard — the page's pickers cover typeface and text size, nothing else.
+the keyboard — the page's controls cover typeface, text size and stopping a turn,
+nothing else.
 
 ## Notifications (ntfy)
 
