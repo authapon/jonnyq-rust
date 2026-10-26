@@ -335,7 +335,7 @@ the browser's own sans-serif.
 | **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **font** and **size** pickers described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
-| **file tabs** | One per opened file; click a tab to switch between the console and any number of files |
+| **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **Stop button** (next to Send) | The browser's Ctrl-C: it cancels the turn in flight and is enabled only while there is one. It presses the same cancellation as Ctrl-C at the terminal, so the model's stream is dropped, a running command's process group is killed and a pending `ask_user` question is withdrawn — and the session survives to take the next prompt, with `[cancelled]` in the transcript. The popup carries its own copy, since a question covers the prompt box |
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
@@ -373,6 +373,35 @@ working directory failing outright is the one case that does pop up, and it says
 it once per distinct reason rather than once per tick. A hidden tab is not polled,
 and neither is an offline one, so closing the laptop lid costs nothing and a
 reconnect picks the listing back up.
+
+**File tabs are syntax-highlighted.** Open a file from the tree and its source
+is drawn in the same gruvbox dark palette as the console: comments dimmed and
+italic, reserved words red, types yellow, strings green, keys and literals
+picked out. The language comes from the file's extension, from its name where an
+extension would not say (`Dockerfile`, `Makefile`, `Cargo.lock`, `.env`), and
+failing both from its `#!` line — so an extensionless script is still read as
+the interpreter it asks for. Rust, TOML, Python, JavaScript, TypeScript, JSON,
+YAML, Markdown, shell, Dockerfile, HTML, CSS, C/C++, Go, Java, Ruby, PHP, Lua,
+Zig, Perl, SQL and INI-style config are covered; anything else is shown plain
+rather than guessed at, because colouring a file by the wrong rules is how you
+come to distrust the right ones.
+
+It is a scanner, not a parser, and it is written into the page rather than
+fetched from a CDN — the same reason the rest of the page has no dependencies:
+the colouring has to be there on a machine with no internet. Three properties it
+never gives up: the text the pane shows is the file's text, token for token and
+in order, so selecting and copying out of a file tab still gives you the file;
+everything is escaped before it is wrapped, so a file containing a `<script>`
+tag is only ever text; and a string or comment ends at its close marker, its
+line, or the end of the file — one apostrophe in a sentence of prose does not
+turn everything under it pink. Inside a Markdown file a fenced code block is
+shown as a block set off from the prose rather than re-read as the language its
+fence names — the fence is part of the document, not a window into another file.
+Files over 400 KB are shown plain: past that a
+file is being searched rather than read, and building a span per token would
+freeze the tab for a second to no purpose. The header of every file tab says
+which language it was read as, so an unhighlighted file never leaves you
+wondering whether the feature is broken.
 
 **Terminal tabs.** The **Terminal** button under the prompt box opens a shell in
 the browser, in the session's working directory — a real PTY with a real

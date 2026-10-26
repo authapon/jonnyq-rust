@@ -451,5 +451,223 @@ rpc = realRpc;
 termClose(tab);
 ok(!termTabs.has("t1"), "closing the tab takes the shell's entry with it");
 
+/* ---- 3. the file view's syntax highlighting ------------------------------ */
+
+/* The one property a highlighter may never break: the pane still holds the
+   file. Every token is a slice of the input, in order, with nothing dropped,
+   added or reordered — so a select-and-copy out of the tab gives you the file,
+   and the colours cannot hide a line from you. Checked by concatenating the
+   tokens back and by stripping the markup off the rendered HTML. */
+const HL_SAMPLES = {
+  rust: "// a comment\nuse std::fmt;\n#[derive(Debug)]\npub struct Thing<T> { n: u32 }\n" +
+        "impl Thing {\n    /// doc /* nested */ still doc\n    pub fn new() -> Self { Self { n: 0x1F_ff } }\n}\n" +
+        "const MAX_LEN: usize = 1_000;\nlet s = \"a \\\"quoted\\\" string\";\n" +
+        "let r = r#\"{\"raw\": \"not closed\"}\"#;\nlet c = 'x';\nmatch x { Some(v) => v, None => 0 }\n",
+  python: "#!/usr/bin/env python3\nimport os\n@decorator\ndef f(a, b=1):\n" +
+          "    \"\"\"doc\n    line two\"\"\"\n    s = 'it\\'s'\n    t = \"don't\"\n" +
+          "    x = 0xff + 1.5e-3\n    return {'k': v} if a else None  # trailing\n",
+  js: ["/* head */", "import { x } from \"./y.js\";", "const re = /a[b/c]d/;",
+       "const t = `tpl ${x + 1} tail`;", "class A extends B { constructor() { super(); } }",
+       "if (a === \"s\") f(1, 2);", ""].join("\n"),
+  json: "{\n  \"name\": \"jonnyq\",\n  \"deps\": { \"a\": 1, \"b\": true },\n  \"list\": [null, 1.5e3]\n}\n",
+  yaml: "# comment\n---\napp:\n  name: \"jonnyq\"\n  on: true\n  ref: &anchor\n  other: *anchor\n...",
+  toml: "[package]\nname = \"jonnyq\"   # trailing\n[profile.release]\nstrip = true\n",
+  sh: "#!/bin/sh\n# a comment\nfor f in *.rs; do\n  grep -n --color=auto \"$PAT\" \"$f\" | head -3\ndone\n" +
+      "if [ -x \"$HOME/bin\" ]; then export PATH=$HOME/bin:$PATH; fi\n",
+  md: ["# Title", "", "some *text* here, don't colour the rest", "", "- one", "- two", "",
+       "> quoted", "", "inline `code` here", "", "[link](http://x.y)", ""].join("\n"),
+  html: "<!DOCTYPE html>\n<html lang=\"en\">\n<head><title>a & b</title></head>\n" +
+        "<body class=\"x\" data-n=3></body>\n</html>\n",
+  css: "/* gruvbox dark */\n:root { --bg0h: #1d2021; --fg: #ebdbb2; }\n" +
+       ".file-out {\n  white-space: pre;\n  font-family: ui-monospace, monospace;\n}\n" +
+       "@media (max-width: 600px) { body { display: none } }\n",
+  c: "#include <stdio.h>\n/* a comment */\nstatic int f(const char *s) { return printf(\"%s\\n\", s); }\n",
+  go: "package main\n\nimport \"fmt\"\n\nfunc main() { // hi\n\tconst s = \"tab\\there\"\n\tfmt.Println(s, 0x10)\n}\n",
+  sql: "-- list\nSELECT a, b FROM t WHERE x = 'lit' AND y IS NOT NULL;\n",
+  ini: "[unit]\nDescription=jonnyq\nExecStart=/usr/bin/jonnyq -web 8080 ; comment\n",
+  env: "# comment\nexport KEY=\"value with spaces\"   # trailing\nOTHER=${KEY:-fallback}\n",
+  docker: "FROM rust:1.83 AS build\nRUN cargo build --release   # comment\n" +
+          "ENV A=1 B=2\nENTRYPOINT [\"jonnyq\"]\n",
+};
+for (const [lang, src] of Object.entries(HL_SAMPLES)) {
+  const toks = hlTok(src, HL_LANG[lang]);
+  eq(toks.map((x) => x[1]).join(""), src, lang + ": the tokens are the file, in order");
+  const html = hlRender(src, HL_LANG[lang]);
+  eq(html.replace(/<\/?span[^>]*>/g, ""), esc(src), lang + ": the pane's text is the file, escaped");
+  ok(!/<[a-zA-Z][^>]*>/.test(html) || !/<[a-zA-Z][^>]*>/.test(esc(src)),
+     lang + ": nothing in the file becomes markup");
+}
+
+/* Which language a file is read as: the name first, then a `#!` line, and
+   otherwise nothing at all — colouring a file by a wrong guess is worse than
+   leaving it plain. */
+eq(hlLangOf("main.rs", ""), "rust", "a .rs file is Rust");
+eq(hlLangOf("Cargo.lock", ""), "yaml", "and Cargo.lock is listed by name");
+eq(hlLangOf("Cargo.toml", ""), "toml", "and .toml by extension");
+eq(hlLangOf(".env", ""), "env", "a dotfile's extension is what follows the dot");
+eq(hlLangOf("Dockerfile", ""), "docker", "a nameless file is known by its name");
+eq(hlLangOf("no_such_ext.abcd", ""), "", "an unknown extension is not guessed at");
+eq(hlLangOf("notes.txt", ""), "", "and a plain text file is knowingly plain");
+eq(hlLangOf("build", "#!/bin/sh\nls\n"), "sh", "a shebang decides for an extensionless file");
+eq(hlLangOf("tool", "#!/usr/bin/env python3\n"), "python", "even through `env`");
+
+/* The roles that carry meaning, as the classes the CSS colours. */
+const hlc = (src, lang, needle) => {
+  const hit = hlTok(src, HL_LANG[lang]).find((x) => x[1] === needle);
+  return hit ? hit[0] : "(none)";
+};
+eq(hlc("// go", "rust", "// go"), "s-com", "a line comment is a comment");
+eq(hlc("/* a /* b */ c */", "rust", "/* a /* b */ c */"), "s-com",
+   "a nested block comment closes at its own close marker");
+eq(hlc('r#"a "b" c"#', "rust", 'r#"a "b" c"#'), "s-str",
+   "a raw string holds the quotes inside it");
+eq(hlc("fn", "rust", "fn"), "s-kw", "a reserved word is a keyword");
+eq(hlc("Gruvbox", "rust", "Gruvbox"), "s-type", "a Capitalised name is a type");
+eq(hlc("MAX_LEN", "rust", "MAX_LEN"), "s-const", "a SCREAMING name is a constant");
+eq(hlc("usize", "rust", "usize"), "s-type", "a lowercase primitive type is a type");
+eq(hlc("println", "rust", "println"), "", "a bare name is nothing special");
+eq(hlc('println!("x")', "rust", "println"), "s-fn",
+   "a bang-call is a call too, which is how Rust's macros are written");
+eq(hlc('  println("x")', "rust", "println"), "s-fn", "a name before a call is a call");
+eq(hlc("0x1F_ff", "rust", "0x1F_ff"), "s-num", "a hex literal is a number");
+eq(hlc('"""doc"""', "python", '"""doc"""'), "s-str", "a triple-quoted string is one string");
+eq(hlc("#!/bin/sh", "sh", "#!/bin/sh"), "s-com", "a shebang is a comment");
+eq(hlc('"unclosed', "python", '"unclosed'), "s-str",
+   "an unterminated string is one token and stops at the line");
+eq(hlc("--force", "sh", "--force"), "s-var", "a long flag");
+eq(hlc("name:", "yaml", "name"), "s-key", "an unquoted YAML key is a key");
+eq(hlc('"name":', "json", '"name"'), "s-key", "a JSON key is a key");
+eq(hlc('"value"', "json", '"value"'), "s-str", "and a JSON value is a string");
+eq(hlc("[package]", "toml", "[package]"), "s-type", "a TOML section header");
+eq(hlc('features = ["regex"]', "toml", '"regex"'), "s-str",
+   "but a bracket mid-line is an array value, not a section header");
+eq(hlc("[package]", "toml", "package"), "(none)",
+   "and the header is one token, not a name that can be mistaken for a key");
+eq(hlc("strip = true", "toml", "strip"), "s-key", "a TOML key");
+eq(hlc('tokio = { version = "1", features = ["rt"] }', "toml", "version"), "s-const",
+   "a key inside an inline table is drawn as a value, as gruvbox draws it");
+eq(hlc('tokio = { version = "1", features = ["rt"] }', "toml", "tokio"), "s-key",
+   "while the key that starts the line stays a key");
+eq(hlc('KEY="v"', "env", "KEY"), "s-key", "an env file's variable name");
+eq(hlc("FROM", "docker", "FROM"), "s-kw", "a Dockerfile instruction");
+eq(hlc("SELECT", "sql", "SELECT"), "s-kw", "SQL keywords, however they are cased");
+eq(hlc("select", "sql", "select"), "s-kw", "in both cases");
+eq(hlc("#1d2021", "css", "#1d2021"), "s-pre", "a CSS hex colour");
+eq(hlc("@media", "css", "@media"), "s-pre", "an at-rule");
+eq(hlc("<html lang=\"en\">", "html", "html"), "s-tag", "a markup tag");
+eq(hlc("<html lang=\"en\">", "html", "lang"), "s-attr", "and its attributes");
+eq(hlc("# Title", "md", "# Title"), "s-kw", "a Markdown heading");
+eq(hlc("> quoted", "md", "> quoted"), "s-com", "a block quote");
+eq(hlc("see the notes (below)", "md", "notes"), "",
+   "a word before a bracket in prose is not a function call");
+
+/* A README's fences are the likeliest thing to fool the scanner: they are long
+   runs of backticks with no closing pair, in a file full of apostrophes. */
+{
+  const md = "text\n\n```rust\nlet s = \"unclosed;\n```\n\nmore text\n";
+  const toks = hlTok(md, HL_LANG.md);
+  const fence = toks.find((x) => x[0] === "s-code");
+  ok(fence !== undefined, "a fenced block is one token");
+  eq(fence[1], "```rust\nlet s = \"unclosed;\n```", "and it runs fence to fence");
+  const after = toks.slice(toks.indexOf(fence) + 1).map((x) => x[1]).join("");
+  eq(after, "\n\nmore text\n", "the text after the closing fence is text again");
+  ok(!toks.some((x) => x[0] === "s-str"), "nothing inside it is mistaken for a string");
+}
+{
+  /* An odd number of fences: the block runs to the end of the file, which is
+     what an unclosed fence is, and does not leave the pane half-coloured. */
+  const md = "a\n```\nx\n```\nb\n```\nc\n";
+  const toks = hlTok(md, HL_LANG.md);
+  const code = toks.filter((x) => x[0] === "s-code").map((x) => x[1]).join("|");
+  eq(code, "```\nx\n```|```\nc\n", "two fences pair and a third takes the rest");
+}
+{
+  /* A fence of three or more, closed by a longer run, and inline spans still
+     work when they are not at the start of a line. */
+  const md = "````\nhas ``` inside\n````\nand `code` here\n";
+  const toks = hlTok(md, HL_LANG.md);
+  eq(toks.find((x) => x[0] === "s-code")[1], "````\nhas ``` inside\n````",
+     "a longer fence closes only on a run at least as long");
+  ok(toks.some((x) => x[0] === "s-str" && x[1] === "`code`"),
+     "and an inline span mid-line is still a span");
+}
+
+/* The bug that makes a naive highlighter untrustworthy: one apostrophe in a
+   sentence of prose must not colour everything under it. */
+ok(!hlTok(HL_SAMPLES.md, HL_LANG.md).some((x) => x[0] === "s-str" && x[1].includes("colour the rest")),
+   "an apostrophe in prose colours nothing");
+eq(hlTok("/* never closed\nmore\ntext", HL_LANG.c).length, 1,
+   "an unclosed block comment runs to the end of the file, which is what it is");
+
+/* A script tag in a file is text, in every language including HTML. */
+ok(!/<script/.test(hlRender("const s = \"<script>alert(1)</script>\";", HL_LANG.js)),
+   "a script tag inside a string is not markup");
+{
+  /* The one property that matters, checked over every language: the pane's HTML
+     may contain no markup except the spans the highlighter emitted, whatever the
+     file contains. A quote, a bracket or a comment marker that could break out
+     of a span would show up here. */
+  const hostile = "a<evil> \"q\" <script>alert(1)</script> `x` 'y' <!-- c --> [[b]] [l](h\"t) \\\" /* o */";
+  for (const name of Object.keys(HL_LANG)) {
+    const h = hlRender(hostile, HL_LANG[name]);
+    const bare = h.replace(/<\/?span(?: class="s-[a-z]+")?>/g, "");
+    ok(!bare.includes("<") && !bare.includes(">"), name + ": only the highlighter's own spans are markup");
+    const back = bare.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    eq(back, hostile, name + ": and the text is the file's");
+  }
+}
+{
+  const h = hlRender("<b>x</b>", HL_LANG.html);
+  ok(h.includes("&lt;") && h.includes("&gt;") && !/<b>/.test(h),
+     "and in HTML mode the tag is escaped before it is wrapped");
+}
+
+/* The pane's own entry point: colour when there is a language and the file is
+   small enough to read, plain text otherwise, and say which happened. */
+function filePanel() {
+  const out = node("pre", "file-out");
+  const head = node("div", "file-head");
+  const panel = node("div", "panel");
+  panel.querySelector = (sel) => (sel === ".file-out" ? out : head);
+  return { panel, out, head };
+}
+{
+  const p = filePanel();
+  const tab = { id: "F1", kind: "file", path: "src/main.rs", el: p.panel, tab: node("div", "tab") };
+  eq(hlPaint(tab, "main.rs", HL_SAMPLES.rust), "rust", "a file view says what it read the file as");
+  ok(p.out.innerHTML.includes("<span class=\"s-com\">"), "and draws the comment in its colour");
+  ok(!p.out.innerHTML.includes('class=""'), "and never wraps nothing in a span");
+  eq(p.out.innerHTML.replace(/<\/?span[^>]*>/g, ""), esc(HL_SAMPLES.rust),
+     "and the pane still holds the file's text");
+
+  const plain = filePanel();
+  const t2 = { id: "F2", kind: "file", path: "notes.txt", el: plain.panel, tab: node("div", "tab") };
+  eq(hlPaint(t2, "notes.txt", "a note, don't you know"), "",
+     "a file with no rules of its own is not coloured");
+  eq(plain.out.textContent, "a note, don't you know", "and is set as text, not as markup");
+
+  /* Past the cap, a file is being searched rather than read, and building a
+     span per token would freeze the tab to no purpose. */
+  const big = filePanel();
+  const t3 = { id: "F3", kind: "file", path: "big.rs", el: big.panel, tab: node("div", "tab") };
+  /* Just over HL_MAX, and compared by length: a failure that prints the
+     string would bury the rest of the run. */
+  const hugeSrc = "let x = 1;\n".repeat(Math.floor(HL_MAX / 10) + 3);
+  ok(hugeSrc.length > HL_MAX, "the sample really is over the cap");
+  eq(hlPaint(t3, "big.rs", hugeSrc), "", "a file over the cap is not highlighted");
+  eq(big.out.textContent.length, hugeSrc.length, "and arrives whole, as text");
+}
+
+/* Highlighting must be a pass over the file, not over itself: no input here
+   makes it spin, and a file the size the server can send is coloured in the
+   time a pane may be blocked for. */
+{
+  const t0 = Date.now();
+  const many = HL_SAMPLES.rust.repeat(2000);
+  hlRender(many, HL_LANG.rust);
+  ok(Date.now() - t0 < 3000, "highlighting " + many.length + " characters took " +
+     (Date.now() - t0) + "ms");
+}
+
 console.log(pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

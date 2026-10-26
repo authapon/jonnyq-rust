@@ -19,7 +19,8 @@
 //!
 //! * centre: a tab strip (always a `console` tab, plus one per opened file)
 //!   over the panel for the selected tab — the console is an ANSI-rendered
-//!   transcript with the prompt textarea under it; a file tab is its text
+//!   transcript with the prompt textarea under it; a file tab is its text,
+//!   syntax-highlighted by the scanner near `openFile` in the same palette
 //! * right: the working directory as a lazily expanded tree; clicking a file
 //!   opens it in a new tab, clicking a non-text file pops up a refusal
 //!
@@ -156,6 +157,32 @@ body {
 .file-head {
   flex: 0 0 auto; padding: 4px 12px; background: var(--bg0);
   border-bottom: 1px solid var(--bg2); color: var(--fg4); font-size: 12px;
+}
+/* --- syntax colours, one class per role, in the same gruvbox dark palette the
+       console's SGR classes are drawn from (gruvbox's own role mapping: comment
+       gray, statement red, type yellow, string green, constant purple,
+       identifier blue, special aqua — in the bright variants, which is what
+       gruvbox uses on a dark background). A file view is source code, so these
+       are not a second theme to keep in step with the first: they are the same
+       seven hues as the ANSI block below, and they reuse its variables. */
+.s-com { color: var(--f12); font-style: italic; }   /* a comment, dimmed and set apart */
+.s-kw { color: var(--f0); }        /* a reserved word, and Markdown's heading marks */
+.s-type { color: var(--f2); }      /* a type, a section header, a SCREAMING config word */
+.s-str { color: #b8bb26; }         /* a string — bright green, as the console's c92 */
+.s-key { color: var(--f6); }       /* the name left of a `:` or an `=` */
+.s-num { color: var(--f4); }       /* a literal */
+.s-const { color: var(--f4); }     /* and a name that reads as one */
+.s-fn { color: var(--f3); }        /* a call */
+.s-var { color: var(--f4); }       /* $VARIABLE, ${...}, a shell flag, a YAML anchor */
+.s-pre { color: var(--f6); }       /* a preprocessor line, an at-rule, a #hex colour */
+.s-tag { color: var(--f6); }       /* a markup tag */
+.s-attr { color: var(--f3); }      /* and its attributes */
+.s-op { color: var(--f7); }        /* the brackets around markup, deliberately quiet */
+/* A fenced code block inside a README: a shade darker than the pane behind it,
+   which is how gruvbox's own `hlsla` renders a code block on bg0. */
+.s-code {
+  color: var(--fg1); background: var(--bg0h);
+  border-radius: 2px; padding: 0;
 }
 /* the console keeps its own scroll position when you tab away and back */
 .console-wrap { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
@@ -2437,6 +2464,642 @@ setInterval(treeTick, TREE_POLL_MS);
    was when you left, so the wait for the next tick is skipped. */
 document.addEventListener("visibilitychange", () => { if (!document.hidden) treeTick(); });
 
+/* ------------------------------------------------------- syntax highlighting
+   A file tab used to show the file's bytes in one flat wash of fg, which is
+   fine until you open a source file and spend a minute working out which of
+   the near-identical lines was the comment. So the page colours source itself,
+   in the same gruvbox dark palette the console is drawn in.
+
+   It is a scanner, not a parser, and it is written here rather than fetched
+   from a CDN for the same reason the rest of the page is written here: the
+   colouring has to work against a local model on a machine with no internet,
+   which is most of the machines jonnyq runs on, and a highlighter that arrives
+   by network request is a highlighter that is sometimes simply absent.
+
+   Three rules it never breaks, because a highlighter that lies is worse than no
+   highlighter at all:
+
+   * The text it draws is the file's text. Every token is a slice of the input,
+     emitted in order with nothing dropped, added or reordered, so selecting
+     and copying out of the pane still gives you the file. The page's node
+     tests check that by stripping the markup back off and comparing.
+   * Everything is escaped before it is wrapped (see `esc`), so a file that
+     contains a tag is still only ever text.
+   * A string ends at its closing quote, at the end of the line, or at the end
+     of the file, whichever comes first, and a comment ends at its close marker
+     or at the end of the file. Never at "whatever the rest of the file looks
+     like" — otherwise one stray apostrophe in a sentence of prose turns every
+     line under it pink. */
+
+/* Past this many characters a file is shown plain. Highlighting is one pass
+   over the text and, after merging runs of one colour, roughly one `<span>` per
+   token; the server will send up to 2 MB, and colouring a file that size would
+   freeze the tab for a second to no purpose. A file that big is being searched,
+   not read. */
+const HL_MAX = 400 * 1000;
+
+/* Extension to language, deliberately by suffix only: the tree already knows
+   the name, and a file called `.env` or `Cargo.lock` is worth knowing. An
+   extension that is not here is drawn unhighlighted rather than guessed at —
+   colouring a file with the wrong rules is how you come to distrust the right
+   ones. The empty values are the "we know what this is and there is nothing to
+   colour" cases, said out loud instead of left as a miss. */
+const HL_EXT = {
+  rs: "rust", toml: "toml",
+  py: "python", pyw: "python", python: "python",
+  js: "js", mjs: "js", cjs: "js", jsx: "js",
+  ts: "ts", tsx: "ts",
+  json: "json", geojson: "json", ndjson: "json",
+  yaml: "yaml", yml: "yaml", lock: "yaml",
+  md: "md", markdown: "md", mdx: "md",
+  sh: "sh", bash: "sh", zsh: "sh", ksh: "sh", fish: "sh",
+  html: "html", htm: "html", xml: "html", xsl: "html", svg: "html",
+  css: "css", scss: "css", sass: "css", less: "css",
+  c: "c", h: "c", cpp: "c", cxx: "c", cc: "c", hpp: "c", hh: "c", ino: "c", m: "c",
+  go: "go", java: "java", kt: "java", kts: "java", scala: "java",
+  rb: "rb", php: "php", lua: "lua", zig: "zig", sql: "sql", pl: "perl",
+  ini: "ini", conf: "ini", cfg: "ini", properties: "ini", env: "env",
+  service: "ini", desktop: "ini", gitconfig: "ini", jsonc: "jsonc",
+  txt: "", log: "", csv: "", tsv: "",
+};
+
+/* Files known by name rather than by suffix, because they have no suffix, or
+   start with a dot and so have no stem to look at. */
+const HL_FILE = {
+  dockerfile: "docker", containerfile: "docker", makefile: "ini",
+  ".gitignore": "ini", ".gitattributes": "ini", ".editorconfig": "ini",
+  ".env": "env", ".env.example": "env", ".stylelintrc": "ini",
+  "cargo.lock": "yaml", "package.json": "json", "go.mod": "ini",
+};
+
+/* A `#!` line is the other evidence worth trusting: an extensionless script is
+   a shell, Python or Perl script, and the first line says which. */
+const HL_SHEBANG = {
+  sh: "sh", bash: "sh", zsh: "sh", ksh: "sh", fish: "sh", ash: "sh", dash: "sh",
+  python: "python", python3: "python", python2: "python",
+  node: "js", ruby: "rb", php: "php", lua: "lua", perl: "perl", awk: "sh",
+};
+
+/* What the pane's header calls a language. */
+const HL_TITLE = {
+  rust: "Rust", toml: "TOML", python: "Python", js: "JavaScript", ts: "TypeScript",
+  json: "JSON", jsonc: "JSON", yaml: "YAML", md: "Markdown", sh: "shell",
+  docker: "Dockerfile", html: "HTML", css: "CSS", c: "C", go: "Go", java: "Java",
+  rb: "Ruby", php: "PHP", lua: "Lua", zig: "Zig", sql: "SQL", perl: "Perl",
+  ini: "INI", env: "env file",
+};
+
+/* The opening of a markup comment, in two pieces: written as one literal, the
+   three characters that switch a browser's inline-script tokenizer into its
+   escaped state are in the page, and while they are balanced here there is no
+   reason to depend on that. */
+const HL_CMARK = "<" + "!--";
+
+/* One entry per language: the comment markers, the quote characters, the
+   reserved words, and a `mode` for the few things a shared scanner cannot know
+   on its own (JSON and YAML keys, HTML tags, Markdown headings, `=`-separated
+   config keys). `upper` means a Capitalised name is a type and a SCREAMING one
+   is a constant — true of every language here except shell, Markdown and
+   config files, where it would colour half the file.
+
+   The keyword lists are reserved words, not the standard library: colouring
+   `Vec` and `HashMap` because they are Capitalised is enough, and a list of
+   every built-in is a list that is permanently out of date. */
+const HL_LANG = {
+  rust: {
+    line: "//", open: "/*", close: "*/", nest: true, q: "\"'", raw: true, upper: true,
+    kw: "as async await break const continue dyn else enum extern false fn for if impl " +
+        "in let match mod move mut pub ref return self Self static struct super trait " +
+        "true type unsafe use where while crate abstract do final macro override " +
+        "typeof unsized virtual yield try",
+    types: "i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 usize isize f32 f64 bool char str",
+  },
+  /* TOML is a config file with three extra literals: `[table]` headers and
+     `key = value`, with `#` comments. */
+  toml: { line: "#", q: "\"'", upper: true, mode: "ini", kw: "true false inf nan" },
+  env: { line: "#", q: "\"'", mode: "eq" },
+  ini: { line: "#;", q: "\"'", mode: "ini", kw: "true false yes no on off null" },
+  python: {
+    line: "#", q: "\"'", triple: ['"""', "'''"], upper: true, pre: "@",
+    kw: "and or not if elif else for while def class return lambda yield try except " +
+        "finally raise with as import from pass break continue global nonlocal assert " +
+        "del in is None True False async await match case",
+  },
+  js: {
+    line: "//", open: "/*", close: "*/", q: "\"'`", upper: true,
+    kw: "var let const function class extends new this typeof instanceof in of if else " +
+        "for while do switch case default break continue return try catch finally throw " +
+        "async await yield delete void static get set super export import from as null " +
+        "undefined true false debugger with",
+  },
+  ts: {
+    line: "//", open: "/*", close: "*/", q: "\"'`", upper: true,
+    kw: "var let const function class extends new this typeof instanceof in of if else " +
+        "for while do switch case default break continue return try catch finally throw " +
+        "async await yield delete void static get set super export import from as null " +
+        "undefined true false debugger with interface type enum implements public " +
+        "private protected readonly namespace declare abstract keyof infer satisfies " +
+        "any string number boolean void unknown never is",
+  },
+  /* C, C++ and everything that borrowed their shape. */
+  c: {
+    line: "//", open: "/*", close: "*/", q: "\"'", upper: true, pre: "#",
+    kw: "auto break case char const continue default do double else enum extern float " +
+        "for goto if inline int long register return short signed sizeof static struct " +
+        "switch typedef union unsigned void volatile while bool true false new delete " +
+        "class public private protected template namespace this using virtual override " +
+        "final try catch throw nullptr",
+    types: "size_t ssize_t int8_t uint8_t int16_t uint16_t int32_t uint32_t int64_t " +
+           "uint64_t size_type string vector map pair bool",
+  },
+  go: {
+    line: "//", open: "/*", close: "*/", q: "\"'`", upper: true,
+    kw: "break case chan const continue default defer else fallthrough for func go goto " +
+        "if import interface map package return select struct switch type var " +
+        "nil true false string int int8 int16 int32 int64 uint float32 float64 byte " +
+        "rune bool error any",   /* its types are reserved words in Go, so listed there */
+  },
+  java: {
+    line: "//", open: "/*", close: "*/", q: "\"'", upper: true,
+    kw: "abstract assert boolean break byte case catch char class const continue default " +
+        "do double else enum extends final finally float for goto if implements import " +
+        "instanceof int interface long native new package private protected public " +
+        "return short static strictfp super switch synchronized this throw throws " +
+        "transient try void volatile while var record sealed null true false",
+  },
+  rb: {
+    line: "#", open: "=begin", close: "=end", q: "\"'", upper: true,
+    kw: "alias and begin break case class def defined do else elsif end ensure false " +
+        "for if in module next nil not or redo rescue retry return self super then true " +
+        "undef unless until when while yield require attr_accessor",
+  },
+  php: {
+    line: "//#", open: "/*", close: "*/", q: "\"'", upper: true,
+    kw: "abstract and array as break callable case catch class clone const continue " +
+        "declare default do echo else elseif empty enddeclare endfor endforeach endif " +
+        "endswitch endwhile extends final finally fn for foreach function global goto " +
+        "if implements include instanceof insteadof interface isset list namespace new " +
+        "or print private protected public require return static switch throw trait try " +
+        "unset use var while xor yield null true false",
+  },
+  lua: {
+    line: "--", open: "--[[", close: "]]", q: "\"'", upper: true,
+    kw: "and break do else elseif end false for function goto if in local nil not or " +
+        "repeat return then until while",
+  },
+  zig: {
+    line: "//", open: "/*", close: "*/", q: "\"'", upper: true,
+    kw: "const var fn return struct enum union switch case if else while for break " +
+        "continue pub use extern export async await try catch defer errdefer orelse " +
+        "and or true false null undefined anytype comptime inline callconv",
+  },
+  perl: {
+    line: "#", q: "\"'", upper: true,
+    kw: "my our local sub if elsif else unless while until for foreach do return " +
+        "use no package require begin end last next redo",
+  },
+  sh: {
+    line: "#", q: "\"'", pre: "$@", upper: false, mode: "sh",
+    kw: "if then else elif fi for while until do done case esac function in return " +
+        "exit break continue select time exec trap set unset shift local readonly " +
+        "declare export source eval getopts",
+  },
+  sql: {
+    line: "--", open: "/*", close: "*/", q: "\"'`", ci: true,
+    kw: "select from where insert into values update delete create table drop alter " +
+        "add column primary key foreign references index view join inner left right " +
+        "full outer on group by having order asc desc limit offset union all distinct " +
+        "as and or not null is in like between exists case when then else end count " +
+        "sum avg min max coalesce cast begin commit rollback transaction grant revoke",
+  },
+  /* JSON has no comments and no keywords worth the name, but the name on the
+     left of a colon is the only structure in the file, so it gets its own
+     colour. `keys` is what lets the scanner tell a name from a value. */
+  json: { q: "\"", keys: true, kw: "true false null" },
+  jsonc: { q: "\"", keys: true, line: "//", open: "/*", close: "*/", kw: "true false null" },
+  yaml: {
+    line: "#", q: "\"'", keys: true, mode: "yaml", kw: "true false null yes no on off",
+  },
+  md: { mode: "md", open: HL_CMARK, close: "-->" },
+  html: { open: HL_CMARK, close: "-->", mode: "html" },
+  css: { line: "", open: "/*", close: "*/", q: "\"'", mode: "css", pre: "@#" },
+  /* A Dockerfile is a config file that shouts: `#` comments and INSTRUCTIONS. */
+  docker: {
+    line: "#", q: "\"'", mode: "ini", ci: true,
+    kw: "FROM RUN CMD COPY ADD ENV EXPOSE ARG LABEL USER WORKDIR ONBUILD STOPSIGNAL " +
+        "HEALTHCHECK MAINTAINER VOLUME ENTRYPOINT",
+  },
+};
+
+/* The scanner's two sticky patterns, at page scope so the state is one that is
+   always set immediately before use — the same discipline as `SGR`. */
+/* Both are written with `{0,}` rather than `*` at the end: a regex literal
+   ending in a star is the two characters that close a block comment, and the
+   page is one long comment-and-string mix where that has bitten before. */
+const HL_WORD_RE = /[A-Za-z_$][A-Za-z0-9_$]{0,}/y;
+const HL_NUM_RE = /[0-9][0-9a-fA-FxXoObBeE._]*(?:[eE][+-]?[0-9][0-9._]*)?[a-zA-Z_]{0,}/y;
+
+/* Is this character part of a word? Tells `r#"..."#` from the `r` at the end of
+   an identifier, and a leading `$` from one inside a name. */
+const HL_WORDY = /[A-Za-z0-9_$]/;
+
+/* Lazily-built sets: the table above keeps the words in the compact form a human
+   can proof-read, and the lookup wants a Set. */
+function hlKw(lang) {
+  if (!lang._kw) lang._kw = new Set((lang.kw || "").split(" "));
+  return lang._kw;
+}
+/* Type names that are not Capitalised — Rust's `u32`, `bool` — and so are
+   invisible to the shape rules. */
+function hlTypes(lang) {
+  if (!lang._types) lang._types = new Set((lang.types || "").split(" "));
+  return lang._types;
+}
+
+/* Which language a file is written in, from its name, and failing that from its
+   `#!` line. `""` means "not one of ours" and the pane stays plain text. */
+function hlLangOf(name, src) {
+  const base = (name || "").toLowerCase();
+  if (HL_FILE[base]) return HL_FILE[base];
+  const dot = base.lastIndexOf(".");
+  /* `.env` has no stem, but the thing after the dot is still its extension. */
+  const ext = dot > 0 ? base.slice(dot + 1) : dot === 0 ? base.slice(1) : "";
+  if (ext && ext in HL_EXT) return HL_EXT[ext];
+  if ((src || "").slice(0, 2) === "#!") {
+    const nl = src.indexOf("\n");
+    const line = src.slice(0, nl < 0 ? Math.min(120, src.length) : nl);
+    for (const w of line.split(/[\s/]+/)) if (HL_SHEBANG[w]) return HL_SHEBANG[w];
+    return "sh";
+  }
+  return "";
+}
+
+/* The one colour a word gets, in the order that matters: a reserved word, then
+   a constant or a type, then anything followed by an argument list — which is
+   how a call is recognised in every language here without a symbol table. */
+function hlWord(src, i, j, lang) {
+  const w = src.slice(i, j);
+  const words = hlKw(lang);
+  if (words.has(w) || (lang.ci && words.has(w.toLowerCase()))) return "s-kw";
+  if (hlTypes(lang).has(w)) return "s-type";
+  if (lang.upper) {
+    /* A constant before a type: `MAX_LEN` is shouting, and the type pattern
+       with its underscore would otherwise claim it. */
+    if (w.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(w)) return "s-const";
+    if (w.length > 1 && /^[A-Z][A-Za-z0-9_]*$/.test(w)) return "s-type";
+  }
+  let k = j;
+  while (k < src.length && (src[k] === " " || src[k] === "\t")) k++;
+  /* A call — or, with the bang, a macro call, which is how `println!` and
+     `format!` are written and would otherwise be the only plain word on a
+     line that is otherwise all colour. No language here uses `identifier!(`
+     for anything else.
+
+     Not in prose or config: "see the notes (below)" is not a call, and neither
+     is `Description=jonnyq (web)`, and a colour that appears for no reason is
+     the kind that makes the rest of the file untrustworthy. */
+  const prose = lang.mode === "md" || lang.mode === "ini" || lang.mode === "eq";
+  if (!prose && (src[k] === "(" || (src[k] === "!" && src[k + 1] === "("))) return "s-fn";
+  return "";
+}
+
+/* The first non-space character at or after `j`. */
+const HL_NEXT = (src, j) => {
+  while (j < src.length && (src[j] === " " || src[j] === "\t")) j++;
+  return src[j] || "";
+};
+
+/* Is `i` at the start of a line, ignoring indentation? Bounded by the indent, so
+   it never walks the file. */
+function hlAtBol(src, i) {
+  let p = i - 1;
+  while (p >= 0 && (src[p] === " " || src[p] === "\t")) p--;
+  return p < 0 || src[p] === "\n";
+}
+
+/* How many unclosed `{` precede `i` on its line. TOML writes an inline table as
+   `features = { version = "1" }`, and gruvbox draws those nested keys dimmer
+   than the ones that start a line. The walk stops at the line start or after
+   HL_INLINE_LOOKBACK characters — whichever comes first, so a file that is one
+   enormous line cannot make the scan quadratic the way an unbounded one would. */
+const HL_INLINE_LOOKBACK = 200;
+
+function hlInlineDepth(src, i) {
+  let p = i, depth = 0, seen = 0;
+  while (p > 0 && seen++ < HL_INLINE_LOOKBACK) {
+    p--;
+    const c = src[p];
+    if (c === "\n") break;
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+  }
+  return depth;
+}
+
+/* Tokenise one file into `[class, text]` pairs whose texts concatenate back into
+   the source. Comments and strings are matched by their markers; everything
+   else is words, numbers and punctuation. */
+function hlTok(src, lang) {
+  const line = lang.line || "", open = lang.open || "", close = lang.close || "";
+  const q = lang.q || "", triple = lang.triple || [], n = src.length;
+  const keys = !!lang.keys;
+  const toks = [];
+  let i = 0, done = 0;
+
+  /* Emit one token, taking the plain text in front of it with it so the slices
+     stay contiguous — which is what makes the pane's selection the file. */
+  const emit = (cls, from, to) => {
+    if (to <= from) return;
+    if (from > done) toks.push(["", src.slice(done, from)]);
+    toks.push([cls, src.slice(from, to)]);
+    done = to;
+  };
+
+  while (i < n) {
+    const c = src[i];
+
+    /* A block comment, nested where the language nests them (Rust, C, JS),
+       because a doc comment containing an example of itself is a thing. */
+    if (open && c === open[0] && src.startsWith(open, i)) {
+      const at = i;
+      let j = i + open.length, depth = 1;
+      while (j < n && depth > 0) {
+        if (lang.nest && src.startsWith(open, j)) { depth++; j += open.length; continue; }
+        if (src.startsWith(close, j)) { depth--; j += close.length; continue; }
+        j++;
+      }
+      j = Math.min(j, n);
+      emit("s-com", at, j);
+      i = j;
+      continue;
+    }
+
+    /* A line comment runs to the end of the line and never further. */
+    if (line && line.indexOf(c) >= 0 && src.startsWith(line, i)) {
+      let e = src.indexOf("\n", i);
+      if (e < 0) e = n;
+      emit("s-com", i, e);
+      i = e;
+      continue;
+    }
+
+    /* Markup, in the one mode that has it: the tag name, its attributes and the
+       quoted values, and nothing else about it. */
+    if (lang.mode === "html" && c === "<" && /[A-Za-z!/]/.test(src[i + 1] || "")) {
+      let j = i + 1;
+      emit("s-op", i, j);
+      /* A closing tag's slash and a declaration's bang belong to the marker. */
+      if (src[j] === "/" || src[j] === "!") j++;
+      const tagAt = j;
+      while (j < n && /[A-Za-z0-9:_-]/.test(src[j])) j++;
+      if (j > tagAt) emit("s-tag", tagAt, j);
+      while (j < n && src[j] !== ">") {
+        const d = src[j];
+        if (d === '"' || d === "'") {
+          let k = j + 1;
+          while (k < n && src[k] !== d && src[k] !== "\n") k++;
+          emit("s-str", j, Math.min(k + 1, n));
+          j = Math.min(k + 1, n);
+          continue;
+        }
+        if (HL_WORDY.test(d)) {
+          const k0 = j;
+          while (j < n && /[A-Za-z0-9:_-]/.test(src[j])) j++;
+          emit("s-attr", k0, j);
+          continue;
+        }
+        j++;
+      }
+      if (j < n) { emit("s-op", j, j + 1); j++; }
+      i = j;
+      continue;
+    }
+
+    /* A triple-quoted string is the one multi-line string any of these
+       languages has, so it is tried before the single quote it starts with. */
+    if (triple.length) {
+      const t = triple.find((s) => src.startsWith(s, i));
+      if (t) {
+        const at = i;
+        let k = src.indexOf(t, i + t.length);
+        if (k < 0) k = n - t.length;
+        const to = Math.max(Math.min(k + t.length, n), at);
+        emit("s-str", at, to);
+        i = to;
+        continue;
+      }
+    }
+
+    /* Rust's raw strings: `r"..."`, and the hashed forms with any number of
+       hashes. Without the hash count, a raw string containing a quote — every
+       JSON example ever pasted into a Rust test — ends early and takes the rest
+       of the line with it. */
+    if (lang.raw && c === "r" && !HL_WORDY.test(src[i - 1] || "")) {
+      let j = i + 1, h = 0;
+      while (src[j] === "#") { h++; j++; }
+      if (src[j] === '"') {
+        const end = '"' + "#".repeat(h);
+        let k = j + 1;
+        while (k < n && !src.startsWith(end, k)) k++;
+        const to = Math.min(k + end.length, n);
+        emit("s-str", i, to);
+        i = to;
+        continue;
+      }
+    }
+
+    /* An ordinary string: same quote in, backslash escapes, out at the line
+       end. `keys` is what turns a JSON or YAML name into something other than
+       its values. */
+    if (q.indexOf(c) >= 0) {
+      let j = i + 1;
+      while (j < n) {
+        const d = src[j];
+        if (d === "\\" && j + 1 < n) { j += 2; continue; }
+        if (d === c) { j++; break; }
+        if (d === "\n") break;
+        j++;
+      }
+      emit(keys && HL_NEXT(src, j) === ":" ? "s-key" : "s-str", i, j);
+      i = j;
+      continue;
+    }
+
+    /* The line-anchored rules: Markdown's headings, list bullets and block
+       quotes. */
+    if (lang.mode === "md" && hlAtBol(src, i) && (c === "#" || c === ">")) {
+      let e = src.indexOf("\n", i);
+      if (e < 0) e = n;
+      emit(c === "#" ? "s-kw" : "s-com", i, e);
+      i = e;
+      continue;
+    }
+    if (lang.mode === "md" && (c === "-" || c === "*" || c === "+") &&
+        /[ \t]/.test(src[i + 1] || "") && hlAtBol(src, i)) {
+      emit("s-kw", i, i + 1);
+      i++;
+      continue;
+    }
+    /* A Markdown fenced code block: three or more backticks at the start of a
+       line, closed by a line of the same or a longer run. Matched as a block
+       because the inline rule below cannot tell a fence from a span — without
+       this, a README with two triple backticks and an odd number of threes
+       colours everything under it green. */
+    if (lang.mode === "md" && c === "`" && hlAtBol(src, i)) {
+      let run = 0;
+      while (src[i + run] === "`") run++;
+      if (run >= 3) {
+        const lineEnd = (j) => { const e = src.indexOf("\n", j); return e < 0 ? n : e; };
+        let j = lineEnd(i);
+        while (j < n) {
+          const start = j + 1;
+          if (start >= n) { j = n; break; }
+          let k = start;
+          while (k < n && (src[k] === " " || src[k] === "\t")) k++;
+          let r = 0;
+          while (k + r < n && src[k + r] === "`") r++;
+          if (r >= run) {
+            /* A closing fence: backticks and nothing else on its line. */
+            let e = k + r;
+            while (e < n && (src[e] === " " || src[e] === "\t")) e++;
+            if (e >= n || src[e] === "\n") { j = e; break; }
+          }
+          j = lineEnd(start);
+        }
+        emit("s-code", i, Math.min(j, n));
+        i = Math.min(j, n);
+        continue;
+      }
+    }
+    if (lang.mode === "md" && c === "`") {
+      let k = src.indexOf("`", i + 1);
+      const nl = src.indexOf("\n", i);
+      if (k < 0 || (nl >= 0 && k > nl)) k = nl < 0 ? n - 1 : nl - 1;
+      emit("s-str", i, Math.min(k + 1, n));
+      i = Math.min(k + 1, n);
+      continue;
+    }
+
+    /* A config file: `[section]` headers and the `key` left of an `=`, which is
+       all the structure the format has. */
+    if ((lang.mode === "ini" || lang.mode === "eq") && (c === "[" || HL_WORDY.test(c))) {
+      if (c === "[") {
+        /* A section header sits alone at the start of its line; a bracket that
+           opens mid-line is an array or inline-table *value* — TOML's
+           `features = ["regex"]` — and belongs to the string rules below. */
+        const e = hlAtBol(src, i) ? src.indexOf("]", i) : -1;
+        const lim = src.indexOf("\n", i);
+        if (e >= 0 && (lim < 0 || e < lim)) { emit("s-type", i, e + 1); i = e + 1; continue; }
+        i++;                                    /* not a section header after all */
+        continue;
+      }
+      const k0 = i;
+      while (i < n && (HL_WORDY.test(src[i]) || src[i] === "." || src[i] === "-")) i++;
+      const eq = HL_NEXT(src, i) === "=";
+      emit(eq ? (hlInlineDepth(src, k0) ? "s-const" : "s-key") : hlWord(src, k0, i, lang), k0, i);
+      continue;
+    }
+
+    /* `$VAR`, `${VAR}` and `@decorator`; in CSS the same rule takes `#hex`. */
+    if (lang.pre && lang.pre.indexOf(c) >= 0) {
+      let j = i + 1;
+      if (src[j] === "{") {
+        const e = src.indexOf("}", j), lim = src.indexOf("\n", i);
+        if (e >= 0 && (lim < 0 || e < lim)) { emit("s-var", i, e + 1); i = e + 1; continue; }
+      }
+      while (j < n && (HL_WORDY.test(src[j]) || (c === "@" && src[j] === ".") ||
+             (c === "#" && lang.mode === "css" && /[0-9a-fA-F]/.test(src[j])))) j++;
+      if (j > i + 1) {
+        emit(lang.mode === "css" ? "s-pre" : "s-var", i, j);
+        i = j;
+        continue;
+      }
+    }
+
+    /* YAML's document markers and anchors. */
+    if (lang.mode === "yaml" && hlAtBol(src, i) &&
+        (src.startsWith("---", i) || src.startsWith("...", i))) {
+      emit("s-pre", i, i + 3);
+      i += 3;
+      continue;
+    }
+    if (lang.mode === "yaml" && (c === "&" || c === "*") && !HL_WORDY.test(src[i - 1] || "")) {
+      let j = i + 1;
+      while (j < n && HL_WORDY.test(src[j])) j++;
+      if (j > i + 1) { emit("s-pre", i, j); i = j; continue; }
+    }
+
+    /* A shell flag: `-x`, `--force`. */
+    if (lang.mode === "sh" && c === "-" && /[A-Za-z-]/.test(src[i + 1] || "") &&
+        !HL_WORDY.test(src[i - 1] || "")) {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9-]/.test(src[j])) j++;
+      emit("s-var", i, j);
+      i = j;
+      continue;
+    }
+
+    /* A number, with its radix, its separators and its unit: `0x1f`, `1_000`,
+       `1.5e-3`, `14pt`. */
+    if (c >= "0" && c <= "9") {
+      HL_NUM_RE.lastIndex = i;
+      const m = HL_NUM_RE.exec(src);
+      if (m) { emit("s-num", i, i + m[0].length); i += m[0].length; continue; }
+    }
+
+    /* A word. An unquoted YAML key is the one word whose colour the generic
+       rule cannot know, so it is decided here, where the colon is visible. */
+    if (/[A-Za-z_$]/.test(c)) {
+      HL_WORD_RE.lastIndex = i;
+      const m = HL_WORD_RE.exec(src);
+      if (m) {
+        const j = i + m[0].length;
+        let cls = hlWord(src, i, j, lang);
+        if (!cls && keys && lang.mode === "yaml" && hlAtBol(src, i) &&
+            HL_NEXT(src, j) === ":") cls = "s-key";
+        emit(cls, i, j);
+        i = j;
+        continue;
+      }
+    }
+    i++;
+  }
+  if (done < n) toks.push(["", src.slice(done)]);
+  return toks;
+}
+
+/* Tokens to HTML. Runs of one colour are merged first, which on prose is the
+   difference between ten thousand spans and a few hundred, and the reason the
+   cap can be as high as it is. */
+function hlRender(src, lang) {
+  const toks = hlTok(src, lang);
+  let out = "", cls = null, text = "";
+  for (const [c, t] of toks) {
+    if (!t) continue;
+    if (c !== cls) { out += hlSpan(cls, text); cls = c; text = t; } else text += t;
+  }
+  return out + hlSpan(cls, text);
+}
+function hlSpan(cls, text) {
+  const body = esc(text);
+  if (!body) return "";
+  return cls ? '<span class="' + cls + '">' + body + "</span>" : body;
+}
+
+/* The pane's own job: pick the language, colour the file if it is small enough
+   to be worth colouring, and hand back the language so the header can say what
+   the pane is showing (`""` when it stayed plain text). */
+function hlPaint(t, name, content) {
+  const out = t.el.querySelector(".file-out");
+  const lang = hlLangOf(name, content);
+  if (!lang || !HL_LANG[lang] || content.length > HL_MAX) {
+    out.textContent = content;
+    return "";
+  }
+  out.innerHTML = hlRender(content, HL_LANG[lang]);
+  return lang;
+}
+
 /* Opening a file: one request; the server decides whether it is text. A
    binary/image/PDF answer comes back as an error and is shown in the popup,
    which is what the feature asks for ("cannot be viewed"). */
@@ -2449,9 +3112,13 @@ async function openFile(path, name) {
   if (t) { select(t.id); return; }
   t = makeTab(name, "file", path);
   const head = t.el.querySelector(".file-head");
+  const content = res.content || "";
+  /* Colour it first, then label it: the header says which language it was read
+     as, so "no colours here" is never a mystery. */
+  const lang = hlPaint(t, name, content);
   head.textContent = path + "  \u00B7  " + (res.size || 0) + " bytes" +
-    (res.truncated ? "  \u00B7  truncated" : "") + (res.lines ? "  \u00B7  " + res.lines + " lines" : "");
-  t.el.querySelector(".file-out").textContent = res.content || "";
+    (res.truncated ? "  \u00B7  truncated" : "") + (res.lines ? "  \u00B7  " + res.lines + " lines" : "") +
+    (lang ? "  \u00B7  " + (HL_TITLE[lang] || lang) : "");
   select(t.id);
 }
 
@@ -3548,6 +4215,133 @@ mod tests {
     /// Spliced rather than duplicated, so a test cannot pass while the shipped
     /// page is broken: the emulator, the key handler, the frame decoder and the
     /// resize are the ones in [`INDEX_HTML`], in the page's own scope.
+    /// A file tab is coloured by the page now, and the two ways that can be
+    /// quietly wrong are both invisible to the JS: a token class with no CSS
+    /// rule draws in default colour and looks like a file with no colours at
+    /// all, and a language named by the extension table but missing from the
+    /// language table would throw the moment such a file was opened.
+    #[test]
+    fn every_syntax_class_has_a_colour_and_every_language_a_definition() {
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+
+        /* The classes the scanner can emit: every `emit("s-…"` and the class
+           strings the role helpers hand back. */
+        let classes = regex::Regex::new(r#""(s-[a-z]+)""#).expect("regex");
+        let mut seen: Vec<String> = classes
+            .captures_iter(script)
+            .map(|m| m[1].to_string())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.sort();
+        seen.dedup();
+        assert!(seen.len() >= 8, "the scanner emits {seen:?}");
+        for cls in &seen {
+            let rule = format!(".{cls} {{");
+            assert!(
+                css.contains(&rule),
+                "the scanner emits {cls} but the CSS has no `{rule}` rule, so it \
+                 would draw in the file view's default colour"
+            );
+        }
+
+        /* The languages the extension and shebang tables can name. */
+        let names = regex::Regex::new(r#": "([a-z]+)""#).expect("regex");
+        let table = |head: &str| -> String {
+            script
+                .split(head)
+                .nth(1)
+                .and_then(|s| s.split("};").next())
+                .unwrap_or("")
+                .to_string()
+        };
+        let mut langs: Vec<String> = Vec::new();
+        for head in ["const HL_EXT = {", "const HL_FILE = {", "const HL_SHEBANG = {"] {
+            let body = table(head);
+            assert!(!body.is_empty(), "missing {head}");
+            for m in names.captures_iter(&body) {
+                langs.push(m[1].to_string());
+            }
+        }
+        langs.sort();
+        langs.dedup();
+        /* The empty ones are the deliberate "nothing to colour" entries. */
+        let defined = table("const HL_LANG = {");
+        for lang in &langs {
+            let rule = format!("{lang}: {{");
+            assert!(
+                defined.contains(&rule),
+                "a file can be detected as {lang} but HL_LANG has no entry for it"
+            );
+        }
+        /* And the header's friendly name exists for every defined language, so
+           the pane never says `undefined`. */
+        let titles = table("const HL_TITLE = {");
+        for m in regex::Regex::new(r"(?m)^  ([a-z]+): \{")
+            .expect("regex")
+            .captures_iter(&defined)
+        {
+            assert!(
+                titles.contains(&format!("{}:", &m[1])),
+                "HL_TITLE does not know the language {}",
+                &m[1]
+            );
+        }
+    }
+
+    /// The file view must never be *told* to show markup: the content goes
+    /// through `esc` on its way in, whatever the language. Pinned here as well
+    /// as in the JS because this is the one place the feature could regress into
+    /// an injection in the page.
+    #[test]
+    fn a_file_view_is_escaped_on_its_way_in() {
+        let script = INDEX_HTML
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("a script block");
+        let render = script
+            .split("function hlRender(src, lang)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("hlRender");
+        assert!(render.contains("hlSpan("), "it goes through the wrapper");
+        let span = script
+            .split("function hlSpan(cls, text) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("hlSpan");
+        assert!(
+            span.contains("esc(text)"),
+            "every token is escaped before it is wrapped: {span}"
+        );
+        assert!(
+            !span.contains("innerHTML"),
+            "the wrapper builds a string; the pane is written once, by hlPaint"
+        );
+        /* And the plain-text path is textContent, so a file the page will not
+           colour is still never markup. */
+        let paint = script
+            .split("function hlPaint(t, name, content) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("hlPaint");
+        assert!(paint.contains("out.textContent = content"), "{paint}");
+        assert!(
+            paint.contains("content.length > HL_MAX"),
+            "and a file too big to be worth colouring is capped rather than frozen: {paint}"
+        );
+    }
+
     #[test]
     fn the_terminal_emulation_and_the_tab_are_tested_through_node() {
         let harness = include_str!("page_harness.js");
