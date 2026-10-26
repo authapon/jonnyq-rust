@@ -45,12 +45,19 @@ pub const PAGE_SCRIPT: &str = "@@PAGE_SCRIPT@@";
 /// drive it with frames that came off a real pty.
 pub const PAGE_HARNESS: &str = include_str!("page_harness.js");
 
-pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
+/// The console page, with the version spliced into the tab title, the top bar's
+/// brand and the terminal emulator's XTVERSION answer — all from
+/// `CARGO_PKG_VERSION`, i.e. the `Cargo.toml` the binary was built from, so the
+/// page can never advertise a build other than the one serving it.
+pub const INDEX_HTML: &str = concat!(
+    r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>jonnyq console</title>
+<title>jonnyq console v"##,
+    env!("CARGO_PKG_VERSION"),
+    r##"</title>
 <!-- The typefaces, from Google Fonts: the nine Thai prose faces the console and
      the prompt box are drawn in, and the eighteen monospaced faces the terminal
      panes and the file views are drawn in. One request for both, because the
@@ -104,6 +111,15 @@ body {
   flex: 0 0 auto;
 }
 #top b { color: var(--accent); letter-spacing: .04em; }
+/* The version of the build serving the page, in the brand itself rather than
+   somewhere the reader has to know to look: it is the first thing worth knowing
+   about a console, and it is written in from Cargo.toml when the page is built,
+   so it can never name a different build from the one answering. It sits inside
+   the brand's `<b>` and overrides the accent colour, the letter-spacing and the
+   bold that rule gives its children — a version number is a footnote to the
+   name, not the name — and it is short enough that the status line, which is
+   the bar's flexible element, never has to give up room for it. */
+#top b #ver { color: var(--fg4); font-weight: normal; letter-spacing: 0; font-size: 11px; }
 /* The status line is the session's live ctx figure, so it gets the space a
    long model name cannot take from it: it shrinks and ellipsises instead of
    pushing the type controls and the connection light out of the bar. */
@@ -496,7 +512,9 @@ body {
 </head>
 <body>
 <div id="top">
-  <b>jonnyq</b>
+  <b>jonnyq<span id="ver" title="the build serving this page"> v"##,
+    env!("CARGO_PKG_VERSION"),
+    r##"</span></b>
   <span id="status">connecting&hellip;</span>
   <span id="type">
     <label for="font">text</label>
@@ -1452,7 +1470,9 @@ class TermScreen {
     if (priv === ">") {
       if (final === "c") { this.reply += "\u001b[>1;1985;0c"; return; }   /* secondary DA */
       if (final === "q") {                    /* XTVERSION: who am I */
-        this.reply += "\u001bP>|jonnyq console\u001b\\";
+        this.reply += "\u001bP>|jonnyq console v"##,
+    env!("CARGO_PKG_VERSION"),
+    r##"\u001b\\";
         return;
       }
       return;
@@ -3826,7 +3846,8 @@ window.addEventListener("keydown", (e) => {
 </script>
 </body>
 </html>
-"##;
+"##
+);
 
 #[cfg(test)]
 mod tests {
@@ -3842,6 +3863,53 @@ mod tests {
         for tag in ["<style>", "</style>", "<script>", "</script>", "/ws"] {
             assert!(INDEX_HTML.contains(tag), "missing {tag}");
         }
+    }
+
+    /// The version is on the page in three places — the tab title, the top bar's
+    /// brand and the terminal emulator's XTVERSION answer — and it is the build
+    /// that is serving them, because all three are written by `concat!` from
+    /// `CARGO_PKG_VERSION`. A page that advertised another version would send
+    /// someone off to read the docs of a release they do not have.
+    #[test]
+    fn the_page_names_the_build_it_was_served_by() {
+        let want = env!("CARGO_PKG_VERSION");
+        assert!(
+            INDEX_HTML.contains(&format!("<title>jonnyq console v{want}</title>")),
+            "the tab title must carry the version"
+        );
+        let bar = INDEX_HTML
+            .split("<div id=\"top\">")
+            .nth(1)
+            .and_then(|s| s.split("</b>").next())
+            .expect("the top bar's brand");
+        assert!(
+            bar.contains("jonnyq") && bar.contains("id=\"ver\"") && bar.contains(want),
+            "the brand shows the version of the build: {bar}"
+        );
+        // The emulator answers XTVERSION with it too, so a shell inside a
+        // terminal tab can be asked which console it is running in.
+        assert!(
+            INDEX_HTML.contains(&format!("jonnyq console v{want}")),
+            "XTVERSION must answer with the version"
+        );
+        // The version is styled as a footnote to the brand rather than as part
+        // of it — and it sits inside the `<b>`, which sets the accent colour,
+        // the letter-spacing and the bold it has to override.
+        assert!(
+            INDEX_HTML.contains("#ver { color: var(--fg4);"),
+            "the version needs its own quiet rule"
+        );
+        // And the figure is not a hand-copied string that can go stale: every
+        // version number on the page is one of these three splices.
+        let numbers = regex::Regex::new(r"\bv\d+\.\d+\.\d+\b")
+            .expect("regex")
+            .find_iter(INDEX_HTML)
+            .count();
+        assert_eq!(
+            numbers, 3,
+            "the page may carry the version in its title, its brand and its \
+             XTVERSION answer, and nowhere else"
+        );
     }
 
     #[test]

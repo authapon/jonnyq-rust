@@ -922,6 +922,11 @@ impl WebConsole {
             ("GET", "/health") => {
                 let body = json!({
                     "ok": true,
+                    // The build serving this page, same figure the page's own
+                    // title bar shows and the terminal's `-h` prints — so a
+                    // script checking a running session does not have to ask a
+                    // human which binary is behind the port.
+                    "version": crate::config::VERSION,
                     "work_dir": self.work_dir,
                     "clients": self.clients(),
                     "ready": self.ready_now(),
@@ -2126,6 +2131,12 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         assert!(body.contains("text/html; charset=utf-8"));
         assert!(body.contains("<!DOCTYPE html>"));
         assert!(body.contains("</html>"));
+        // The version of the binary answering is spelled into the bytes, so a
+        // curl is enough to identify a session's build.
+        assert!(
+            body.contains(&format!("jonnyq console v{}", crate::config::VERSION)),
+            "the served page must name its build"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2172,6 +2183,11 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         let json = body.split("\r\n\r\n").nth(1).unwrap();
         let v: Value = serde_json::from_str(json).unwrap();
         assert_eq!(v["ok"], json!(true));
+        assert_eq!(
+            v["version"],
+            json!(crate::config::VERSION),
+            "a session must say which build it is running"
+        );
         assert!(v["work_dir"].as_str().unwrap().len() > 1);
         assert_eq!(v["asks"], json!(0), "nothing is being asked yet");
     }

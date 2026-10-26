@@ -6,6 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
+jonnyq v1.0.0
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -22,19 +23,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 1. [What it is](#what-it-is)
 2. [How it works](#how-it-works)
-3. [Requirements](#requirements)
-4. [Installation](#installation)
-5. [Quick start](#quick-start)
-6. [Configuration](#configuration)
-7. [Slash commands](#slash-commands)
-8. [Tools](#tools)
-9. [Automated coding: `/plan` → `.progress` → `/coding`](#automated-coding-plan--progress--coding)
-10. [Skills](#skills)
-11. [Web console](#web-console)
-12. [Notifications (ntfy)](#notifications-ntfy)
-13. [Files created at runtime](#files-created-at-runtime)
-14. [Security notes](#security-notes)
-15. [License](#license)
+3. [Version](#version)
+4. [Requirements](#requirements)
+5. [Installation](#installation)
+6. [Quick start](#quick-start)
+7. [Configuration](#configuration)
+8. [Slash commands](#slash-commands)
+9. [Tools](#tools)
+10. [Automated coding: `/plan` → `.progress` → `/coding`](#automated-coding-plan--progress--coding)
+11. [Skills](#skills)
+12. [Web console](#web-console)
+13. [Notifications (ntfy)](#notifications-ntfy)
+14. [Files created at runtime](#files-created-at-runtime)
+15. [Security notes](#security-notes)
+16. [License](#license)
 
 ---
 
@@ -43,6 +45,7 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 - An interactive terminal agent: you type a request, the model thinks, calls tools, and answers — repeating until the job is finished.
 - Works with **Ollama** (native API) and any **OpenAI-compatible** endpoint (OpenAI, LM Studio, llama.cpp server, vLLM, OpenRouter, …).
 - Prompt-driven project automation: `/plan`, `/plan_for_human`, `/coding`, `/coding_phase`, `/autocoding`.
+- Says which build it is: the version from `Cargo.toml` is printed above the first prompt, heads `-h` and `/help`, is repeated by `/version`, and is on the web console's title bar and in its `/health` JSON.
 - Runs on [`tokio`](https://tokio.rs/); pure Rust, no C toolchain required.
 
 ## How it works
@@ -60,7 +63,22 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`output.txt` by default).
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`output.txt` by default). The REPL prints its version (`jonnyq v1.0.0`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+
+## Version
+
+jonnyq is at **v1.0.0**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+
+| Where | What you see |
+|---|---|
+| Terminal, at startup | `jonnyq v1.0.0` above the first prompt, and in the transcript log |
+| `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
+| `/version` | The same line, any time during a session |
+| `/help`, `/?` | The version above the slash command list |
+| Web console | In the browser tab's title (`jonnyq console v1.0.0`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.0.0"` in the JSON, so a script can identify a running session |
+
+`-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
 ## Requirements
 
@@ -84,7 +102,7 @@ brew install poppler               # macOS
 ```bash
 cd jonnyq-rust
 cargo build --release
-./target/release/jonnyq -h
+./target/release/jonnyq -h     # version on the first line, then every flag; exits 1, like Go's flag
 ```
 
 Run without building, or install into `PATH`:
@@ -206,7 +224,7 @@ The file supports comments, `export KEY=value`, single/double quotes (`\n`, `\t`
 
 Notes:
 
-- Every flag takes a value except `-thinking` (inline `-thinking=false` only) and `-h`/`-help`. Parsing stops at the first non-flag argument or at `--`; a repeated flag keeps the last value. `-h` prints usage and exits with code 1.
+- Every flag takes a value except `-thinking` (inline `-thinking=false` only) and `-h`/`-help`. Parsing stops at the first non-flag argument or at `--`; a repeated flag keeps the last value. `-h` prints the version and the usage and exits with code 1.
 - `-thinking` is only forwarded to Ollama (`{"think": true|false}`). With the `openai` provider jonnyq just renders `reasoning_content` when the endpoint sends it — turn thinking off server-side.
 - Credentials in a proxy URL are masked as `user:***` in all output and logs.
 - `-skill-path` is separated by `;` only (not `:`), and needs `\;` or single quotes in a shell.
@@ -217,7 +235,7 @@ Notes:
 
 | Command | Description |
 |---|---|
-| `/?`, `/help` | Show all commands |
+| `/?`, `/help` | Show all commands, with the version on top |
 | `/provider <name>:<url>` | Switch provider (effective immediately) |
 | `/key <key>` | Set the API key |
 | `/model <model>` | Set the model |
@@ -241,6 +259,7 @@ Notes:
 | `/env [path\|off]` | Show which `.env` file is in use, or switch/disable it |
 | `/env list` | Every setting with its effective value and source (`flag`/`file`/`env`/`default`) |
 | `/env reload [path\|off]` | Re-read the dotenv file and apply it to the running session |
+| `/version` | Print the version (`jonnyq v…`) — the same figure `-h`, the startup line and the web console show |
 | `/exit`, `/bye` | Quit |
 
 `/env reload` applies model, context, thinking, tool mode, output file, provider/key, proxy, searxng/fetch/pdf timeouts, tool-call budget, skill path, ntfy topic and watch settings without a restart. Flags given on the command line are replayed, so they keep winning.
@@ -333,7 +352,7 @@ lined up either way.
 
 | Part | What it does |
 |---|---|
-| **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **text** and **code** font and size controls described below |
+| **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, the build's version beside the **jonnyq** brand, plus the **text** and **code** font and size controls described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
 | **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files. The head of each has a **Download** that saves that file to your computer |
@@ -520,7 +539,8 @@ only channel, so it is also what makes `-web` usable without a terminal at all.
 
 The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 `Origin`, when a browser sends one) names loopback, so it is a local interface
-and nothing else. `GET /health` reports the session as JSON, including `asks` —
+and nothing else. `GET /health` reports the session as JSON, including `version`
+— the build behind the port, the same figure the page's title bar shows — `asks`,
 how many `ask_user` questions are unanswered, i.e. that jonnyq is waiting for a
 human rather than working — and `busy`, whether a turn is in flight and so
 whether there is anything for a `stop` message to cancel. `GET /file?path=…`,
@@ -559,4 +579,8 @@ The same topic is also an inbound channel: `ask_user` pushes the question and su
 
 ## License
 
-Not declared yet (`Cargo.toml` has no `license` field) — contact the maintainer before redistributing.
+[MIT License](LICENSE) — Copyright (c) 2026 Authapon Kongwan.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: the above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

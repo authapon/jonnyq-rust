@@ -19,6 +19,11 @@ pub mod dotenv;
 
 pub use dotenv::Dotenv;
 
+/// The program version, taken from `Cargo.toml` so the manifest is the single
+/// place it is written: `-h`, the REPL's startup line and `/version`, the web
+/// console's title bar and `/health` all read it from here.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub const ENV_PREFIX: &str = "JONNYQ_";
 
 pub const DEFAULT_PROVIDER: &str = "ollama:http://localhost:11434";
@@ -64,6 +69,17 @@ pub const DEFAULT_SUMMARY_TRANSCRIPT_CAP: i64 = 48_000;
 /// conversation history (`JONNYQ_MAX_TOOL_RESULT_CHARS`) - see
 /// `tools::cap_tool_result`.
 pub const DEFAULT_MAX_TOOL_RESULT_CHARS: i64 = 64_000;
+
+/// The version line the REPL opens with, `/version` prints and `-h` puts above
+/// the flag table. No trailing newline: the caller decides how it ends.
+pub fn version_line() -> String {
+    format!("jonnyq v{VERSION}")
+}
+
+/// The whole help output: the version, then the flag table.
+fn usage_text() -> String {
+    format!("{}\n{USAGE}", version_line())
+}
 
 const USAGE: &str = "Usage: jonnyq [flags]
 
@@ -882,13 +898,14 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
         // binary does.
         Err(e) if e.message == HELP_SENTINEL => {
             // Go's flag prints just the usage for -h/-help (no error line)
-            // and still returns ErrHelp to the caller.
-            eprint!("{}", USAGE);
+            // and still returns ErrHelp to the caller. jonnyq leads that usage
+            // with its version, so `-h` answers "which build is this" too.
+            eprint!("{}", usage_text());
             return Err(e);
         }
         Err(e) => {
             eprintln!("{}", e.message);
-            eprint!("{}", USAGE);
+            eprint!("{}", usage_text());
             return Err(e);
         }
     }
@@ -1269,6 +1286,27 @@ mod tests {
         );
         // ';' only: ':' must survive inside a path (Windows drive letters).
         assert_eq!(split_paths("C:/skills"), vec!["C:/skills".to_string()]);
+    }
+
+    /// `-h` leads with the version, so it answers "which build is this" as well
+    /// as "what are the flags". The figure is `Cargo.toml`'s, so a README or a
+    /// release note cannot drift from what the binary says without the manifest
+    /// having to change too.
+    #[test]
+    fn help_leads_with_the_version() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(version_line(), format!("jonnyq v{VERSION}"));
+
+        let help = usage_text();
+        assert!(
+            help.starts_with(&format!("jonnyq v{VERSION}\nUsage: jonnyq [flags]")),
+            "got {help:?}"
+        );
+        // The version line is added in front of the flag table, not swapped for
+        // it: a reader asking about flags still gets every flag.
+        for flag in ["-provider", "-web", "-env-file", "JONNYQ_"] {
+            assert!(help.contains(flag), "the flag table lost {flag}");
+        }
     }
 
     #[test]

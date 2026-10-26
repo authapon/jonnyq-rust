@@ -6,6 +6,7 @@
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
+jonnyq v1.0.0
 qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -22,19 +23,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 1. [แอปนี้คืออะไร](#แอปนี้คืออะไร)
 2. [หลักการการทำงาน](#หลักการการทำงาน)
-3. [ความต้องการของระบบ](#ความต้องการของระบบ)
-4. [การติดตั้ง](#การติดตั้ง)
-5. [เริ่มต้นใช้งาน](#เริ่มต้นใช้งาน)
-6. [การตั้งค่า](#การตั้งค่า)
-7. [Slash commands](#slash-commands)
-8. [Tools](#tools)
-9. [การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`](#การทำงานอัตโนมัติ-plan--progress--coding)
-10. [Skills](#skills)
-11. [เวบคอนโซล](#เวบคอนโซล)
-12. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
-13. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
-14. [ความปลอดภัย](#ความปลอดภัย)
-15. [License](#license)
+3. [เวอร์ชัน](#เวอร์ชัน)
+4. [ความต้องการของระบบ](#ความต้องการของระบบ)
+5. [การติดตั้ง](#การติดตั้ง)
+6. [เริ่มต้นใช้งาน](#เริ่มต้นใช้งาน)
+7. [การตั้งค่า](#การตั้งค่า)
+8. [Slash commands](#slash-commands)
+9. [Tools](#tools)
+10. [การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`](#การทำงานอัตโนมัติ-plan--progress--coding)
+11. [Skills](#skills)
+12. [เวบคอนโซล](#เวบคอนโซล)
+13. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
+14. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
+15. [ความปลอดภัย](#ความปลอดภัย)
+16. [License](#license)
 
 ---
 
@@ -43,6 +45,7 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 - Agent บน terminal แบบโต้ตอบ: พิมพ์คำสั่ง → model คิด → เรียก tool → ตอบ โดยวนซ้ำจนงานเสร็จ
 - รองรับ **Ollama** (native API) และ endpoint ที่เป็น **OpenAI-compatible** (OpenAI, LM Studio, llama.cpp server, vLLM, OpenRouter, …)
 - automate งานเขียนโค้ดด้วยคำสั่ง `/plan`, `/plan_for_human`, `/coding`, `/coding_phase`, `/autocoding`
+- บอกเวอร์ชันของตัวเองเสมอ: เลขเวอร์ชันจาก `Cargo.toml` จะถูกพิมพ์เหนือ prompt บรรทัดแรกทุกครั้งที่เปิด session, เป็นบรรทัดแรกของ `-h` และ `/help`, `/version` พิมพ์ซ้ำได้ทุกเมื่อ และมีบน title bar ของ web console กับ field `version` ใน JSON ของ `/health`
 - รันบน [`tokio`](https://tokio.rs/) เป็น pure Rust ไม่ต้องมี C toolchain
 
 ## หลักการการทำงาน
@@ -60,7 +63,22 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
 
-**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `output.txt`)
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `output.txt`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.0.0`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
+
+## เวอร์ชัน
+
+jonnyq อยู่ที่ **v1.0.0** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
+
+| ที่ไหน | สิ่งที่เห็น |
+|---|---|
+| terminal, ตอนเปิด session | `jonnyq v1.0.0` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
+| `jonnyq -h` / `-help` | เวอร์ชันเป็นบรรทัดแรกของ usage (พิมพ์ออกมาหลัง error ของ flag ผิดด้วย) |
+| `/version` | บรรทัดเดียวกัน เรียกใช้กลาง session ได้ตลอด |
+| `/help`, `/?` | เวอร์ชันอยู่เหนือรายการ slash command |
+| web console | ใน title ของ tab (`jonnyq console v1.0.0`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
+| `GET /health` | `"version": "1.0.0"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
+
+`-h` ยัง exit ด้วย code 1 เหมือนโปรแกรมที่ใช้ Go `flag` เพราะถือเป็นการขอ usage ไม่ใช่คำสั่งปกติ และไม่มี flag `-version` — ใช้ `-h`, `/version` หรือ `curl 127.0.0.1:<port>/health` ของ session ที่เปิด `-web` แทน
 
 ## ความต้องการของระบบ
 
@@ -84,7 +102,7 @@ brew install poppler               # macOS
 ```bash
 cd jonnyq-rust
 cargo build --release
-./target/release/jonnyq -h
+./target/release/jonnyq -h     # บรรทัดแรกคือเวอร์ชัน ตามด้วย flag ทุกตัว; exit 1 เหมือน Go's flag
 ```
 
 รันโดยไม่ต้อง build เอง หรือติดตั้งเข้า `PATH`:
@@ -206,7 +224,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 
 หมายเหตุ:
 
-- ทุก flag รับ value ยกเว้น `-thinking` (รับแบบ inline `-thinking=false` เท่านั้น) และ `-h`/`-help` — การ parse หยุดที่ argument แรกที่ไม่ใช่ flag หรือที่ `--`; ตั้ง flag ซ้ำ = ค่าสุดท้ายชนะ; `-h` พิมพ์ usage แล้วออกด้วย exit code 1
+- ทุก flag รับ value ยกเว้น `-thinking` (รับแบบ inline `-thinking=false` เท่านั้น) และ `-h`/`-help` — การ parse หยุดที่ argument แรกที่ไม่ใช่ flag หรือที่ `--`; ตั้ง flag ซ้ำ = ค่าสุดท้ายชนะ; `-h` พิมพ์เวอร์ชันตามด้วย usage แล้วออกด้วย exit code 1
 - `-thinking` ถูกส่งเฉพาะ Ollama (`{"think": true|false}`) — ฝั่ง `openai` jonnyq แค่แสดงผล `reasoning_content` ถ้า server ส่งมา จึงต้องปิดที่ฝั่ง server
 - credential ใน proxy URL ถูก mask เป็น `user:***` ในทุก output และ log
 - `-skill-path` คั่นด้วย `;` เท่านั้น (ไม่ใช่ `:`) และต้อง escape เป็น `\;` หรือครอบ single quotes ใน shell
@@ -217,7 +235,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 
 | คำสั่ง | ความหมาย |
 |---|---|
-| `/?`, `/help` | แสดงคำสั่งทั้งหมด |
+| `/?`, `/help` | แสดงคำสั่งทั้งหมด (มีเวอร์ชันกำกับบรรทัดแรก) |
 | `/provider <name>:<url>` | เปลี่ยน provider (มีผลทันที) |
 | `/key <key>` | ตั้ง API key |
 | `/model <model>` | ตั้ง model |
@@ -241,6 +259,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `/env [path\|off]` | ดูว่า `.env` ไฟล์ไหนถูกใช้ หรือเปลี่ยน/ปิดไฟล์ |
 | `/env list` | ตารางทุก setting: ค่าที่ใช้จริง + ที่มา (`flag`/`file`/`env`/`default`) |
 | `/env reload [path\|off]` | อ่านไฟล์ `.env` ใหม่แล้ว apply เข้า session ที่กำลังรัน |
+| `/version` | พิมพ์เวอร์ชัน (`jonnyq v…`) — เลขเดียวกับที่ `-h`, บรรทัดแรกของ session และ web console แสดง |
 
 `/env reload` apply model, context, thinking, tool mode, ไฟล์ output, provider/key, proxy, timeout ของ searxng/fetch/pdf, tool-call budget, skill path, ntfy topic และ watch settings โดยไม่ต้อง restart — flag ที่ใส่ตอน start ถูก replay จึงยังชนะเสมอ
 
@@ -330,7 +349,7 @@ jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.
 
 | ส่วน | ทำงานอะไร |
 |---|---|
-| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
+| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน เลขเวอร์ชันของ build ที่เสิร์ฟ page นี้ถัดจากคำว่า **jonnyq** พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ source ในแท็บถูก syntax highlight ด้วย palette gruvbox dark ชุดเดียวกับ console — คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ และหัวของทุกแท็บมีปุ่ม **Download** เพื่อบันทึกไฟล์นั้นลงเครื่อง |
 | **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
@@ -462,7 +481,8 @@ channel อื่นถูกรวบให้ทันที: popup จะป�
 
 listener ผูกกับ `127.0.0.1` และตอบเฉพาะ request ที่ `Host` (และ `Origin` เมื่อ
 browser ส่งมา) เป็น loopback จึงเป็น interface ในเครื่องเท่านั้น `GET /health` ตอบ
-สถานะ session เป็น JSON รวมถึง `asks` (จำนวนคำถาม `ask_user` ที่ยังไม่มีใครตอบ
+สถานะ session เป็น JSON รวมถึง `version` (build ที่อยู่หลัง port นั้น เลขเดียวกับที่
+title bar ของ page แสดง), `asks` (จำนวนคำถาม `ask_user` ที่ยังไม่มีใครตอบ
 คือ jonnyq กำลังรอมนุษย์ ไม่ใช่กำลังทำงาน) และ `busy` (มี turn กำลังรันอยู่หรือไม่
 — นั่นคือมีอะไรให้ `stop` ยกเลิกหรือเปล่า) ส่วน `GET /file?path=…` ซึ่งเป็นปลายทางของ
 ปุ่ม **Download** ก็ยึดกฎเดียวกันบวกกับกฎของ tree: ชื่อไฟล์ต้อง resolve อยู่ภายใน
@@ -499,4 +519,8 @@ topic เดียวกันใช้เป็นขากลับได้�
 
 ## License
 
-ยังไม่ระบุใน repo (`Cargo.toml` ไม่มี field `license`) — ติดต่อผู้ดูแลโปรเจกต์ก่อนนำไปเผยแพร่
+[MIT License](LICENSE) — Copyright (c) 2026 Authapon Kongwan
+
+อนุญาตให้ผู้ที่ได้รับสำเนาซอฟต์แวร์และไฟล์เอกสารประกอบ (the "Software") ทุกคน ใช้ซอฟต์แวร์ได้อย่างอิสระโดยไม่คิดค่าใช้จ่าย รวมถึงสิทธิในการใช้ คัดลอก แก้ไข รวม เผยแพร่ จำหน่าย แจกจ่ายต่อ (sublicense) และ/หรือขายสำเนาของ Software ตลอดจนอนุญาตให้ผู้อื่นกระทำการดังกล่าวได้ โดยมีเงื่อนไขว่าต้องใส่ประกาศลิขสิทธิ์ข้างต้นและประกาศอนุญาตนี้ไว้ใน Software ทุกสำเนาหรือส่วนที่ยังเป็นเนื้อหาส่วนใหญ่ของ Software
+
+Software นี้ถูกส่งมอบแบบ "AS IS" โดยไม่มีรับประกันใด ๆ ทั้งสิ้น ไม่ว่าจะโดยชัดแจ้งหรือโดยนัย รวมถึงรับประกันเชิงพาณิชย์ (MERCHANTABILITY) ความเหมาะสมสำหรับวัตถุประสงค์เฉพาะ และการไม่ละเมิดทรัพย์สินทางปัญญา ผู้เขียนหรือผู้ถือลิขสิทธิ์จะไม่รับผิดต่อข้อเรียกร้อง ความเสียหาย หรือความรับผิดใด ๆ ไม่ว่าในการกระทำ สัญญา หรือกรณีอื่นใด ซึ่งเกิดขึ้นจากการใช้หรือเกี่ยวข้องกับการใช้ Software

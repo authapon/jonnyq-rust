@@ -29,8 +29,10 @@ use crate::ui::Writer;
 use crate::watch::{Trigger, Watcher};
 use crate::web::WebConsole;
 
+/// The slash command reference `/help` prints, under the version line printed
+/// above it (see [`Repl::handle_slash`]).
 pub const HELP_TEXT: &str = r#"Slash commands:
-  /?  /help                         show this help
+  /?  /help                         show this help (with the version on top)
   /provider <name>:<url>            set the AI provider, e.g. ollama:http://localhost:11434
   /key <key>                        set the provider API key
   /model <model>                    set the model name
@@ -54,6 +56,7 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /env [path|off]                   show the dotenv file settings come from; a path (or off) also reloads it
   /env list                         every setting, its value in effect and which layer supplied it
   /env reload [path|off]            re-read the dotenv file and apply the new values to this session
+  /version                          print the jonnyq version (same figure as -h and the web console)
   /exit  /bye                       exit jonnyq
 
 Multi-line prompts: end a line with a trailing backslash to continue it on
@@ -89,6 +92,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/proxy",
     "/toolmode",
     "/env",
+    "/version",
     "/exit",
     "/bye",
 ];
@@ -253,6 +257,12 @@ impl Repl {
                 }
             }
         });
+
+        // Which build this session is, once before the first prompt: the same
+        // figure `-h`, `/version`, the web console's bar and its `/health`
+        // endpoint report, so the number is on screen from the first line
+        // rather than only on request.
+        self.ui.meta(&config::version_line());
 
         let mut headless = false;
         loop {
@@ -590,7 +600,12 @@ so it doesn't fire again.",
             .to_string();
 
         match cmd.as_str() {
-            "/?" | "/help" => self.ui.plainln(HELP_TEXT),
+            "/?" | "/help" => {
+                self.ui
+                    .plainln(&format!("{}\n{}", config::version_line(), HELP_TEXT))
+            }
+
+            "/version" => self.ui.plainln(&config::version_line()),
 
             "/exit" | "/bye" => return (true, Ok(())),
 
@@ -1934,6 +1949,50 @@ mod tests {
             cfg.context_size, 4242,
             "the startup flag must still beat the file"
         );
+    }
+
+    /// The three places a command has to be spelled: the table Tab completes
+    /// from, the reference `/help` prints, and the matcher above. A command
+    /// missing from the table cannot be completed; one missing from the help is
+    /// invisible.
+    #[tokio::test]
+    async fn the_help_lists_every_completable_command() {
+        for cmd in SLASH_COMMANDS {
+            assert!(
+                HELP_TEXT.contains(cmd),
+                "{cmd} completes but /help never mentions it"
+            );
+        }
+        // `/version` is the command that made this worth pinning.
+        assert!(SLASH_COMMANDS.contains(&"/version"));
+        assert!(HELP_TEXT.contains("/version"));
+    }
+
+    /// `/version` prints the version, and `/help` says it above the command
+    /// list — the same figure `-h`, the terminal's opening line and the web
+    /// console's bar show, all of them read from `Cargo.toml`.
+    #[tokio::test]
+    async fn version_is_reported_by_version_and_help() {
+        let want = config::version_line();
+        assert_eq!(want, format!("jonnyq v{}", crate::config::VERSION));
+
+        let t = new_test_repl().await;
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/version")
+            .await;
+        res.unwrap();
+        assert!(t.log_contents().contains(&want), "got: {want}");
+
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/help").await;
+        res.unwrap();
+        let log = t.log_contents();
+        assert!(log.contains(&want), "help must name the version: {log}");
+        assert!(
+            log.find(&want).expect("the version") < log.find("Slash commands:").expect("the list"),
+            "the version comes first: {log}"
+        );
+        assert!(log.contains("/version"), "and lists itself: {log}");
     }
 
     #[tokio::test]
