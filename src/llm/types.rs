@@ -217,10 +217,18 @@ impl Canceled {
 }
 
 /// Builds a provider for the given name ("ollama" or "openai").
-pub fn new_provider(name: &str, base_url: &str, key: &str) -> Result<std::sync::Arc<dyn Provider>, AgentError> {
+pub fn new_provider(
+    name: &str,
+    base_url: &str,
+    key: &str,
+) -> Result<std::sync::Arc<dyn Provider>, AgentError> {
     match name {
-        "ollama" => Ok(std::sync::Arc::new(super::ollama::OllamaProvider::new(base_url, key))),
-        "openai" => Ok(std::sync::Arc::new(super::openai::OpenAiProvider::new(base_url, key))),
+        "ollama" => Ok(std::sync::Arc::new(super::ollama::OllamaProvider::new(
+            base_url, key,
+        ))),
+        "openai" => Ok(std::sync::Arc::new(super::openai::OpenAiProvider::new(
+            base_url, key,
+        ))),
         other => Err(AgentError::new(format!("unsupported provider {:?}", other))),
     }
 }

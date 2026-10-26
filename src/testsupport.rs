@@ -9,9 +9,9 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
@@ -28,7 +28,10 @@ pub struct RecordedRequest {
 impl RecordedRequest {
     pub fn header(&self, name: &str) -> Option<String> {
         let name = name.to_lowercase();
-        self.headers.iter().find(|(k, _)| k.to_lowercase() == name).map(|(_, v)| v.clone())
+        self.headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == name)
+            .map(|(_, v)| v.clone())
     }
 
     pub fn body_json(&self) -> serde_json::Value {
@@ -55,7 +58,12 @@ pub struct StubResponse {
 
 impl StubResponse {
     pub fn json(body: impl Into<String>) -> Self {
-        Self { status: 200, content_type: "application/json".into(), body: body.into(), ..Default::default() }
+        Self {
+            status: 200,
+            content_type: "application/json".into(),
+            body: body.into(),
+            ..Default::default()
+        }
     }
     pub fn ndjson(body: impl Into<String>) -> Self {
         Self {
@@ -66,15 +74,31 @@ impl StubResponse {
         }
     }
     pub fn sse(body: impl Into<String>) -> Self {
-        Self { status: 200, content_type: "text/event-stream".into(), body: body.into(), ..Default::default() }
+        Self {
+            status: 200,
+            content_type: "text/event-stream".into(),
+            body: body.into(),
+            ..Default::default()
+        }
     }
     pub fn status(status: u16, body: impl Into<String>) -> Self {
-        Self { status, content_type: "text/plain".into(), body: body.into(), ..Default::default() }
+        Self {
+            status,
+            content_type: "text/plain".into(),
+            body: body.into(),
+            ..Default::default()
+        }
     }
     /// A streamed SSE body written one `pieces` entry at a time, sleeping
     /// `delay` before each. Used to exercise client-side stream timing.
     pub fn sse_staged(pieces: Vec<(String, std::time::Duration)>) -> Self {
-        Self { status: 200, content_type: "text/event-stream".into(), body: String::new(), staged: pieces, hold: 0 }
+        Self {
+            status: 200,
+            content_type: "text/event-stream".into(),
+            body: String::new(),
+            staged: pieces,
+            hold: 0,
+        }
     }
     /// A streamed newline-delimited JSON body, one `pieces` entry at a time —
     /// the shape of an ntfy `/json` subscription, so `ask_user`'s wait can be
@@ -92,7 +116,10 @@ impl StubResponse {
     /// `secs`) after the pieces are written — a live subscription with no
     /// further messages.
     pub fn ndjson_open(pieces: Vec<(String, std::time::Duration)>, secs: u64) -> Self {
-        Self { hold: secs, ..StubResponse::ndjson_staged(pieces) }
+        Self {
+            hold: secs,
+            ..StubResponse::ndjson_staged(pieces)
+        }
     }
 }
 
@@ -126,7 +153,9 @@ impl TestServer {
     }
 
     async fn start(handler: Handler) -> TestServer {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
 
         let addr = listener.local_addr().unwrap();
         let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
@@ -141,7 +170,9 @@ impl TestServer {
                 let req_log = req_log.clone();
                 let handler = handler.clone();
                 tokio::spawn(async move {
-                    let Some(req) = read_request(&mut sock).await else { return };
+                    let Some(req) = read_request(&mut sock).await else {
+                        return;
+                    };
                     req_log.lock().unwrap().push(req.clone());
                     let resp = handler(&req);
                     if !resp.staged.is_empty() {
@@ -187,7 +218,10 @@ impl TestServer {
             }
         });
 
-        TestServer { url: format!("http://{addr}"), requests }
+        TestServer {
+            url: format!("http://{addr}"),
+            requests,
+        }
     }
 
     /// Requests seen so far, in arrival order.
@@ -200,7 +234,12 @@ impl TestServer {
     }
 
     pub fn last_request(&self) -> RecordedRequest {
-        self.requests.lock().unwrap().last().cloned().expect("no request recorded")
+        self.requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("no request recorded")
     }
 
     /// (Title header, body) of every request seen, in order - for asserting
@@ -276,7 +315,12 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<RecordedReques
                     headers.push((k.trim().to_string(), v.trim().to_string()));
                 }
             }
-            return Some(RecordedRequest { method, path, headers, body });
+            return Some(RecordedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
         }
     }
     None
@@ -306,7 +350,9 @@ pub struct SocksProxy {
 
 impl SocksProxy {
     pub async fn start() -> SocksProxy {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks stub");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind socks stub");
         let addr = listener.local_addr().unwrap();
         let tunnels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = tunnels.clone();
@@ -322,7 +368,10 @@ impl SocksProxy {
                 });
             }
         });
-        SocksProxy { url: format!("socks5h://127.0.0.1:{}", addr.port()), tunnels }
+        SocksProxy {
+            url: format!("socks5h://127.0.0.1:{}", addr.port()),
+            tunnels,
+        }
     }
 
     /// `host:port` of every CONNECT accepted, in order.
@@ -334,7 +383,10 @@ impl SocksProxy {
     /// "this request went through the proxy" (or, when empty, that it did not)
     /// without caring what other traffic the stub served.
     pub fn tunnels_to(&self, hostport: &str) -> Vec<String> {
-        self.tunnels().into_iter().filter(|t| t == hostport).collect()
+        self.tunnels()
+            .into_iter()
+            .filter(|t| t == hostport)
+            .collect()
     }
 
     /// Runs one request through the handshake, records the destination, then
@@ -399,7 +451,11 @@ impl SocksProxy {
             }
         };
         // REP=0, ATYP=IPv4, BND=0.0.0.0:0 - the client only needs the success.
-        if sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {
+        if sock
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .is_err()
+        {
             return;
         }
         // Recorded as soon as the tunnel opens (not when it closes), so a test
@@ -512,7 +568,10 @@ impl crate::llm::Provider for SequenceProvider {
         _cancel: CancellationToken,
         req: &crate::llm::ChatRequest,
     ) -> Result<(mpsc::UnboundedReceiver<ChatEvent>, CancellationToken), AgentError> {
-        self.sent_reqs.lock().unwrap().push(crate::llm::ChatRequestSnapshot::from(req));
+        self.sent_reqs
+            .lock()
+            .unwrap()
+            .push(crate::llm::ChatRequestSnapshot::from(req));
         let i = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let events = match self.responses.get(i) {
             Some(e) => e.clone(),
@@ -545,7 +604,9 @@ pub struct EchoTool {
 
 impl Default for EchoTool {
     fn default() -> Self {
-        Self { called: std::sync::atomic::AtomicBool::new(false) }
+        Self {
+            called: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -567,7 +628,11 @@ impl crate::tools::Tool for EchoTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn call(&self, _ctx: crate::tools::CallCtx, args: &serde_json::Value) -> crate::error::R<String> {
+    async fn call(
+        &self,
+        _ctx: crate::tools::CallCtx,
+        args: &serde_json::Value,
+    ) -> crate::error::R<String> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
         Ok(format!("echoed: {text}"))
@@ -583,7 +648,9 @@ pub struct DelayedLines {
 
 impl DelayedLines {
     pub fn new(lines: Vec<(std::time::Duration, &str)>) -> Self {
-        Self { lines: lines.into_iter().map(|(d, l)| (d, l.to_string())).collect() }
+        Self {
+            lines: lines.into_iter().map(|(d, l)| (d, l.to_string())).collect(),
+        }
     }
 }
 
@@ -652,7 +719,12 @@ pub fn new_test_agent(
 /// sent to the model.
 pub fn new_test_agent_with_provider(
     responses: Vec<Vec<ChatEvent>>,
-) -> (Arc<crate::agent::Agent>, Arc<EchoTool>, TestLog, Arc<SequenceProvider>) {
+) -> (
+    Arc<crate::agent::Agent>,
+    Arc<EchoTool>,
+    TestLog,
+    Arc<SequenceProvider>,
+) {
     let log = TestLog::new("agent");
     let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
     let mut reg = test_registry(&ui);
@@ -689,7 +761,11 @@ impl crate::tools::Tool for ScriptedTool {
             parameters: serde_json::json!({"type": "object"}),
         }
     }
-    async fn call(&self, _ctx: crate::tools::CallCtx, _args: &serde_json::Value) -> crate::error::R<String> {
+    async fn call(
+        &self,
+        _ctx: crate::tools::CallCtx,
+        _args: &serde_json::Value,
+    ) -> crate::error::R<String> {
         let dir = self.work_dir.lock().unwrap().clone();
         let path = std::path::Path::new(&dir).join(crate::coding::PROGRESS_FILE);
         let content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -729,9 +805,15 @@ impl CodingEnv {
     pub fn with_provider(tag: &str, provider: Arc<SequenceProvider>) -> CodingEnv {
         let dir = TempDir::new(tag);
         let mut reg = crate::tools::Registry::new();
-        reg.register(Arc::new(crate::tools::file::WriteFileTool { work_dir: dir.str() }));
-        reg.register(Arc::new(crate::tools::file::ReadFileTool { work_dir: dir.str() }));
-        reg.register(Arc::new(crate::tools::file::EditFileTool { work_dir: dir.str() }));
+        reg.register(Arc::new(crate::tools::file::WriteFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::ReadFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::EditFileTool {
+            work_dir: dir.str(),
+        }));
         let log_path = dir.0.join("output.txt").to_string_lossy().into_owned();
         let ui = Arc::new(crate::ui::Writer::new(&log_path).unwrap());
         let ui2 = ui.clone();
@@ -745,7 +827,13 @@ impl CodingEnv {
             ui,
             Vec::new(),
         ));
-        CodingEnv { dir, agent, provider, ui: ui2, log: log_path }
+        CodingEnv {
+            dir,
+            agent,
+            provider,
+            ui: ui2,
+            log: log_path,
+        }
     }
 
     /// The command object under test, with notifications pointed at `ntfy`.
@@ -762,12 +850,7 @@ impl CodingEnv {
     pub fn notifications(&self, srv: &TestServer) -> Vec<(String, String)> {
         srv.requests()
             .iter()
-            .map(|r| {
-                (
-                    r.header("title").unwrap_or_default(),
-                    r.body.clone(),
-                )
-            })
+            .map(|r| (r.header("title").unwrap_or_default(), r.body.clone()))
             .collect()
     }
 }
@@ -778,7 +861,8 @@ fn log_path_for(dir: &TempDir) -> String {
 
 /// Tool-call events for a simulated write_file that overwrites `.progress`.
 pub fn write_progress_step(content: &str) -> Vec<ChatEvent> {
-    let args = serde_json::json!({ "path": crate::coding::PROGRESS_FILE, "content": content }).to_string();
+    let args =
+        serde_json::json!({ "path": crate::coding::PROGRESS_FILE, "content": content }).to_string();
     vec![
         ChatEvent::ToolCalls {
             tool_calls: vec![crate::llm::ToolCall {
@@ -806,12 +890,23 @@ pub fn content_step(text: &str) -> Vec<ChatEvent> {
 }
 
 pub fn done_event() -> ChatEvent {
-    ChatEvent::Done { usage: crate::llm::Usage::default() }
+    ChatEvent::Done {
+        usage: crate::llm::Usage::default(),
+    }
 }
 
 /// A REPL test environment: a throwaway working dir, an agent with a no-op
 /// provider, and the UI/log wired to it (Go's repl_test `newTestREPL`).
-pub fn new_repl_env(tag: &str) -> (crate::config::Config, Arc<crate::agent::Agent>, Arc<crate::ui::Writer>, Arc<crate::tools::run_command::RunCommandTool>, TempDir, TestLog) {
+pub fn new_repl_env(
+    tag: &str,
+) -> (
+    crate::config::Config,
+    Arc<crate::agent::Agent>,
+    Arc<crate::ui::Writer>,
+    Arc<crate::tools::run_command::RunCommandTool>,
+    TempDir,
+    TestLog,
+) {
     let dir = TempDir::new(&format!("repl-{}", tag));
     let log = TestLog::new(&format!("repl-{}", tag));
     let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
@@ -821,7 +916,10 @@ pub fn new_repl_env(tag: &str) -> (crate::config::Config, Arc<crate::agent::Agen
     cfg.watch_poll_interval_sec = 1;
     cfg.output_file = log.file.clone();
     let mut reg = crate::tools::Registry::new();
-    let rc = Arc::new(crate::tools::run_command::RunCommandTool::new(&dir.str(), 30));
+    let rc = Arc::new(crate::tools::run_command::RunCommandTool::new(
+        &dir.str(),
+        30,
+    ));
     reg.register(rc.clone());
     let agent = Arc::new(crate::agent::Agent::new(
         SequenceProvider::new(Vec::new()),
@@ -848,7 +946,12 @@ impl TestLog {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("jonnyq-log-{}-{}-{}", tag, std::process::id(), nanos));
+        let dir = std::env::temp_dir().join(format!(
+            "jonnyq-log-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("output.txt").to_string_lossy().into_owned();
         let _ = std::fs::File::create(&file);
@@ -929,7 +1032,11 @@ pub fn clean_env() -> CleanEnv {
     for (k, _) in &saved {
         unsafe { std::env::remove_var(k) };
     }
-    CleanEnv { _guard: guard, saved, touched: std::sync::Mutex::new(Vec::new()) }
+    CleanEnv {
+        _guard: guard,
+        saved,
+        touched: std::sync::Mutex::new(Vec::new()),
+    }
 }
 
 // --- input isolation -------------------------------------------------------

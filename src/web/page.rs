@@ -7,13 +7,15 @@
 //! no bundler): it must work offline, from a local model, on a machine with no
 //! internet — which is most of the machines jonnyq runs on.
 //!
-//! The one exception is the Thai typefaces: the top bar offers nine of them
-//! from Google Fonts. That stylesheet is *optional* in the strongest sense — it
-//! is requested in a way that cannot block the first paint, so a machine with no
-//! internet draws the page immediately and every family falls back to a locally
-//! installed copy of the same name or to the browser's own sans-serif. Nothing
-//! on the page waits for it and no script comes from it, so offline behaviour is
-//! unchanged apart from which face the text is drawn in.
+//! The one exception is the typefaces: the top bar offers nine Thai prose faces
+//! and eighteen monospaced code faces from Google Fonts. That stylesheet is
+//! *optional* in the strongest sense — it is requested in a way that cannot
+//! block the first paint, so a machine with no internet draws the page
+//! immediately and every family falls back to a locally installed copy of the
+//! same name or to the generic tail of its stack (a sans-serif for prose, a
+//! monospace for the terminal panes and the file views, whose cells and columns
+//! depend on it). Nothing on the page waits for it and no script comes from it,
+//! so offline behaviour is unchanged apart from which face the text is drawn in.
 //!
 //! Layout, per the feature:
 //!
@@ -46,15 +48,21 @@ pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>jonnyq console</title>
-<!-- The Thai typefaces, from Google Fonts. Optional by design, and fetched
-     without blocking the paint: with `media="print"` the browser never waits on
-     this stylesheet before drawing the page, so a machine with no internet (or
-     one whose proxy blackholes the request) paints immediately and redraws when
-     the faces arrive — or never, in which case every family below resolves to a
-     locally installed copy of the same name, or to the browser's sans-serif.
-     Nothing on the page waits for it, and nothing is executed from it. -->
+<!-- The typefaces, from Google Fonts: the nine Thai prose faces the console and
+     the prompt box are drawn in, and the eighteen monospaced faces the terminal
+     panes and the file views are drawn in. One request for both, because the
+     page asks for a stylesheet, not per face, and each family is one `family=`
+     parameter on the same URL.
+
+     Optional by design, and fetched without blocking the paint: with
+     `media="print"` the browser never waits on this stylesheet before drawing
+     the page, so a machine with no internet (or one whose proxy blackholes the
+     request) paints immediately and redraws when the faces arrive — or never,
+     in which case every family below resolves to a locally installed copy of
+     the same name, or to the generic family each stack ends in. Nothing on the
+     page waits for it, and nothing is executed from it. -->
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Athiti:wght@400;700&amp;family=IBM+Plex+Sans+Thai+Looped:wght@400;700&amp;family=K2D:wght@400;700&amp;family=Kodchasan:wght@400;700&amp;family=Noto+Sans+Thai+Looped:wght@400;700&amp;family=Noto+Serif+Thai:wght@400;700&amp;family=Playpen+Sans+Thai:wght@400;700&amp;family=Thasadith:wght@400;700&amp;family=Trirong:wght@400;700&amp;display=swap">
+<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Athiti:wght@400;700&amp;family=IBM+Plex+Sans+Thai+Looped:wght@400;700&amp;family=K2D:wght@400;700&amp;family=Kodchasan:wght@400;700&amp;family=Noto+Sans+Thai+Looped:wght@400;700&amp;family=Noto+Serif+Thai:wght@400;700&amp;family=Playpen+Sans+Thai:wght@400;700&amp;family=Thasadith:wght@400;700&amp;family=Trirong:wght@400;700&amp;family=Source+Code+Pro:wght@400;700&amp;family=Roboto+Mono:wght@400;700&amp;family=JetBrains+Mono:wght@400;700&amp;family=IBM+Plex+Mono:wght@400;700&amp;family=Space+Mono:wght@400;700&amp;family=Fira+Code:wght@400;700&amp;family=Google+Sans+Code:wght@400;700&amp;family=Ubuntu+Mono:wght@400;700&amp;family=Ubuntu+Sans+Mono:wght@400;700&amp;family=Anonymous+Pro:wght@400;700&amp;family=Nova+Mono:wght@400;700&amp;family=Syne+Mono:wght@400;700&amp;family=Iosevka+Charon+Mono:wght@400;700&amp;family=Sono:wght@400;700&amp;family=Intel+One+Mono:wght@400;700&amp;family=SUSE+Mono:wght@400;700&amp;family=Cascadia+Mono:wght@400;700&amp;family=Libertinus+Mono:wght@400;700&amp;display=swap">
 <style>
 /* gruvbox dark (predniam), the palette the terminal output is written in. */
 :root {
@@ -68,9 +76,17 @@ pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
   --accent: #fe8019;
   /* What the top bar's controls write: the face the console, the prompt box
      and the chrome are drawn in, and the text size every one of them uses.
-     Both are overwritten from localStorage on boot, before the first paint. */
+     The mono pair belongs to the panes that are grids of cells — the terminal
+     tabs and the file views — and is deliberately separate: a cell grid needs
+     a monospaced face whatever the prose face is set to, and 12pt reads better
+     in a shell than the 14pt that suits prose. Both are overwritten from
+     localStorage on boot, before the first paint, and every family in each
+     stack resolves to a locally installed copy or to the generic tail if the
+     stylesheet above never arrived. */
   --ui-font: "IBM Plex Sans Thai Looped", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
   --ui-size: 14pt;
+  --mono-font: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --mono-size: 12pt;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
@@ -92,16 +108,26 @@ body {
   color: var(--fg4); font-size: 12px; white-space: nowrap;
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
 }
-#type { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+/* The bar carries two pairs of controls — the face and size of prose, and the
+   face and size of code — so the second pair is separated from the first by a
+   little air rather than by a rule that would fight the gruvbox bar.
+
+   The block is shrinkable and wraps within itself: four controls and two font
+   names are wider than the bar of a half-screen window, and a control that has
+   been pushed off the edge is a control that cannot be reached. So the status
+   line gives up its room first (it ellipsises), then the pickers narrow, then
+   they move to a second row — which is why nothing here is `flex: 0 0 auto`. */
+#type { display: flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
 #type label { font-size: 11px; color: var(--fg4); }
-#font, #size {
+#type label.grp { margin-left: 8px; }
+#font, #size, #code, #code-size {
   background: var(--bg1); color: var(--fg1); border: 1px solid var(--bg2);
   border-radius: 3px; font: inherit; font-size: 12px; padding: 1px 3px; outline: none;
 }
-#font { max-width: 14em; }
-#size { width: 4.5em; }
-#font:focus, #size:focus { border-color: var(--bg4); }
-#font:hover, #size:hover { border-color: var(--bg4); }
+#font, #code { max-width: 14em; min-width: 7em; flex: 0 1 auto; }
+#size, #code-size { width: 4.5em; flex: 0 0 auto; }
+#font:focus, #size:focus, #code:focus, #code-size:focus { border-color: var(--bg4); }
+#font:hover, #size:hover, #code:hover, #code-size:hover { border-color: var(--bg4); }
 #type .reset {
   background: none; border: 1px solid var(--bg2); color: var(--fg4);
   border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px; padding: 1px 6px;
@@ -147,12 +173,16 @@ body {
 }
 #console-out { font-family: var(--ui-font); }
 /* A file tab shows source, and source is read by its columns: indentation that
-   lines up, aligned `=` signs, side-by-side diffs. The faces the picker offers
-   are proportional, so a file view keeps a monospaced face and takes only the
-   size — the console keeps the chosen face because its text is prose. */
+   lines up, aligned `=` signs, side-by-side diffs. So it takes the *code* pair
+   — the monospaced face and the code size — rather than the prose face the
+   console is drawn in. Every face the code picker offers is monospaced, so a
+   file view keeps its columns whichever one is chosen; the prose faces are
+   proportional and cannot tile columns, which is why they are not offered to
+   the panes that are grids. */
 .file-out {
   white-space: pre;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font-family: var(--mono-font);
+  font-size: var(--mono-size);
 }
 .file-head {
   flex: 0 0 auto; padding: 4px 12px; background: var(--bg0);
@@ -225,11 +255,13 @@ body {
 #stop:disabled { color: var(--fg4); border-color: var(--bg2); cursor: progress; }
 
 /* --- terminal tabs ---
-   A terminal tab is a pane of cells, so the face is monospaced no matter what
-   the picker is set to (proportionate glyphs cannot tile a grid) and the size
-   comes from the same --ui-size every other text area takes. The size is
-   applied here rather than by script: measureCell() then reads the numbers back
-   out of getComputedStyle, so the type control and the grid cannot disagree. */
+   A terminal tab is a pane of cells, so the face is the monospaced one the
+   picker's code list offers, whatever the prose face is set to (proportionate
+   glyphs cannot tile a grid), and the size is the code size the file views take
+   too. Both are applied here rather than by script: measureCell() then reads the
+   numbers back out of getComputedStyle, so the type controls and the grid cannot
+   disagree — and a face that finishes downloading late is caught by the same
+   poll that catches a window resize. */
 .term-head {
   flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
   padding: 4px 10px; background: var(--bg0); border-bottom: 1px solid var(--bg2);
@@ -259,11 +291,50 @@ body {
 .term-out {
   flex: 1 1 auto; overflow: auto; position: relative; outline: none;
   background: var(--bg0h); padding: 6px 8px; cursor: text;
-  font: var(--ui-size)/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font: var(--mono-size)/1.25 var(--mono-font);
   scrollbar-width: thin; scrollbar-color: var(--bg3) var(--bg0h);
+  /* The pane does its own keeping-still. A line that scrolls off the top of the
+     screen moves into the scrollback above it, which leaves every row of output
+     exactly where it was — but the browser cannot see that, it only sees rows
+     inserted above the viewport, and its own scroll anchoring would "correct" a
+     position that was never wrong. It also has no idea which of the pane's
+     changes the reader should be kept anchored to, so it gets switched off and
+     the code below says what happens on each one. */
+  overflow-anchor: none;
 }
+/* The scrollback: the rows that have already scrolled past the top of the
+   screen, in their own element above the grid so the grid can be repainted
+   without touching them.
+
+   A row is a `div` of its own, and the two properties that matter are both
+   about geometry: `white-space: pre` because a shell's column-aligned output is
+   made of spaces that a default `div` collapses, and the fixed height because a
+   row with nothing on it has no line box and would otherwise collapse to
+   nothing — which the pane's scroll arithmetic, measured in rows, would read as
+   a jump. Face, size and leading come from the pane by inheritance, so a row
+   tiles exactly like a row of the grid under it, and `line-height` is a fixed
+   length rather than a keyword, which is what makes "one row = one height" true
+   for every row in the block rather than merely usually true. */
+.term-hist { white-space: pre; }
+.term-hist-row { white-space: pre; min-height: 1.25em; }
 .panel:focus-within .term-out { box-shadow: inset 0 0 0 1px var(--bg4); }
-.term-grid { margin: 0; white-space: pre; }
+/* The grid has to be *told* the face, not left to inherit it. The browser's own
+   stylesheet puts `font-family: monospace` on `pre`, and an inherited value
+   loses to a UA declaration every time — a `pre` that is merely descended from
+   a styled pane draws in the UA's monospace whatever the code picker says. The
+   pane above is a `div`, so it was never affected; the grid is the element that
+   actually draws the cells, and it silently kept the same face through every
+   change the picker made.
+
+   Hence the same two properties here as on .term-out, spelled identically: the
+   span that measures the cell is a `span` and inherits from the pane, so if the
+   grid were drawn in a different face from the measure, the cell width sent to
+   the shell would not be the width the glyphs are drawn at, and a grid of cells
+   stops being a grid. */
+.term-grid {
+  margin: 0; white-space: pre;
+  font: var(--mono-size)/1.25 var(--mono-font);
+}
 /* The cell measure, in the pane's own font metrics: one long word plus a line
    break, measured by scrollWidth/scrollHeight. Hidden by having no layout of
    its own — it must not change the size of the thing whose size it gives. */
@@ -407,11 +478,13 @@ body {
   <b>jonnyq</b>
   <span id="status">connecting&hellip;</span>
   <span id="type">
-    <label for="font">font</label>
-    <select id="font" title="typeface of the console and the prompt box (a file view stays monospaced so its columns line up)"></select>
-    <label for="size">size</label>
-    <input id="size" type="number" min="8" max="40" step="1" title="text size in pt, for the console, the file views and the prompt box" aria-label="text size in pt">
-    <button class="reset" id="type-reset" title="back to IBM Plex Sans Thai Looped at 14pt">reset</button>
+    <label for="font">text</label>
+    <select id="font" title="typeface of the console, the prompt box and the bar (a file view and a terminal pane stay monospaced so their columns line up)"></select>
+    <input id="size" type="number" min="8" max="40" step="1" title="text size in pt, for the console and the prompt box" aria-label="text size in pt">
+    <label for="code" class="grp">code</label>
+    <select id="code" title="monospaced typeface of the terminal panes and the file views"></select>
+    <input id="code-size" type="number" min="8" max="40" step="1" title="code size in pt, for the terminal panes and the file views" aria-label="code size in pt">
+    <button class="reset" id="type-reset" title="back to IBM Plex Sans Thai Looped at 14pt and IBM Plex Mono at 12pt">reset</button>
   </span>
   <span id="conn">offline</span>
 </div>
@@ -456,19 +529,23 @@ let consoleTab = null;
 let treeRefresh = null;        /* the listing in flight, so two are never asked for */
 
 /* ------------------------------------------------------------ typography
-   Nine Thai faces from Google Fonts, in the order the user asked for them,
-   with IBM Plex Sans Thai Looped as the default. The value is the CSS family
-   name: if the stylesheet above never arrived (no internet) the name still
-   resolves to a locally installed copy of the same face, and otherwise to the
-   generic sans-serif the body falls back to — choosing a font is never a
-   network operation.
+   Two pickers, because the page draws two kinds of text. Nine Thai faces from
+   Google Fonts, in the order the user asked for them, set the console, the
+   prompt box and the chrome, with IBM Plex Sans Thai Looped as the default.
+   Eighteen monospaced faces, also from Google Fonts and also in the order
+   asked for, set the terminal panes and the file views, with IBM Plex Mono as
+   the default — those two surfaces are grids of cells, and a proportional face
+   cannot tile a grid, so the lists are deliberately separate.
 
-   Both settings live in localStorage, so a reload or a second tab keeps what
-   was picked, and they are written to two custom properties on :root rather
-   than to each element: one write moves the console, the prompt box, every
-   file tab and the chrome, including tabs opened later. A file view takes the
-   size only — it names a monospaced face for itself so source keeps its
-   columns. */
+   The value of each is the CSS family name: if the stylesheet above never
+   arrived (no internet) the name still resolves to a locally installed copy of
+   the same face, and otherwise to the generic family its stack ends in —
+   choosing a font is never a network operation.
+
+   All four settings live in one localStorage key, so a reload or a second tab
+   keeps what was picked, and they are written to four custom properties on
+   :root rather than to each element: one write moves every surface, including
+   a tab opened later, with no per-element bookkeeping. */
 const FONTS = [
   "IBM Plex Sans Thai Looped",
   "Playpen Sans Thai",
@@ -480,14 +557,39 @@ const FONTS = [
   "Thasadith",
   "Trirong",
 ];
+/* Every one of these is monospaced at Google Fonts (checked against the fonts
+   it serves), which is what makes it safe to offer them for a pane whose cells
+   have to line up. */
+const MONO_FONTS = [
+  "Source Code Pro",
+  "Roboto Mono",
+  "JetBrains Mono",
+  "IBM Plex Mono",
+  "Space Mono",
+  "Fira Code",
+  "Google Sans Code",
+  "Ubuntu Mono",
+  "Ubuntu Sans Mono",
+  "Anonymous Pro",
+  "Nova Mono",
+  "Syne Mono",
+  "Iosevka Charon Mono",
+  "Sono",
+  "Intel One Mono",
+  "SUSE Mono",
+  "Cascadia Mono",
+  "Libertinus Mono",
+];
 const DEFAULT_FONT = "IBM Plex Sans Thai Looped";
+const DEFAULT_MONO_FONT = "IBM Plex Mono";
 const DEFAULT_SIZE = 14;                  /* pt */
+const DEFAULT_MONO_SIZE = 12;             /* pt */
 const SIZE_MIN = 8, SIZE_MAX = 40;
 const LS = "jonnyq.type";                /* the one localStorage key */
 
-function clampSize(v) {
+function clampSize(v, dflt) {
   const n = Math.round(parseFloat(v));
-  if (!Number.isFinite(n)) return DEFAULT_SIZE;
+  if (!Number.isFinite(n)) return dflt;
   return Math.min(SIZE_MAX, Math.max(SIZE_MIN, n));
 }
 
@@ -496,8 +598,16 @@ function storedType() {
     const raw = localStorage.getItem(LS);
     if (!raw) return null;
     const v = JSON.parse(raw);
+    /* A stored value from an older page carries only `font` and `size`; the
+       code pair falls back to its defaults rather than poisoning the stack. An
+       unknown family name is dropped for the same reason. */
     const font = FONTS.includes(v && v.font) ? v.font : DEFAULT_FONT;
-    return { font, size: clampSize(v && v.size) };
+    const code = MONO_FONTS.includes(v && v.code) ? v.code : DEFAULT_MONO_FONT;
+    return {
+      font, code,
+      size: clampSize(v && v.size, DEFAULT_SIZE),
+      codeSize: clampSize(v && v.codeSize, DEFAULT_MONO_SIZE),
+    };
   } catch { return null; }    /* private mode, or a hand-edited value */
 }
 
@@ -505,7 +615,10 @@ function storeType(t) {
   try { localStorage.setItem(LS, JSON.stringify(t)); } catch {}
 }
 
-let typeface = storedType() || { font: DEFAULT_FONT, size: DEFAULT_SIZE };
+let typeface = storedType() || {
+  font: DEFAULT_FONT, size: DEFAULT_SIZE,
+  code: DEFAULT_MONO_FONT, codeSize: DEFAULT_MONO_SIZE,
+};
 
 function applyType() {
   const r = document.documentElement.style;
@@ -513,44 +626,87 @@ function applyType() {
      multi-word family in a custom property does not match. */
   r.setProperty("--ui-font", '"' + typeface.font.replace(/"/g, "") + '", ui-sans-serif, system-ui, sans-serif');
   r.setProperty("--ui-size", typeface.size + "pt");
+  /* The code stack ends in the generic monospace, not in a sans-serif: a face
+     that never downloaded must still draw monospaced, or the terminal's cells
+     and a file's columns stop lining up. */
+  r.setProperty("--mono-font", '"' + typeface.code.replace(/"/g, "") + '", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace');
+  r.setProperty("--mono-size", typeface.codeSize + "pt");
+  /* A pane's cell measure is whatever the face it is drawn in says it is, so
+     every shell is told its new size — now if it can be measured now, and by
+     the fit poll if the pane is hidden and measures nothing. */
+  refitTerms();
+}
+
+/* Re-measure every live shell, because its cell is whatever the code face says
+   it is. termTabs is the shells rather than the tabs, so a shell that has not
+   finished opening is not measured from a pane that measures nothing — it is
+   measured by termStart when its session lands. termFit sends nothing unless
+   the numbers moved, so this is free when the change did not affect the grid. */
+function refitTerms() {
+  for (const t of termTabs.values()) termFit(t);
 }
 
 function syncTypeControls() {
   $("font").value = typeface.font;
   $("size").value = typeface.size;
+  $("code").value = typeface.code;
+  $("code-size").value = typeface.codeSize;
 }
 
-function buildTypeControls() {
-  const sel = $("font");
-  for (const f of FONTS) {
+/* One `<select>` of font names, each option drawn in its own face so the list
+   is a preview of what picking it does rather than a list of names to guess at.
+   The generic tail differs by list: a code option previews as monospace, so an
+   undownloaded face still looks like what it will be. */
+function fillFontSelect(sel, faces, generic) {
+  for (const f of faces) {
     const o = document.createElement("option");
     o.value = f;
     o.textContent = f;
-    /* Preview the face in its own option, so the list is a menu of what the
-       console will look like rather than a list of names to guess at. */
-    o.style.fontFamily = '"' + f + '", sans-serif';
+    o.style.fontFamily = '"' + f + '", ' + generic;
     sel.appendChild(o);
   }
-  sel.addEventListener("change", () => {
-    typeface = { font: FONTS.includes(sel.value) ? sel.value : DEFAULT_FONT, size: typeface.size };
+}
+
+function buildTypeControls() {
+  fillFontSelect($("font"), FONTS, "sans-serif");
+  fillFontSelect($("code"), MONO_FONTS, "monospace");
+  $("font").addEventListener("change", (e) => {
+    const v = e.currentTarget.value;
+    typeface = { ...typeface, font: FONTS.includes(v) ? v : DEFAULT_FONT };
     applyType(); syncTypeControls(); storeType(typeface);
   });
-  const box = $("size");
-  const commit = () => {
-    /* The number input is trusted only after clamping, and the field is then
-       rewritten to what was actually applied, so "3" cannot sit in a box that
-       is drawing 8pt. */
-    typeface = { font: typeface.font, size: clampSize(box.value) };
+  $("code").addEventListener("change", (e) => {
+    const v = e.currentTarget.value;
+    typeface = { ...typeface, code: MONO_FONTS.includes(v) ? v : DEFAULT_MONO_FONT };
+    applyType(); syncTypeControls(); storeType(typeface);
+  });
+  /* One number field per pair. The input is trusted only after clamping, and
+     the field is then rewritten to what was actually applied, so "3" cannot sit
+     in a box that is drawing 8pt. */
+  const sizeBox = $("size"), codeBox = $("code-size");
+  const commit = (key, box, dflt) => {
+    typeface = { ...typeface, [key]: clampSize(box.value, dflt) };
     applyType(); syncTypeControls(); storeType(typeface);
   };
-  box.addEventListener("change", commit);
-  box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } });
+  sizeBox.addEventListener("change", () => commit("size", sizeBox, DEFAULT_SIZE));
+  codeBox.addEventListener("change", () => commit("codeSize", codeBox, DEFAULT_MONO_SIZE));
+  for (const [key, box, dflt] of [["size", sizeBox, DEFAULT_SIZE], ["codeSize", codeBox, DEFAULT_MONO_SIZE]])
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commit(key, box, dflt); } });
   $("type-reset").addEventListener("click", () => {
-    typeface = { font: DEFAULT_FONT, size: DEFAULT_SIZE };
+    typeface = {
+      font: DEFAULT_FONT, size: DEFAULT_SIZE,
+      code: DEFAULT_MONO_FONT, codeSize: DEFAULT_MONO_SIZE,
+    };
     applyType(); syncTypeControls(); storeType(typeface);
   });
   applyType();
   syncTypeControls();
+  /* A webfont that lands after the first paint changes the cell the grid was
+     measured in. The fit poll catches it within its tick anyway, but the face's
+     own ready promise says when the faces have arrived, so a pane retiles as
+     soon as it can rather than up to a poll interval later. */
+  if (document.fonts && document.fonts.ready && document.fonts.ready.then)
+    document.fonts.ready.then(refitTerms, () => {});
 }
 
 /* ------------------------------------------------------------------ utils */
@@ -780,7 +936,11 @@ function blankLine(cols) {
   const ch = new Array(cols);
   const at = new Array(cols);
   for (let i = 0; i < cols; i++) { ch[i] = " "; at[i] = ""; }
-  return { ch, at };
+  /* `cont`: this row runs on to the next one, so the two are one logical line
+     drawn across two rows. It is what makes the scrollback re-wrappable — and
+     it lives on the row rather than on the screen, because a row keeps its
+     identity when it scrolls up into the history. */
+  return { ch, at, cont: false };
 }
 
 /* DEC special graphics (the ACS line-drawing set), used by `less`, `vim` and
@@ -809,6 +969,19 @@ function xterm256(n) {
   return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/* How many scrolled-past rows a pane remembers. A terminal emulator keeps a
+   scrollback for exactly this reason and every one of them bounds it: a `cat`
+   of a 200 MB log must not turn the tab into a 200 MB DOM. 2000 rows is deep
+   enough to read a build's output from the top and shallow enough that drawing
+   it is never the expensive part of a frame. */
+const TERM_HIST = 2000;
+
+/* How far below the cap the scrollback is cut when it overflows. Trimming one
+   row at a time would mean re-rendering two thousand rows for every row the
+   next `cat` pushes out, so a whole block goes at once and the redraw is
+   amortised to one in TERM_HIST_TRIM rows. */
+const TERM_HIST_TRIM = 250;
+
 class TermScreen {
   constructor(cols, rows) {
     this.cols = Math.max(1, cols | 0);
@@ -824,6 +997,20 @@ class TermScreen {
   reset() {
     this.lines = [];
     for (let r = 0; r < this.rows; r++) this.lines.push(blankLine(this.cols));
+    /* The scrollback: rows that have gone past the top of the screen. They are
+       kept here rather than re-derived from the screen, because by the time the
+       reader scrolls up the shell has overwritten those cells. Rows are the
+       same row objects the screen drew, never copies, so colour survives the
+       trip, and `cont` says which ones were soft-wrapped, so they can be
+       re-wrapped at a new width.
+
+       A live screen being reset loses its scrollback with it (`RIS` is the
+       shell saying "forget everything"), and the pane has to be told; a fresh
+       screen has nothing to say. */
+    this.histRebuild = !!(this.hist && this.hist.length);
+    this.hist = [];
+    this.histAdd = [];        /* rows drawn since the pane last looked           */
+    this.histDrop = 0;        /* rows lost to the cap, likewise                  */
     this.x = 0; this.y = 0;
     this.top = 0; this.bottom = this.rows - 1;
     this.attr = "";
@@ -863,11 +1050,93 @@ class TermScreen {
     };
     this.lines = rescale(this.lines);
     if (this.alt) this.alt.lines = rescale(this.alt.lines);
+    /* The scrollback is re-told at the new width rather than cut and padded
+       like the screen: the rows that scrolled past are the ones the reader went
+       back to read, and the tail of a wrapped line is the interesting part of
+       it. A height-only change leaves it exactly as it was — those rows were
+       already drawn at this width. */
+    if (cols !== this.cols) { this.rewrapHist(cols); this.histRebuild = true; }
     this.cols = cols; this.rows = rows;
     this.top = 0; this.bottom = rows - 1;
     this.x = Math.min(this.x, cols - 1);
     this.y = Math.min(this.y, rows - 1);
     this.wrap = false;
+  }
+
+  /* --------------------------------------------------------- scrollback */
+
+  /* The scrollback retold at a new width. Rows that were soft-wrapped are
+     joined back into the line they were and re-split, so a line that took two
+     rows at 80 columns takes one at 160 and three at 60 — which is what the
+     reader who widened the pane to read it expects. A row that ended with a
+     hard line break stays a row of its own, however short it is. */
+  rewrapHist(cols) {
+    if (!this.hist.length || this.cols === cols) return;
+    const rows = [];
+    let ch = [], at = [];
+    for (const ln of this.hist) {
+      for (let c = 0; c < this.cols; c++) {
+        ch.push(ln.ch[c] !== undefined ? ln.ch[c] : " ");
+        at.push(ln.at[c] !== undefined ? ln.at[c] : "");
+      }
+      if (!ln.cont) { splitRow(rows, ch, at, cols); ch = []; at = []; }
+    }
+    if (ch.length) splitRow(rows, ch, at, cols);
+    this.hist = rows;
+    this.histRebuild = true;
+  }
+
+  /* Everything that scrolled past, as the pane asked for it: `rebuild` when
+     the whole scrollback has to be drawn again (a resize changed the width it
+     is drawn at, or it was thrown away), otherwise the rows appended at the
+     end and the count of rows lost off the front. That split is what lets the
+     pane keep both ends cheaply, instead of redrawing two thousand rows per
+     keystroke. `null` when nothing has changed since it last looked. */
+  takeHist() {
+    if (this.histRebuild) {
+      this.histRebuild = false;
+      this.histAdd.length = 0;
+      this.histDrop = 0;
+      return { rebuild: this.hist.map((ln) => this.rowHtml(ln, -1)) };
+    }
+    if (!this.histAdd.length && !this.histDrop) return null;
+    const out = { add: this.histAdd.splice(0), drop: this.histDrop };
+    this.histDrop = 0;
+    return out;
+  }
+
+  /* One row out of the top of the scroll region and into the reader's reach —
+     except while the alternate screen is up or a scroll region other than the
+     whole screen is set, which is what a real terminal does and the reason
+     `vim` and `htop` do not fill the scrollback with their redraws. */
+  keepHist(ln) {
+    /* Only a full-screen scroll is scrollback material. While the alternate
+       screen is up (a `vim`, a `less`) or a scroll region short of the whole
+       screen is set (`htop`'s status line), the row that leaves the top is
+       somebody's redraw, not output that went past — which is precisely why
+       those programs do not fill a real terminal's scrollback either. */
+    if (this.altActive || this.top !== 0 || this.bottom !== this.rows - 1) return;
+    this.hist.push(ln);
+    this.histAdd.push(this.rowHtml(ln, -1));
+    /* Past the cap the oldest rows go, counted rather than re-rendered: the
+       pane drops them off the front of its own element, which is a splice and
+       not a redraw of two thousand rows. The overshoot (TERM_HIST_TRIM) keeps
+       the splice off the common path. */
+    if (this.hist.length > TERM_HIST + TERM_HIST_TRIM) {
+      const cut = this.hist.length - TERM_HIST;
+      this.hist.splice(0, cut);
+      this.histDrop += cut;
+    }
+  }
+
+  /* The scrollback is gone (a full reset, or `CSI 3 J`, which is the sequence
+     that means "and throw away the history"). */
+  dropHist() {
+    if (!this.hist.length && !this.histAdd.length) return;
+    this.hist.length = 0;
+    this.histAdd.length = 0;
+    this.histDrop = 0;
+    this.histRebuild = true;
   }
 
   /* ---------------------------------------------------------------- feed */
@@ -986,10 +1255,23 @@ class TermScreen {
       }
     }
     if (this.charset && DEC_GRAPHICS[ch] !== undefined) ch = DEC_GRAPHICS[ch];
-    if (this.wrap) { this.x = 0; this.lineFeed(); this.wrap = false; }
+    if (this.wrap) {
+      /* The row just filled up and this glyph is going on the next one: mark
+         the row it came from as *continued*, which is the only way the
+         scrollback can later tell a line that ran on from a line that ended
+         with a real Enter. Without it a resize would join two separate
+         commands into one. */
+      const prev = this.lines[this.y];
+      if (prev) prev.cont = true;
+      this.x = 0; this.lineFeed(); this.wrap = false;
+    }
     const ln = this.lines[this.y];
     ln.ch[this.x] = ch;
     ln.at[this.x] = this.attr;
+    /* Writing here decides the row's own ending, so a redraw over a row that
+       once wrapped (a prompt short enough to fit, over the wrapped long one it
+       replaces) stops claiming a continuation it no longer has. */
+    ln.cont = false;
     if (this.x >= this.cols - 1) this.wrap = true;    /* deferred wrap */
     else this.x++;
   }
@@ -1017,9 +1299,13 @@ class TermScreen {
     else if (this.y > 0) this.y--;
   }
 
+  /* Scroll one row out of the region. When the region is the whole screen the
+     row that leaves the top is what the reader scrolled up to find, so it goes
+     into the scrollback rather than being thrown away. */
   scrollUp(top) {
     const [t, b] = top <= this.bottom ? [top, this.bottom] : [0, this.rows - 1];
-    this.lines.splice(t, 1);                  /* the region's top line leaves */
+    const gone = this.lines.splice(t, 1)[0];     /* the region's top line leaves */
+    if (gone && t === 0) this.keepHist(gone);
     this.lines.splice(b, 0, blankLine(this.cols));
   }
 
@@ -1056,7 +1342,10 @@ class TermScreen {
       for (let r = 0; r < this.y; r++) this.eraseRange(r, 0, this.cols - 1);
     } else if (mode === 2 || mode === 3) {
       for (let r = 0; r < this.rows; r++) this.eraseRange(r, 0, this.cols - 1);
-      if (mode === 3) this.wrap = false;        /* xterm's 3 also clears history */
+      /* xterm's 3 also clears the scrollback, which is the one erase a shell
+         can be *asked* to do (`clear` on many of them, `reset` on all) and the
+         one the reader would notice missing. */
+      if (mode === 3) { this.wrap = false; this.dropHist(); }
     } else {
       this.eraseLine(0);
       for (let r = this.y + 1; r < this.rows; r++) this.eraseRange(r, 0, this.cols - 1);
@@ -1069,6 +1358,7 @@ class TermScreen {
       this.lines.splice(this.y, 0, blankLine(this.cols));
       this.lines.splice(this.bottom + 1, 1);
     }
+    this.forgetWrap(this.top, this.bottom);
     this.wrap = false;
   }
 
@@ -1078,7 +1368,17 @@ class TermScreen {
       this.lines.splice(this.y, 1);
       this.lines.splice(this.bottom + 1, 0, blankLine(this.cols));
     }
+    this.forgetWrap(this.top, this.bottom);
     this.wrap = false;
+  }
+
+  /* Rows the program has just shuffled cannot be trusted to say what continues
+     what: `cont` is a claim about the row *below* this one, and line
+     insertion/deletion moves rows relative to each other. Better to lose a
+     join in the scrollback's re-wrap than to weld two unrelated lines together,
+     so the claim is dropped over the region that moved. */
+  forgetWrap(from, to) {
+    for (let r = from; r <= to && r < this.lines.length; r++) this.lines[r].cont = false;
   }
 
   /* ------------------------------------------------------------ sequences */
@@ -1303,46 +1603,89 @@ class TermScreen {
 
   /* -------------------------------------------------------------- render */
 
-  /* The screen as HTML: one line per row inside a `pre`, cells grouped into a
-     span per run of equal attributes, the cursor drawn as a block over the
-     glyph it sits on. Escaped, so shell output can never be markup. */
-  render() {
+  /* One row as HTML: cells grouped into a span per run of equal attributes,
+     escaped so shell output can never be markup. `cursor` is the column the
+     block sits on, or -1 for a row no cursor is on — which is every row of the
+     scrollback, since there is only ever one cursor and it is on the screen. */
+  rowHtml(ln, cursor) {
     let out = "";
-    for (let r = 0; r < this.lines.length; r++) {
-      if (r) out += "\n";
-      const ln = this.lines[r];
-      let c = 0;
-      while (c < this.cols) {
-        const here = r === this.y && c === this.x && this.visible;
-        const a = ln.at[c];
-        let j = c;
-        const text = [];
-        /* One run: equal attributes, and the cursor's cell always stands alone
-           so its block can be drawn over exactly one glyph. */
-        while (j < this.cols && ln.at[j] === a) {
-          const atCursor = r === this.y && j === this.x && this.visible;
-          if (atCursor !== here) break;
-          text.push(ln.ch[j]);
-          j++;
-          if (here) break;
-        }
-        const body = esc(text.join(""));
-        const cls = classesFor(a, here);
-        const style = styleFor(a);
-        if (body === "" && !cls && !style) { /* nothing to draw */ }
-        else if (cls || style) {
-          out += "<span" + (cls ? ' class="' + cls + '"' : "") +
-                 (style ? ' style="' + style + '"' : "") + ">" + body + "</span>";
-        } else out += body;
-        c = j;
+    let c = 0;
+    while (c < this.cols) {
+      const here = c === cursor;
+      const a = ln.at[c];
+      let j = c;
+      const text = [];
+      /* One run: equal attributes, and the cursor's cell always stands alone
+         so its block can be drawn over exactly one glyph. */
+      while (j < this.cols && ln.at[j] === a) {
+        const atCursor = j === cursor;
+        if (atCursor !== here) break;
+        text.push(ln.ch[j]);
+        j++;
+        if (here) break;
       }
+      const body = esc(text.join(""));
+      const cls = classesFor(a, here);
+      const style = styleFor(a);
+      if (body === "" && !cls && !style) { /* nothing to draw */ }
+      else if (cls || style) {
+        out += "<span" + (cls ? ' class="' + cls + '"' : "") +
+               (style ? ' style="' + style + '"' : "") + ">" + body + "</span>";
+      } else out += body;
+      c = j;
     }
     return out;
   }
 
-  /* Plain text, for a test or for copying the pane. */
+  /* The screen as HTML: one line per row, the cursor drawn as a block over the
+     glyph it sits on. The scrollback is not here — it is drawn once per row
+     into its own element by `takeHist`, because it changes one row at a time
+     and repainting two thousand rows per keystroke is not a frame. */
+  render() {
+    let out = "";
+    for (let r = 0; r < this.lines.length; r++) {
+      if (r) out += "\n";
+      const cursor = r === this.y && this.visible ? this.x : -1;
+      out += this.rowHtml(this.lines[r], cursor);
+    }
+    return out;
+  }
+
+  /* Plain text, for a test or for copying the pane: what is on the screen. The
+     scrollback is deliberately not in here — `histText()` is the one that
+     reaches above the top, and a test that reads the screen wants the screen. */
   text() {
     return this.lines.map((ln) => ln.ch.join("").replace(/\s+$/, "")).join("\n").replace(/\n+$/, "");
+  }
+
+  /* The scrollback as text, oldest row first: what the reader who scrolled up
+     is looking at. Wrapped rows are joined, so a line that took two rows reads
+     as the line it was. */
+  histText() {
+    const rows = [];
+    let line = "";
+    for (const ln of this.hist) {
+      line += ln.ch.join("").replace(/\s+$/, "");
+      if (!ln.cont) { rows.push(line); line = ""; }
+    }
+    if (line) rows.push(line);
+    return rows.join("\n");
+  }
+}
+
+/* A logical line's cells split into rows of `cols`, the way the screen splits
+   one: the last row is kept even when it is empty, because a line that ends
+   short still occupies the row it was written on. */
+function splitRow(rows, ch, at, cols) {
+  if (!ch.length) { rows.push(blankLine(cols)); return; }
+  for (let i = 0; i < ch.length; i += cols) {
+    const ln = blankLine(cols);
+    for (let c = 0; c < cols; c++) {
+      ln.ch[c] = ch[i + c] !== undefined ? ch[i + c] : " ";
+      ln.at[c] = at[i + c] !== undefined ? at[i + c] : "";
+    }
+    ln.cont = i + cols < ch.length;
+    rows.push(ln);
   }
 }
 
@@ -1451,10 +1794,18 @@ function wireTerm(t) {
     dead: false,
     pending: "",          /* bytes owed to the shell (a query reply) */
     queue: "",            /* bytes for the shell, waiting on its id */
+    out: out,
     grid: t.el.querySelector(".term-grid"),
+    hist: t.el.querySelector(".term-hist"),
     size: t.el.querySelector(".term-size"),
     input: ta,
     dirty: false,
+    /* The pane's own units: how tall one row of the grid is in pixels, and how
+       many rows of scrollback are in the document above it. Both are needed to
+       talk about the reader's position in rows rather than in pixels, which is
+       the only unit that survives a font change. */
+    cellH: 0,
+    histRows: 0,
   };
   /* The textarea is what has focus — a browser only starts an IME composition,
    honours a layout's dead keys, or raises a soft keyboard on a phone when there
@@ -1472,7 +1823,16 @@ function wireTerm(t) {
     /* A middle-click paste of the X selection arrives as a `paste` event on
        Firefox and as nothing at all on Chrome; keeping the input focused is
        the part that is always in our hands. */
-    if (!e.shiftKey) { e.preventDefault(); ta.focus(); }
+    if (e.shiftKey) return;
+    /* A press on the pane's own scrollbar belongs to the scrollbar. The bar is
+       drawn inside the element's box, so it is this same handler that sees the
+       press, and cancelling it cancels the drag before it starts — leaving a
+       scroll bar that is visible and a pane that only the wheel can move.
+       `offsetX/Y` are measured against the padding box, so anything past the
+      client width/height is the bar rather than the text. */
+    if (e.offsetX >= out.clientWidth || e.offsetY >= out.clientHeight) return;
+    e.preventDefault();
+    ta.focus();
   });
   /* Every click in the pane means "I am typing into this shell now". */
   t.el.addEventListener("focusin", () => { if (!t.term.dead) ta.focus(); });
@@ -1562,6 +1922,12 @@ function termFit(t, force) {
   const w = size.scrollWidth / 80;
   const h = size.scrollHeight / 9;
   if (!(w > 0) || !(h > 0)) return;
+  /* The row height in pixels, which is what the scrollback's rows are `high`
+     in: the reader's position and the correction for a row entering or leaving
+     the history are both counted in rows, so the pane needs the one number that
+     turns one into the other. Measured here rather than from the grid, because
+     this is the code that already measures the cell. */
+  me.cellH = h;
   const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
   const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
   /* The scroll bar takes room the grid cannot use, and it is only there once
@@ -1652,6 +2018,14 @@ function termKey(t, e) {
   }
   if (e.key === "Backspace") { e.preventDefault(); termSend(t, "\x7f"); termDone(t); return; }
   if (e.key === "Escape") { e.preventDefault(); termSend(t, "\x1b"); termDone(t); return; }
+  /* Shift-PgUp / Shift-PgDn is the one keyboard route to the scrollback, and
+     it is the convention every desktop terminal uses (the plain keys stay the
+     shell's, because `less` and `man` are the reason anyone presses them). */
+  if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
+    e.preventDefault();
+    termScroll(me, (e.key === "PageUp" ? -1 : 1) * Math.max(1, me.rows - 2));
+    return;
+  }
   /* The names are the DOM's (`ArrowUp`, not `Up`) — a map keyed by what the
      escape sequence wants, not by what the browser calls the key, is a map
      that silently sends nothing for every arrow. */
@@ -1751,6 +2125,17 @@ function termDone(t) {
   out.scrollTop = out.scrollHeight;         /* typing always shows what you typed */
 }
 
+/* Nudge the pane through its scrollback, in rows rather than pixels: a page
+   that scrolls by a fixed number of pixels moves a different amount of text
+   every time the code face or size changes, and the reader is asking for lines. */
+function termScroll(me, rows) {
+  const out = me.out;
+  if (!out) return;
+  const step = rows * (me.cellH > 0 ? me.cellH : 16);
+  out.scrollTop = Math.max(0, Math.min(out.scrollHeight - out.clientHeight,
+                                       out.scrollTop + step));
+}
+
 function termPaste(t, e) {
   const text = (e.clipboardData || window.clipboardData).getData("text");
   if (!text) return;
@@ -1834,7 +2219,11 @@ function termFrame(buf) {
   termOutput(t, all.subarray(1 + n));
 }
 
-/* Shell output. */
+/* Shell output. The screen is drawn and the reader's position dealt with by
+   `termDraw`'s frame — including the "am I at the bottom, or have I scrolled up
+   to read something" question, which is now a question about two different
+   parts of the pane (the scrollback above and the screen below) and belongs with
+   the code that knows where each of them starts. */
 function termOutput(t, bytes) {
   const me = t.term;
   if (me.dead) return;
@@ -1845,15 +2234,12 @@ function termOutput(t, bytes) {
   const back = me.screen.takeOutput();
   if (back) termFeed(t, back);
   termDraw(t);
-  const out = t.el.querySelector(".term-out");
-  /* Follow the output only when already at the bottom, so a `cat` of a long
-     file does not drag a scroll-up back down — the same rule the console uses. */
-  if (out.scrollTop + out.clientHeight >= out.scrollHeight - 30) out.scrollTop = out.scrollHeight;
 }
 
-/* Draw the screen. Coalesced into one frame: a `cat` of a big file arrives in
-   many chunks and repainting per chunk is a layout per chunk for something the
-   browser can only show once per frame anyway.
+/* Draw the screen, and the scrollback above it. Coalesced into one frame: a
+   `cat` of a big file arrives in many chunks and repainting per chunk is a
+   layout per chunk for something the browser can only show once per frame
+   anyway.
 
    The rAF callback re-reads `t.term` rather than closing over its contents, and
    the grid over `me.grid`, because this runs after the tab may have been
@@ -1867,8 +2253,97 @@ function termDraw(t) {
   requestAnimationFrame(() => {
     const now = t.term;
     if (now) now.dirty = false;
-    if (grid) grid.innerHTML = t.term ? t.term.screen.render() : "";
+    if (!grid) return;
+    if (!now) { grid.innerHTML = ""; return; }
+    /* The scrollback first — the rows it gains and loses are what can move the
+       reader's view, and where they land decides what the pane has to do about
+       it — then the screen below it, then the keeping-still. */
+    const keep = termHistSync(now, now.screen.takeHist());
+    grid.innerHTML = now.screen.render();
+    termFollow(now, keep);
   });
+}
+
+/* One row of scrollback, as a node of its own. Per row rather than one string
+   for the whole scrollback because the only two things that ever happen to it
+   are "append one" and "drop some off the front", and both are splices when
+   each row is its own node — whereas `innerHTML =` of two thousand rows is a
+   parse of the entire scrollback for every line the shell prints. */
+function termHistRow(html) {
+  const d = document.createElement("div");
+  d.className = "term-hist-row";
+  d.innerHTML = html;
+  return d;
+}
+
+/* Put the scrollback's rows into the pane: whole redraw when the width changed
+   (every row was measured in the old cell) or the history was thrown away,
+   otherwise append what is new and drop what is past the cap.
+   `me.cellH` and `me.histRows` are the pane's own units of distance, and the
+   reader's position is measured in them, which is what makes the correction
+   below arithmetic rather than a guess.
+
+   Returns what the pane owes the reader for having done it — whether they were
+   at the bottom, and how many rows the document under them moved by — or null
+   when the scrollback did not change at all. The pane's scroll position is read
+   *before* the DOM is touched: appending is what makes the browser lay the pane
+   out again, so a position read afterwards is a position already moved. */
+function termHistSync(me, h) {
+  const el = me.hist, out = me.out;
+  if (!el || !h) return null;
+  const hgt = me.cellH;
+  const was = out ? out.scrollTop : 0;
+  const atBottom = !out || termAtBottom(out);
+  /* Rows above the screen, before this frame: the boundary between "the reader
+     is reading the scrollback" and "the reader is looking at the screen". */
+  const before = me.histRows;
+  let added = 0, dropped = 0;
+  if (h.rebuild) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    for (const row of h.rebuild) el.appendChild(termHistRow(row));
+    me.histRows = h.rebuild.length;
+  } else {
+    added = h.add.length;
+    dropped = h.drop || 0;
+    for (const row of h.add) el.appendChild(termHistRow(row));
+    for (let i = 0; i < dropped && el.firstChild; i++) el.removeChild(el.firstChild);
+    me.histRows += added - dropped;
+  }
+  /* Rows enter the scrollback at its foot, so they push the *screen* down and
+     leave everything above untouched: a reader who has scrolled up to read what
+     went past sees them appear below their view and is not moved at all, while
+     a reader looking at the screen has their text pushed down by exactly the
+     rows added. Rows the cap takes off the front are the mirror image — they sat
+     above everything, so the document slid up when they went. */
+  let rows = 0;
+  if (!h.rebuild && hgt > 0) rows = -dropped + (was >= before * hgt ? added : 0);
+  return { atBottom: atBottom, rows: rows };
+}
+
+/* Keep the reader looking at what they were looking at, after a frame that
+   changed how much scrollback there is. The pane sets `overflow-anchor: none`,
+   so this is the only thing deciding what happens to a scrolled-up reader — the
+   browser's own anchoring is disabled precisely because it cannot tell a row
+   that entered the history from a row the reader asked to see. A rebuild (a
+   re-wrap at a new width) gets no correction: the rows themselves are different,
+   and a real terminal moves a scrolled-up reader's text on reflow too. */
+function termFollow(me, keep) {
+  const out = me.out;
+  if (!out) return;
+  /* Nothing entered or left the scrollback this frame, so nothing moved under
+     the reader: only one who was already following gets pinned to the new
+     bottom, and one who scrolled up is left where they are. */
+  if (!keep) { if (termAtBottom(out)) out.scrollTop = out.scrollHeight; return; }
+  if (keep.atBottom) { out.scrollTop = out.scrollHeight; return; }
+  if (!keep.rows || !(me.cellH > 0)) return;
+  out.scrollTop = Math.max(0, out.scrollTop + keep.rows * me.cellH);
+}
+
+/* At the bottom, within a couple of rows: the same tolerance the console tab
+   uses, so a pane the reader is following does not unstick itself over a
+   rounding difference. */
+function termAtBottom(out) {
+  return out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
 }
 
 /* ---------------------------------------------------------------- tabs */
@@ -1903,7 +2378,8 @@ function makeTab(name, kind, path) {
       '<div class="term-head"><span class="dir"></span><span class="shell"></span>' +
       '<span class="spacer"></span><button class="new">New</button>' +
       '<button class="kill">Kill</button></div>' +
-      '<div class="term-out"><pre class="term-grid"></pre>' +
+      '<div class="term-out"><div class="term-hist"></div>' +
+      '<pre class="term-grid"></pre>' +
       '<span class="term-size" aria-hidden="true"></span></div>' +
       '<textarea class="term-input" tabindex="0" spellcheck="false" wrap="off" ' +
       'autocapitalize="off" autocorrect="off" autocomplete="off" ' +
@@ -3318,8 +3794,8 @@ mod tests {
         }
     }
 
-    /// The nine faces the human asked for, in the order asked for, with IBM
-    /// Plex Sans Thai Looped as the default — and the stylesheet that offers
+    /// The nine prose faces the human asked for, in the order asked for, with
+    /// IBM Plex Sans Thai Looped as the default — and the stylesheet that offers
     /// them. The list lives in the page rather than in the server, so the
     /// choice is one write to a CSS property and never a request.
     #[test]
@@ -3354,6 +3830,413 @@ mod tests {
         );
     }
 
+    /// The eighteen monospaced faces the human asked for, in the order asked
+    /// for, with IBM Plex Mono as the default — the list the terminal panes and
+    /// the file views draw in.
+    ///
+    /// They are offered to those surfaces only, because every one of them is
+    /// monospaced (each was checked against the face Google Fonts serves: one
+    /// advance width across the printable ASCII range, at 400 and at 700). A
+    /// cell grid cannot be drawn in a proportional face, so the prose list is
+    /// not offered to a pane and this list is not offered to the console.
+    #[test]
+    fn the_eighteen_mono_faces_are_offered_with_the_named_default() {
+        let want = [
+            "Source Code Pro",
+            "Roboto Mono",
+            "JetBrains Mono",
+            "IBM Plex Mono",
+            "Space Mono",
+            "Fira Code",
+            "Google Sans Code",
+            "Ubuntu Mono",
+            "Ubuntu Sans Mono",
+            "Anonymous Pro",
+            "Nova Mono",
+            "Syne Mono",
+            "Iosevka Charon Mono",
+            "Sono",
+            "Intel One Mono",
+            "SUSE Mono",
+            "Cascadia Mono",
+            "Libertinus Mono",
+        ];
+        assert_eq!(want.len(), 18);
+        for f in want {
+            assert!(
+                INDEX_HTML.contains(&format!("\"{f}\"")),
+                "missing {f} in the code list"
+            );
+            assert!(
+                INDEX_HTML.contains(&f.replace(' ', "+")),
+                "{f} is not requested from Google Fonts"
+            );
+        }
+        assert!(INDEX_HTML.contains("const DEFAULT_MONO_FONT = \"IBM Plex Mono\""));
+        assert!(
+            INDEX_HTML.contains("--mono-font: \"IBM Plex Mono\""),
+            "the CSS default code face must match DEFAULT_MONO_FONT"
+        );
+
+        // The list is exactly those eighteen, in that order, and none of them
+        // leaks into the prose list (and vice versa): the two pickers offer two
+        // different kinds of face.
+        let list = INDEX_HTML
+            .split("const MONO_FONTS = [")
+            .nth(1)
+            .and_then(|s| s.split("];").next())
+            .expect("MONO_FONTS");
+        let at = |f: &str| {
+            list.find(&format!("\"{f}\""))
+                .unwrap_or_else(|| panic!("{f} is not in MONO_FONTS"))
+        };
+        let mut last = 0;
+        for f in want {
+            let here = at(f);
+            assert!(here > last, "{f} is out of the order it was asked for in");
+            last = here;
+        }
+        assert_eq!(
+            list.matches('"').count() / 2,
+            want.len(),
+            "MONO_FONTS must hold exactly the eighteen asked for"
+        );
+        let prose = INDEX_HTML
+            .split("const FONTS = [")
+            .nth(1)
+            .and_then(|s| s.split("];").next())
+            .expect("FONTS");
+        for f in want {
+            assert!(
+                !prose.contains(&format!("\"{f}\"")),
+                "a monospaced face must not be offered for prose: {f}"
+            );
+        }
+    }
+
+    /// Code text defaults to 12pt, applies to the terminal panes and the file
+    /// views through `--mono-size`, and is set by its own bounded number field.
+    #[test]
+    fn the_code_size_defaults_to_12pt_and_reaches_the_panes() {
+        assert!(INDEX_HTML.contains("const DEFAULT_MONO_SIZE = 12"));
+        assert!(INDEX_HTML.contains("--mono-size: 12pt"));
+        assert!(
+            INDEX_HTML.contains("<input id=\"code-size\" type=\"number\" min=\"8\" max=\"40\""),
+            "the code size needs its own bounded field"
+        );
+        // The terminal pane and the file view are the two cell grids, and both
+        // take the code size rather than the prose size.
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        let term = css
+            .split("\n.term-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-out rule");
+        assert!(
+            term.contains("var(--mono-size)") && term.contains("var(--mono-font)"),
+            "a terminal pane takes the code face and size: {term}"
+        );
+        let file = css
+            .split("\n.file-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .file-out rule");
+        assert!(
+            file.contains("var(--mono-size)") && file.contains("var(--mono-font)"),
+            "a file view takes the code face and size: {file}"
+        );
+        // And the code size is applied as a point size, like the prose size.
+        let apply = INDEX_HTML
+            .split("function applyType()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("applyType");
+        assert!(
+            apply.contains("setProperty(\"--mono-size\", typeface.codeSize + \"pt\")"),
+            "the code size is a point size: {apply}"
+        );
+    }
+
+    /// The terminal pane's scrollback lives in a `div` above the grid, and the
+    /// three things that make it work are all things the JS tests cannot see:
+    /// the fake DOM has no layout, so it cannot notice that an empty row of
+    /// history collapsed to zero height, that a `div` swallowed the spaces a
+    /// column-aligned `ls` is made of, or that the browser was left free to
+    /// "correct" a reader who had scrolled up.
+    #[test]
+    fn the_scrollback_is_a_block_of_rows_the_browser_cannot_reshape() {
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        let row = css
+            .split("\n.term-hist-row {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-hist-row rule");
+        /* One row, one height — and one the pane can count in. A `div` with
+        nothing on it has no line box, so without a height of its own a blank
+        line of history is zero pixels and every row below it slides up. */
+        assert!(
+            row.contains("min-height:") && row.contains("white-space: pre"),
+            "a scrollback row needs its own height and its spaces kept: {row}"
+        );
+        let pane = css
+            .split("\n.term-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-out rule");
+        /* The pane decides what a scrolled-up reader is anchored to; the
+        browser's own idea cannot tell a row that entered the history from a
+        row the reader asked to see, and would move them for the wrong one. */
+        assert!(
+            pane.contains("overflow-anchor: none"),
+            "the pane keeps its reader still itself: {pane}"
+        );
+
+        // The scrollback is a real element in the pane, above the grid it
+        // shares the pane's face with.
+        let markup = INDEX_HTML
+            .split("kind === \"term\"")
+            .nth(1)
+            .and_then(|s| s.split("panel.innerHTML =").nth(1))
+            .and_then(|s| s.split("';").next())
+            .expect("the terminal panel's markup");
+        let hist = markup
+            .find("term-hist")
+            .expect("a terminal pane needs its scrollback element");
+        assert!(
+            hist < markup.find("term-grid").expect("the grid"),
+            "the scrollback sits above the grid, not below it: {markup}"
+        );
+
+        // And the rows are drawn one at a time: the pane appends and drops, it
+        // never re-parses the whole history per line of output.
+        let sync = INDEX_HTML
+            .split("function termHistSync(me, h)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("termHistSync");
+        assert!(
+            sync.contains("appendChild") && sync.contains("removeChild"),
+            "rows are spliced in and out: {sync}"
+        );
+        assert!(
+            !sync.contains("innerHTML =") || sync.contains("termHistRow"),
+            "the scrollback is never rebuilt wholesale per frame: {sync}"
+        );
+    }
+
+    /// Reaching the scrollback has to work with the pointer as well as the
+    /// keyboard, and all three ways that can fail are in the page's own markup
+    /// rather than in its logic — so the JS harness cannot see any of them.
+    ///
+    /// A pane that never overflows has nothing to scroll, so it must be allowed
+    /// to overflow. A press on the bar is delivered to the pane's own press
+    /// handler, because the bar is drawn inside the element's box; a handler that
+    /// cancels every press cancels the drag before it starts, leaving a bar that
+    /// is visible and useless. And the keyboard's route in must not be the
+    /// shell's: `less` and `man` are the reason PgUp belongs to the program.
+    #[test]
+    fn a_reader_reaches_the_scrollback_with_the_pointer_and_the_keyboard() {
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        let pane = css
+            .split("\n.term-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-out rule");
+        assert!(
+            pane.contains("overflow: auto"),
+            "the pane must be allowed to overflow, or there is nothing to scroll: {pane}"
+        );
+
+        // The press handler spares the bars before it cancels anything.
+        let press = INDEX_HTML
+            .split("out.addEventListener(\"mousedown\"")
+            .nth(1)
+            .and_then(|s| s.split("\n  });").next())
+            .expect("the pane's press handler");
+        let spare = press
+            .find("e.preventDefault()")
+            .expect("the handler cancels a press, so it must check first");
+        assert!(
+            press[..spare].contains("e.offsetX >= out.clientWidth")
+                && press[..spare].contains("e.offsetY >= out.clientHeight"),
+            "a press past the pane's client box is its scrollbar, and must be let \
+             through before the cancel that would stop its drag: {press}"
+        );
+
+        // Shift-PgUp/PgDn page the pane, and the check comes before the key map
+        // that would otherwise hand both keys to the shell.
+        let key = INDEX_HTML
+            .split("function termKey(t, e)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("termKey");
+        let paging = key
+            .find("termScroll")
+            .expect("the pane's keys must be able to reach its scrollback");
+        let to_shell = key
+            .find("PageUp: \"5~\"")
+            .expect("PgUp alone stays the shell's key");
+        assert!(
+            paging < to_shell,
+            "Shift-PgUp has to be taken before the map that sends it to the shell"
+        );
+        assert!(
+            key.contains("e.shiftKey && (e.key === \"PageUp\" || e.key === \"PageDown\")"),
+            "and only with Shift, so a program's paging keys are untouched"
+        );
+
+        // Paging is in rows, so a bigger code size pages the same text rather
+        // than the same number of pixels.
+        let scroll = INDEX_HTML
+            .split("function termScroll(me, rows)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("termScroll");
+        assert!(
+            scroll.contains("me.cellH") && scroll.contains("out.scrollTop + step"),
+            "the step is a count of rows times the row height: {scroll}"
+        );
+        assert!(
+            scroll.contains("out.scrollHeight - out.clientHeight"),
+            "and it cannot run past either end: {scroll}"
+        );
+    }
+
+    /// The element that draws the terminal's cells is a `pre`, and a `pre` left
+    /// to inherit draws in the browser's own monospace: an inherited value loses
+    /// to a user-agent declaration, so `.term-out`'s font never reached the text
+    /// and picking a new code face changed the pane's *padding* and the measure
+    /// span while the glyphs stayed exactly as they were. The grid must therefore
+    /// name the two properties itself.
+    ///
+    /// It must also name them *identically* to the pane. The span that measures
+    /// a cell is a `span` and so inherits from the pane; if the grid were drawn
+    /// in another face, the cell width told to the shell would not be the width
+    /// the glyphs are drawn at, and the columns would drift the moment a face
+    /// with different metrics was picked.
+    #[test]
+    fn the_terminal_grid_names_the_code_face_itself_because_a_pre_inherits_last() {
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        let grid = css
+            .split("\n.term-grid {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-grid rule");
+        assert!(
+            grid.contains("var(--mono-font)") && grid.contains("var(--mono-size)"),
+            "a `pre` must be told the code face, or the UA's own monospace wins: {grid}"
+        );
+
+        // And the grid's font must be the pane's font, character for character:
+        // the measure span inherits from the pane, so a grid drawn in a face
+        // with different metrics would retile the shell to the wrong size.
+        let font_of = |rule: &str| -> String {
+            let at = rule
+                .find("font:")
+                .unwrap_or_else(|| panic!("the rule declares no font: {rule}"));
+            rule[at + "font:".len()..]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let pane = css
+            .split("\n.term-out {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the .term-out rule");
+        assert_eq!(
+            font_of(pane),
+            font_of(grid),
+            "the grid is drawn in the same face and leading the cell is measured in"
+        );
+    }
+
+    /// Two font names and four fields are wider than the top bar of a
+    /// half-screen window, and a control pushed off the edge is one that cannot
+    /// be reached. So nothing in the type block may be unshrinkable, the pickers
+    /// have a floor well below their full width, and the block wraps rather than
+    /// overflow.
+    #[test]
+    fn the_type_controls_cannot_be_pushed_off_the_bar() {
+        let css = INDEX_HTML
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the style block");
+        let typeRule = css
+            .split("\n#type {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the #type rule");
+        assert!(
+            typeRule.contains("flex-wrap: wrap"),
+            "the block must wrap within itself: {typeRule}"
+        );
+        assert!(
+            !typeRule.contains("flex: 0 0 auto"),
+            "an unshrinkable block cannot give up room: {typeRule}"
+        );
+        let pickers = css
+            .split("\n#font, #code {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the picker rule");
+        assert!(
+            pickers.contains("min-width:") && !pickers.contains("flex: 0 0 auto"),
+            "the pickers must shrink: {pickers}"
+        );
+    }
+
+    /// A terminal pane is a grid of cells, so changing its face changes the cell
+    /// — and the shell has to be told. The page re-measures every live shell
+    /// when either code control is applied.
+    #[test]
+    fn a_code_font_change_retiles_the_live_shells() {
+        let apply = INDEX_HTML
+            .split("function applyType()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("applyType");
+        assert!(
+            apply.contains("refitTerms()"),
+            "applying the code face must re-measure the panes: {apply}"
+        );
+        let refit = INDEX_HTML
+            .split("function refitTerms()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("refitTerms");
+        assert!(
+            refit.contains("termTabs.values()"),
+            "the live shells are the thing to re-measure: {refit}"
+        );
+        assert!(refit.contains("termFit(t)"), "{refit}");
+        // A face that arrives after the first paint is a change of cell too.
+        assert!(
+            INDEX_HTML.contains("document.fonts.ready.then(refitTerms"),
+            "a late-landing webfont must retile the panes too"
+        );
+    }
+
     /// Text size defaults to 14pt and is applied as a point size (not pixels)
     /// to the console, the file views and the prompt box, from a number field
     /// that refuses nonsense.
@@ -3367,14 +4250,20 @@ mod tests {
             INDEX_HTML.contains("<input id=\"size\" type=\"number\" min=\"8\" max=\"40\""),
             "the size field needs a bounded range"
         );
-        // Out-of-range and non-numeric input must be clamped, not obeyed.
+        // Out-of-range and non-numeric input must be clamped, not obeyed. Each
+        // pair clamps to its own default, so an empty code box falls back to
+        // 12pt rather than to the prose size.
         let clamp = INDEX_HTML
-            .split("function clampSize(v)")
+            .split("function clampSize(v, dflt)")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("clampSize");
         assert!(clamp.contains("Math.min") && clamp.contains("Math.max"));
         assert!(clamp.contains("Number.isFinite"));
+        assert!(
+            clamp.contains("return dflt"),
+            "a blank field takes its pair's default: {clamp}"
+        );
         assert!(INDEX_HTML.contains("SIZE_MIN = 8"));
         assert!(INDEX_HTML.contains("SIZE_MAX = 40"));
     }
@@ -3487,9 +4376,10 @@ mod tests {
         assert!(body.contains("consoleChars += text.length"));
     }
 
-    /// The console, the prompt box and the chrome take the chosen face; a file
-    /// view keeps a monospaced face and takes only the size, because source is
-    /// read by its columns. All of them take the chosen size.
+    /// The console, the prompt box and the chrome take the chosen prose face and
+    /// the prose size; the file views and the terminal panes take the chosen
+    /// code face and the code size, because source and a cell grid are read by
+    /// their columns. Neither kind of face is applied to the other's surfaces.
     #[test]
     fn a_file_view_keeps_its_columns() {
         let css = INDEX_HTML
@@ -3506,20 +4396,46 @@ mod tests {
             .and_then(|s| s.split("}").next())
             .expect("the .file-out rule");
         assert!(
-            file.contains("monospace"),
-            "a file view must stay monospaced: {file}"
+            file.contains("var(--mono-font)"),
+            "a file view must draw in the code face: {file}"
         );
         assert!(
             !file.contains("--ui-font"),
-            "a file view must not take the prose face: {file}"
+            "a file view must not take the prose face, which is proportional: {file}"
         );
-        // Both still take the size, and the console takes the face too.
+        // The prose surfaces take the prose pair, and nothing takes both.
         assert!(css.contains("#console-out, .file-out"));
         assert!(css.contains("font-size: var(--ui-size)"));
         assert!(
             css.contains("#console-out { font-family: var(--ui-font); }"),
             "the console is the thing the picker was asked for"
         );
+        // Both custom properties have a generic tail in :root, so a face that
+        // never downloaded still draws — monospaced for the code pair, which is
+        // what keeps a file's columns and a terminal's cells lined up.
+        let root = css
+            .split(":root {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the :root rule");
+        for line in root.lines() {
+            if line.contains("--mono-font:") {
+                assert!(
+                    line.trim_end().ends_with("monospace;"),
+                    "the code stack must end in a generic monospace: {line}"
+                );
+            }
+            if line.contains("--ui-font:") {
+                assert!(
+                    line.contains("sans-serif"),
+                    "the prose stack must end in a generic: {line}"
+                );
+            }
+        }
+        // And the font field is labelled for what it now is, next to the code
+        // picker rather than alone.
+        assert!(INDEX_HTML.contains("id=\"code\""));
+        assert!(INDEX_HTML.contains("id=\"code-size\""));
     }
 
     /// A chosen face that never downloaded is not an error: the CSS family name
@@ -3697,7 +4613,10 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("treeTick");
-        assert!(tick.contains("refreshTree()"), "the tick does the listing: {tick}");
+        assert!(
+            tick.contains("refreshTree()"),
+            "the tick does the listing: {tick}"
+        );
         // Offline: every request would wait out its connect deadline first.
         // Hidden: nobody is reading it, and browsers throttle it anyway.
         assert!(
@@ -3721,7 +4640,10 @@ mod tests {
             .and_then(|s| s.split(';').next())
             .and_then(|s| s.trim().parse().ok())
             .expect("TREE_POLL_MS");
-        assert!((1000..=10_000).contains(&ms), "poll every {ms}ms is not a sane cadence");
+        assert!(
+            (1000..=10_000).contains(&ms),
+            "poll every {ms}ms is not a sane cadence"
+        );
     }
 
     /// Polling only pays for itself if an unchanged listing costs nothing: a
@@ -3769,9 +4691,14 @@ mod tests {
         // Every redraw path goes through that comparison.
         for (name, body) in [
             ("askTree", INDEX_HTML.split("function askTree(path)").nth(1)),
-            ("refreshTree", INDEX_HTML.split("async function refreshTree()").nth(1)),
+            (
+                "refreshTree",
+                INDEX_HTML.split("async function refreshTree()").nth(1),
+            ),
         ] {
-            let body = body.and_then(|s| s.split("\n}\n").next()).unwrap_or_else(|| panic!("{name}"));
+            let body = body
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("{name}"));
             assert!(
                 body.contains("setTree(") && body.contains("drawTree()"),
                 "{name} may only redraw through setTree: {body}"
@@ -3946,7 +4873,11 @@ mod tests {
             .spawn()
             .and_then(|mut child| {
                 use std::io::Write;
-                child.stdin.as_mut().expect("stdin").write_all(script.as_bytes())?;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(script.as_bytes())?;
                 child.wait_with_output()
             });
         // Skipped where node is not installed (a checkout without a JS
@@ -3968,13 +4899,13 @@ mod tests {
     #[test]
     fn the_ask_user_popup_can_be_answered() {
         for needle in [
-            "id=\"ask-mask\"",         /* the overlay                        */
-            "id=\"ask-q\"",            /* the question itself                */
-            "id=\"ask-answer\"",       /* the answer field                   */
-            "id=\"ask-send\"",         /* and the button that sends it       */
-            "type: \"answer\"",        /* the message the answer goes over   */
-            "case \"ask\":",           /* the server opening a question      */
-            "case \"ask_close\":",     /* and taking it back                 */
+            "id=\"ask-mask\"",     /* the overlay                        */
+            "id=\"ask-q\"",        /* the question itself                */
+            "id=\"ask-answer\"",   /* the answer field                   */
+            "id=\"ask-send\"",     /* and the button that sends it       */
+            "type: \"answer\"",    /* the message the answer goes over   */
+            "case \"ask\":",       /* the server opening a question      */
+            "case \"ask_close\":", /* and taking it back                 */
             "sendAsk",
             "onAskMessage",
             "onAskClose",
@@ -3988,7 +4919,10 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("sendAsk");
-        assert!(send.contains("ask: q.id"), "the answer must carry its id: {send}");
+        assert!(
+            send.contains("ask: q.id"),
+            "the answer must carry its id: {send}"
+        );
         assert!(send.contains("rpc("), "and go over the socket: {send}");
     }
 
@@ -4025,19 +4959,28 @@ mod tests {
             render.contains(r#"$("ask-mask").classList.toggle("show", !!q)"#),
             "the popup shows while a question is open, with no other condition: {render}"
         );
-        assert!(!render.contains("asks.splice"), "rendering may not drop it: {render}");
+        assert!(
+            !render.contains("asks.splice"),
+            "rendering may not drop it: {render}"
+        );
 
         // No hide control, no hidden flag, no reminder badge to bring a hidden
         // question back — so nothing can strand a question out of reach.
         for gone in ["ask-hide", "askHidden", "ask-badge", "askShown"] {
-            assert!(!INDEX_HTML.contains(gone), "{gone} must be gone from the page");
+            assert!(
+                !INDEX_HTML.contains(gone),
+                "{gone} must be gone from the page"
+            );
         }
         let wire = INDEX_HTML
             .split("function wireAsk()")
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("wireAsk");
-        assert!(!wire.contains("asks.splice"), "nothing here may drop it: {wire}");
+        assert!(
+            !wire.contains("asks.splice"),
+            "nothing here may drop it: {wire}"
+        );
         assert!(
             !wire.contains("ask-mask"),
             "no click and no key may take the popup away: {wire}"
@@ -4076,7 +5019,10 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("renderAsk");
-        assert!(render.contains("asks.length - 1"), "the count of those behind: {render}");
+        assert!(
+            render.contains("asks.length - 1"),
+            "the count of those behind: {render}"
+        );
     }
 
     /// A reconnect must not leave the page holding questions that were answered
@@ -4089,8 +5035,14 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n  };").next())
             .expect("the socket's close handler");
-        assert!(onclose.contains("asks.length = 0"), "stale questions are dropped: {onclose}");
-        assert!(onclose.contains("renderAsk()"), "and the popup is redrawn: {onclose}");
+        assert!(
+            onclose.contains("asks.length = 0"),
+            "stale questions are dropped: {onclose}"
+        );
+        assert!(
+            onclose.contains("renderAsk()"),
+            "and the popup is redrawn: {onclose}"
+        );
     }
 
     /// **Stop** (the browser's Ctrl-C): a button next to Send, live only while
@@ -4105,9 +5057,9 @@ mod tests {
     #[test]
     fn stop_is_the_pages_ctrl_c() {
         for needle in [
-            "id=\"stop\"",             /* the button itself                 */
-            "sendStop",                /* what pressing it does             */
-            "type: \"stop\"",          /* the message it sends              */
+            "id=\"stop\"",    /* the button itself                 */
+            "sendStop",       /* what pressing it does             */
+            "type: \"stop\"", /* the message it sends              */
             "case \"ready\": setReady(m.ready, m.note || \"\", m.busy)",
         ] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
@@ -4151,11 +5103,17 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("sendStop");
-        assert!(stop.contains("rpc({ type: \"stop\" })"), "it must send: {stop}");
+        assert!(
+            stop.contains("rpc({ type: \"stop\" })"),
+            "it must send: {stop}"
+        );
         // A press with nothing running is refused locally, not sent, so the
         // button cannot be mistaken for something that just happened to do
         // nothing.
-        assert!(stop.contains("if (!busy) return"), "idle press is a no-op: {stop}");
+        assert!(
+            stop.contains("if (!busy) return"),
+            "idle press is a no-op: {stop}"
+        );
         // A reply saying nothing was stopped says so, rather than going quiet.
         assert!(
             stop.contains("Nothing to stop"),
@@ -4234,7 +5192,7 @@ mod tests {
             .expect("the style block");
 
         /* The classes the scanner can emit: every `emit("s-…"` and the class
-           strings the role helpers hand back. */
+        strings the role helpers hand back. */
         let classes = regex::Regex::new(r#""(s-[a-z]+)""#).expect("regex");
         let mut seen: Vec<String> = classes
             .captures_iter(script)
@@ -4265,7 +5223,11 @@ mod tests {
                 .to_string()
         };
         let mut langs: Vec<String> = Vec::new();
-        for head in ["const HL_EXT = {", "const HL_FILE = {", "const HL_SHEBANG = {"] {
+        for head in [
+            "const HL_EXT = {",
+            "const HL_FILE = {",
+            "const HL_SHEBANG = {",
+        ] {
             let body = table(head);
             assert!(!body.is_empty(), "missing {head}");
             for m in names.captures_iter(&body) {
@@ -4284,7 +5246,7 @@ mod tests {
             );
         }
         /* And the header's friendly name exists for every defined language, so
-           the pane never says `undefined`. */
+        the pane never says `undefined`. */
         let titles = table("const HL_TITLE = {");
         for m in regex::Regex::new(r"(?m)^  ([a-z]+): \{")
             .expect("regex")
@@ -4329,7 +5291,7 @@ mod tests {
             "the wrapper builds a string; the pane is written once, by hlPaint"
         );
         /* And the plain-text path is textContent, so a file the page will not
-           colour is still never markup. */
+        colour is still never markup. */
         let paint = script
             .split("function hlPaint(t, name, content) {")
             .nth(1)
@@ -4351,7 +5313,10 @@ mod tests {
             .and_then(|s| s.split("</script>").next())
             .expect("a script block");
         let joined = harness.replace(PAGE_SCRIPT, script);
-        assert!(!joined.contains(PAGE_SCRIPT), "the harness lost its splice point");
+        assert!(
+            !joined.contains(PAGE_SCRIPT),
+            "the harness lost its splice point"
+        );
 
         let dir = crate::testsupport::TempDir::new("page-harness");
         let js = dir.path().join("harness.js");

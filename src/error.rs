@@ -18,7 +18,10 @@ pub struct AgentError {
 
 impl AgentError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), notified: false }
+        Self {
+            message: message.into(),
+            notified: false,
+        }
     }
 
     /// Wrap an error to record that a notification was already sent for it

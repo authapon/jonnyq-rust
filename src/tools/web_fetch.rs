@@ -41,7 +41,9 @@ impl Tool for FetchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch a URL and return its readable text content (HTML is stripped of markup).".into(),
+            description:
+                "Fetch a URL and return its readable text content (HTML is stripped of markup)."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "url": { "type": "string", "description": "The URL to fetch." } },
@@ -51,7 +53,8 @@ impl Tool for FetchTool {
     }
 
     fn configure(&self, cfg: &Config) {
-        self.timeout_sec.store(cfg.fetch_timeout_sec, Ordering::SeqCst);
+        self.timeout_sec
+            .store(cfg.fetch_timeout_sec, Ordering::SeqCst);
         self.sem.set_limit(cfg.fetch_concurrency);
     }
 
@@ -67,7 +70,10 @@ impl Tool for FetchTool {
         let _permit = self.sem.acquire(&ctx.cancel).await?;
 
         // Client looked up per call so a `/proxy` change reaches the next fetch.
-        let send = crate::net::client(None, None).get(raw_url).header("User-Agent", "jonnyq/1.0").send();
+        let send = crate::net::client(None, None)
+            .get(raw_url)
+            .header("User-Agent", "jonnyq/1.0")
+            .send();
         let resp = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(self.timeout_sec().max(0) as u64), send) => {
                 match r {
@@ -80,7 +86,10 @@ impl Tool for FetchTool {
 
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
-            return Err(AgentError::new(format!("web_fetch: unexpected status {}", status)));
+            return Err(AgentError::new(format!(
+                "web_fetch: unexpected status {}",
+                status
+            )));
         }
 
         // io.LimitReader(resp.Body, maxFetchBytes) equivalent.
@@ -119,10 +128,15 @@ impl Tool for FetchTool {
     }
 }
 
-static SCRIPT_STYLE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is)<(script|style|noscript|template)[^>]*>.*?</\s*(script|style|noscript|template)\s*>").unwrap());
-static BLOCK_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)</?(p|div|br|li|tr|h[1-6]|section|article|header|footer)[^>]*>").unwrap());
+static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)<(script|style|noscript|template)[^>]*>.*?</\s*(script|style|noscript|template)\s*>",
+    )
+    .unwrap()
+});
+static BLOCK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</?(p|div|br|li|tr|h[1-6]|section|article|header|footer)[^>]*>").unwrap()
+});
 static ANY_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
 static MULTI_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
 static MULTI_BLANK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());

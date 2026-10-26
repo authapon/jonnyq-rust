@@ -40,7 +40,10 @@ pub fn discover(paths: &[String]) -> Vec<Skill> {
                 continue;
             }
             let path = Path::new(root).join(&name);
-            let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_default();
             if !ext.eq_ignore_ascii_case("md") {
                 continue;
             }
@@ -88,7 +91,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jonnyq-skill-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("myskill")).unwrap();
-        std::fs::write(dir.join("myskill/SKILL.md"), "# My Skill\n\nA helpful skill.\n").unwrap();
+        std::fs::write(
+            dir.join("myskill/SKILL.md"),
+            "# My Skill\n\nA helpful skill.\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("other.md"), "## heading two\nreal description\n").unwrap();
         std::fs::write(dir.join("ignore.txt"), "nope").unwrap();
 

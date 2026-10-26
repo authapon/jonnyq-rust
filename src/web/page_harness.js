@@ -424,6 +424,73 @@ const before = live().sent.length;
 termFit(tab);
 eq(live().sent.length, before, "an unchanged pane does not resize the shell again");
 
+/* ---- 2b. reading what scrolled past ---------------------------------------
+   The pane is a scroll container, so the reader's two ways of reaching the
+   scrollback — the pointer and the keyboard — must stay inside it. The failures
+   these guard against are all invisible from the console: a `preventDefault` on
+   a press that lands on the bar leaves a bar you can see and cannot drag, and a
+   PgUp taken from the shell breaks `less`. */
+{
+  const md = out.listeners.mousedown[0];
+  ok(!!md, "the pane watches its own presses");
+  const press = (x, y) => {
+    let prevented = false;
+    md({ shiftKey: false, offsetX: x, offsetY: y, preventDefault() { prevented = true; } });
+    return prevented;
+  };
+  tab.term.input.hasFocus = false;
+  eq(press(100, 100), true, "a press on the text is cancelled so the field keeps focus");
+  eq(tab.term.input.hasFocus, true, "and it lands on the invisible input");
+  /* `offsetX/Y` are measured against the padding box, so a bar's press is one
+     that lands past the client box — and a cancelled press there cancels the
+     drag before it starts. */
+  eq(press(out.clientWidth + 2, 10), false, "a press on the vertical scrollbar is the browser's");
+  eq(press(10, out.clientHeight + 2), false, "so is one on the horizontal scrollbar");
+}
+/* The wheel belongs to the browser: nothing on the pane cancels it, which is
+   what makes a plain scroll of the scrollback work and a pane that does cancel
+   it a pane that only moves under a script. */
+eq((out.listeners.wheel || []).length, 0, "the pane does not intercept the wheel");
+
+/* Keyboard paging, once the pane has scrollback to page through. Measured in
+   rows on purpose: the step has to be the height of the rows the reader is
+   reading, so it follows the code size rather than being a magic pixel count. */
+eq(tab.term.cellH, 16, "the row height the pane knows is the one it measured");
+const page = (tab.term.rows - 2) * 16;         /* the rows one screen shows */
+ok(page > 0, "a screen of rows is a distance, got " + page);
+out.scrollTop = 1000; out.scrollHeight = 2000; out.clientHeight = 480;
+eq(type(key("PageUp", { shiftKey: true })), null, "Shift-PgUp is the pane's, not the shell's");
+eq(out.scrollTop, 1000 - page, "Shift-PgUp moves a screen of rows up");
+eq(type(key("PageDown", { shiftKey: true })), null, "and Shift-PgDn likewise");
+eq(out.scrollTop, 1000, "down by the same rows");
+out.scrollTop = page / 2;
+type(key("PageUp", { shiftKey: true }));
+eq(out.scrollTop, 0, "and paging past the top stops at the top");
+out.scrollTop = 1000;
+eq(type(key("PageUp")), "\x1b[5~", "PgUp alone still goes to the shell (less needs it)");
+/* A key that reaches the shell brings the reader back to the bottom: what you
+   just typed is the one thing you must not have to scroll to find. */
+eq(out.scrollTop, out.scrollHeight, "and a key sent to the shell returns to the bottom");
+
+/* A reader who has scrolled up into the scrollback is not moved by the shell
+   printing more: rows enter the history at its foot, below what they are reading.
+   The pane switched the browser's own anchoring off, so this is the only thing
+   deciding what happens to them. */
+{
+  tab.term.histRows = 60;                    /* 960px of rows above the screen */
+  out.scrollTop = 500; out.scrollHeight = 2000; out.clientHeight = 480;
+  const at = out.scrollTop;
+  termFrame(frameFor("t1", "row\n".repeat(40)));
+  eq(out.scrollTop, at, "new output does not move a reader in the scrollback");
+  ok(tab.term.histRows > 60, "the rows that left the screen joined the history, got "
+     + tab.term.histRows);
+  /* And a reader who was at the bottom follows, which is the whole point. */
+  out.scrollTop = out.scrollHeight;
+  termFrame(frameFor("t1", "more\n"));
+  eq(out.scrollTop, out.scrollHeight, "a reader at the bottom follows the output");
+  tab.term.histRows = 0;
+}
+
 /* The shell going away is said out loud, not left as a silent pane. */
 termDead(tab, "shell exited (1)");
 eq(tab.term.dead, true, "a dead tab does not accept input");

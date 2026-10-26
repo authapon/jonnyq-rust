@@ -324,13 +324,13 @@ jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.
 `-web <port>` แสดง session เดียวกันบนเวบไปด้วยพร้อมกับ terminal — ทำงานได้ทั้งสอง
 หน้าต่างพร้อมกัน และไม่มีทางทำให้รันสอง turn ซ้อนกัน หน้าเวบใช้ websocket เส้นเดียว
 ไม่มี script หรือ bundler ของตัวเอง จึงทำงานกับ model ในเครื่องแบบ offline ได้
-สิ่งเดียวที่เรียกจากภายนอกคือ stylesheet ของ Google Fonts ที่อยู่บน font picker —
-ถ้าดึงไม่เจอก็จะ render ด้วย font เดียวที่ติดตั้งไว้ในเครื่อง หรือ sans-serif ของ
-browser แทน
+สิ่งเดียวที่เรียกจากภายนอกคือ stylesheet ของ Google Fonts ที่อยู่บน font picker สอง
+ตัวบนแถบบน — ถ้าดึงไม่เจอก็จะ render ด้วย font เดียวที่ติดตั้งไว้ในเครื่อง หรือ generic
+ตัวท้ายของ stack นั้น (sans-serif สำหรับข้อความธรรมดา, mono สำหรับ code) แทน
 
 | ส่วน | ทำงานอะไร |
 |---|---|
-| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน พร้อม font picker และช่องใส่ size ตามที่อธิบายด้านล่าง |
+| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ source ในแท็บถูก syntax highlight ด้วย palette gruvbox dark ชุดเดียวกับ console — คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ |
 | **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
@@ -338,16 +338,22 @@ browser แทน
 | **popup ของ `ask_user`** | เมื่อ model เรียก `ask_user` คำถามจะเด้งขึ้นมาทับหน้าเวบ พร้อมช่องพิมพ์คำตอบและปุ่ม **Send answer** — ดูด้านล่าง |
 | **tree** (ขวา) | รายการ working directory (folder ก่อนไฟล์) **ที่อัปเดตตัวเองได้** — ไฟล์ที่ถูกสร้าง/ลบ/เปลี่ยนชื่อ จะโผล่ใน panel เองโดยไม่ต้องคลิกอะไร และ folder ที่คุณขยายไว้ก็จะคงขยายอยู่เหมือนเดิม ขยาย folder เพื่อดูรายการข้างใน คลิกไฟล์ text เพื่อเปิดในแท็บใหม่ ส่วน PDF/image/binary จะขึ้น popup บอกว่าเปิดดูไม่ได้เพราะอะไร |
 
-**font และ size** font picker บนแถบบนมี font ไทยจาก Google Fonts ให้เลือก 9 แบบ —
-IBM Plex Sans Thai Looped (ค่า default), Playpen Sans Thai, K2D, Kodchasan,
-Noto Serif Thai, Noto Sans Thai Looped, Athiti, Thasadith และ Trirong — ส่วนช่อง
-`size` ตั้งขนาดตัวอักษรเป็น pt (8–40, default **14pt**) font ที่เลือกจะถูกใช้กับ
-console, ช่องพิมพ์ prompt และแถบบน ส่วนแท็บไฟล์จะคง font mono ไว้ตามเดิมเพื่อให้
-column ของ source ตรงกัน แต่ได้รับขนาดตัวอักษรด้วย ทั้งสองค่าถูกจำไว้ต่อบราวเซอร์
-จึง reload หรือเปิดแท็บใหม่แล้วได้หน้าตาเดิม กด `reset` เพื่อกลับมาเป็น
-IBM Plex Sans Thai Looped 14pt การเลือก font ไม่ใช่ operation ที่ต้องต่อเน็ต: มันคือ
-ชื่อ CSS family หนึ่งชื่อ ซึ่งจะ resolve เป็น font ที่ดาวน์โหลดมา, font เดียวที่ติดตั้ง
-ไว้ในเครื่อง, หรือ generic fallback ตามลำดับ
+**font และ size** แถบบนมี control สองคู่ เพราะหน้าเวบมีตัวอักษรสองชนิด `text` เลือก
+font ของ console, ช่องพิมพ์ prompt และแถบบน จาก font ไทยบน Google Fonts 9 แบบ
+(default คือ IBM Plex Sans Thai Looped) และช่องตัวเลขข้างกันตั้งขนาดตัวอักษรเป็น pt
+(8–40, default **14pt**) ส่วน `code` เลือก font ของ terminal pane และแท็บไฟล์ จาก
+font mono บน Google Fonts 18 แบบ — Source Code Pro, Roboto Mono, JetBrains Mono,
+IBM Plex Mono (default), Space Mono, Fira Code, Google Sans Code, Ubuntu Mono,
+Ubuntu Sans Mono, Anonymous Pro, Nova Mono, Syne Mono, Iosevka Charon Mono, Sono,
+Intel One Mono, SUSE Mono, Cascadia Mono และ Libertinus Mono — และช่องตัวเลขของมัน
+ตั้งขนาดของส่วนนั้น (8–40, default **12pt**) ทั้งสองรายชื่อแยกกันโดยตั้งใจ: terminal
+pane และแท็บไฟล์คือ grid ของ cell ซึ่ง font แบบ proportional วางให้ตรงกันไม่ได้
+ทั้งสี่ค่าถูกจำไว้ต่อบราวเซอร์ จึง reload หรือเปิดแท็บใหม่แล้วได้หน้าตาเดิม กด `reset`
+เพื่อกลับมาเป็น IBM Plex Sans Thai Looped 14pt และ IBM Plex Mono 12pt การเลือก font
+ไม่ใช่ operation ที่ต้องต่อเน็ต: มันคือชื่อ CSS family หนึ่งชื่อ ซึ่งจะ resolve เป็น
+font ที่ดาวน์โหลดมา, font เดียวที่ติดตั้งไว้ในเครื่อง, หรือ generic ตัวท้ายของ stack
+นั้น — ซึ่งเป็น mono สำหรับ code ดังนั้นเครื่องที่ไม่เคยดึง stylesheet มาได้เลยก็ยังคง
+มี column และ cell ที่ตรงกัน
 
 **แถว status เป็นของสด** ตัวเลข `ctx` บนแถบบนคือ context ที่ session ใช้อยู่ตอนนี้
 ไม่ใช่ค่าที่ snapshot ตอน connect: มันถูกอ่านใหม่ทุก 2 วินาที, ตอน start และ end ของ
@@ -389,6 +395,17 @@ block ในไฟล์ Markdown จะถูกวาดเป็นก้อ�
 400 KB จะแสดงแบบไร้สี เพราะขนาดนั้นคือไฟล์ที่คนกำลัง search ไม่ใช่กำลังอ่าน และการทำ
 span ต่อ token จะ freeze tab ไปหนึ่งวินาทีโดยเปล่าประโยชน์ header ของทุกแท็บไฟล์จะบอก
 ด้วยว่าอ่านไฟล์นั้นเป็นภาษาอะไร จึงไม่ต้องเดาว่าไฟล์ที่ไร้สีคือ feature พังหรือไร้สีโดยเจตนา
+
+**แท็บ terminal เลื่อนดูย้อนหลังได้** ทุก pane เก็บ scrollback ของ 2000 บรรทัด
+ล่าสุด จึงอ่าน `cargo build` ที่เลื่อนผ่านไปนานแล้วได้: หมุน wheel, ลาก scrollbar
+ของ pane, หรือกด `Shift-PgUp`/`Shift-PgDn` เพื่อเลื่อนทีละหน้าจอ — คีย์ธรรมดายังเป็น
+ของ shell ตามเดิม เพราะ `less` และ `man` คือเหตุผลที่คนกดมัน คีย์ที่คุณส่งไปหรือ
+พิมพ์ลงไปจะพา pane กลับมาที่ prompt เสมอ สิ่งที่คุณ scroll ขึ้นไปอ่านจะไม่ถูกขยับ
+เมื่อ shell พิมพ์เพิ่ม — output ใหม่เข้า *ใต้* สายตาที่อ่านอยู่ ไม่ใช่ทับมัน — จึงไม่มี
+คำสั่งยาว ๆ ตัวไหนดึง view กลับลงไปข้างล่าง และ pane ที่อยู่ที่ bottom แล้วเท่านั้นที่
+ตาม output ไป การ resize จะ re-wrap scrollback ใหม่ทั้งก้อนที่ width ใหม่
+บรรทัดที่เคยต้องใช้สองแถวตอน pane แคบจึงอ่านเป็นบรรทัดเดียวตอน pane กว้าง
+`Ctrl-C` ในแท็บ terminal ยังเป็น interrupt ของ shell เสมอ ไม่ได้เป็นวิธี scroll
 
 prompt ที่พิมพ์บนเวบจะถูกเข้าคิวให้ loop ของ REPL เป็นตัวอ่านเอง นี่คือเหตุผลที่
 คำตอบโผล่ทั้งสองหน้าต่าง และทำให้ prompt จากเวบ, prompt ที่พิมพ์ และ trigger ของ

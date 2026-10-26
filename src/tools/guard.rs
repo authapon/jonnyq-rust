@@ -17,8 +17,13 @@ pub fn resolve_path(work_dir: &str, p: &str) -> R<PathBuf> {
     }
 
     let work_abs = absolutenow(work_dir);
-    let work_real = std::fs::canonicalize(&work_abs)
-        .map_err(|e| AgentError::new(format!("resolve working directory: {} ({})", work_abs.display(), e)))?;
+    let work_real = std::fs::canonicalize(&work_abs).map_err(|e| {
+        AgentError::new(format!(
+            "resolve working directory: {} ({})",
+            work_abs.display(),
+            e
+        ))
+    })?;
 
     let target = if Path::new(p).is_absolute() {
         lexical_clean(p)
@@ -96,7 +101,9 @@ pub fn lexical_clean(p: &str) -> PathBuf {
     let mut root = None;
     for comp in in_path.components() {
         match comp {
-            Component::RootDir => root = Some(std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR)),
+            Component::RootDir => {
+                root = Some(std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR))
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 if let Some(last) = parts.last() {

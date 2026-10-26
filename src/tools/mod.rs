@@ -104,7 +104,10 @@ impl ResizeableLimiter {
                     .compare_exchange(used, used + 1, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                return Ok(Guard { in_use: &self.in_use, notify: &self.notify });
+                return Ok(Guard {
+                    in_use: &self.in_use,
+                    notify: &self.notify,
+                });
             }
             tokio::select! {
                 _ = self.notify.notified() => {}
@@ -156,7 +159,14 @@ static MAX_TOOL_RESULT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TOOL_RE
 /// Sets the tool-result ceiling (a value <= 0 restores the default). Called
 /// at startup and by `/env reload` through [`Registry::configure`].
 pub fn set_max_tool_result_chars(n: usize) {
-    MAX_TOOL_RESULT_CHARS.store(if n == 0 { DEFAULT_MAX_TOOL_RESULT_CHARS } else { n }, Ordering::SeqCst);
+    MAX_TOOL_RESULT_CHARS.store(
+        if n == 0 {
+            DEFAULT_MAX_TOOL_RESULT_CHARS
+        } else {
+            n
+        },
+        Ordering::SeqCst,
+    );
 }
 
 /// The ceiling currently in effect.
@@ -176,10 +186,17 @@ pub fn max_tool_result_chars() -> usize {
 pub fn cap_tool_result_chars(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max || max == 0 {
-        return if max == 0 { String::new() } else { s.to_string() };
+        return if max == 0 {
+            String::new()
+        } else {
+            s.to_string()
+        };
     }
     let note_for = |hidden: usize| {
-        format!("\n\n[... {} characters omitted to fit the {}-character tool-result limit ...]\n\n", hidden, max)
+        format!(
+            "\n\n[... {} characters omitted to fit the {}-character tool-result limit ...]\n\n",
+            hidden, max
+        )
     };
     // The marker counts against the budget, so shrink the kept parts until
     // content + marker fit: guessing its length up front (the old
@@ -236,7 +253,10 @@ fn data_uri_span(s: &str, start: usize) -> Option<(usize, &str)> {
         return None;
     }
     let payload_at = start + "data:".len() + semi + ";base64,".len();
-    let end = s[payload_at..].find(char::is_whitespace).map(|i| payload_at + i).unwrap_or(s.len());
+    let end = s[payload_at..]
+        .find(char::is_whitespace)
+        .map(|i| payload_at + i)
+        .unwrap_or(s.len());
     Some((end - start, mime))
 }
 
@@ -331,7 +351,10 @@ impl Registry {
 
     /// Tool specs in registration order, for passing to the provider.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.order.iter().map(|name| self.tools[name].spec()).collect()
+        self.order
+            .iter()
+            .map(|name| self.tools[name].spec())
+            .collect()
     }
 
     /// Hands a (re-read) config to every registered tool - `/env reload`
@@ -375,13 +398,22 @@ mod tests {
     fn cap_tool_result_never_exceeds_its_cap() {
         for max in [1usize, 3, 20, 50, 100, 128, 200, 4_000, 64_000] {
             let out = cap_tool_result_chars(&"x".repeat(100_000), max);
-            assert!(out.chars().count() <= max, "max {max} produced {} chars", out.chars().count());
+            assert!(
+                out.chars().count() <= max,
+                "max {max} produced {} chars",
+                out.chars().count()
+            );
         }
         // Multi-byte text is cut on a character boundary, never mid-rune.
-        let thai: String = (0..5_000).map(|_| char::from_u32(0x0E01).unwrap()).collect();
+        let thai: String = (0..5_000)
+            .map(|_| char::from_u32(0x0E01).unwrap())
+            .collect();
         let out = cap_tool_result_chars(&thai, 300);
         assert!(out.chars().count() <= 300);
-        assert!(out.starts_with('\u{0E01}') && out.ends_with('\u{0E01}'), "rune split: {out}");
+        assert!(
+            out.starts_with('\u{0E01}') && out.ends_with('\u{0E01}'),
+            "rune split: {out}"
+        );
         // Fits already / empty cap: unchanged and empty respectively, and
         // never longer than what went in.
         assert_eq!(cap_tool_result_chars("short", 100), "short");
@@ -400,11 +432,21 @@ mod tests {
     fn data_uris_are_elided_but_other_text_is_left_alone() {
         let uri = format!("data:image/png;base64,{}", "A".repeat(200_000));
         let out = elide_data_uris(&uri).expect("a data URI should be elided");
-        assert!(out.chars().count() < 300, "got {} chars", out.chars().count());
-        assert!(out.contains("image/png") && out.contains(&format!("{} bytes", uri.len())), "{out}");
+        assert!(
+            out.chars().count() < 300,
+            "got {} chars",
+            out.chars().count()
+        );
+        assert!(
+            out.contains("image/png") && out.contains(&format!("{} bytes", uri.len())),
+            "{out}"
+        );
         // Wrapped in other text (prompt mode prefixes the tool name).
         let wrapped = elide_data_uris(&format!("Tool result (read_pic): {uri}")).unwrap();
-        assert!(wrapped.starts_with("Tool result (read_pic): ") && wrapped.len() < 400, "{wrapped}");
+        assert!(
+            wrapped.starts_with("Tool result (read_pic): ") && wrapped.len() < 400,
+            "{wrapped}"
+        );
         // Text that merely mentions one is not a data URI and stays put.
         assert!(elide_data_uris("read the file data: and note the base64 mention").is_none());
         assert!(elide_data_uris("data:text/plain,hello").is_none());
@@ -469,13 +511,29 @@ mod tests {
         let mut reg = Registry::new();
         reg.install_always(ask);
         assert!(reg.contains("ask_user"));
-        assert_eq!(reg.specs().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), vec!["ask_user"]);
+        assert_eq!(
+            reg.specs()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["ask_user"]
+        );
 
         let err = reg
-            .call(CallCtx { cancel: CancellationToken::new() }, "ask_user", r#"{"prompt":"which one?"}"#)
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                "ask_user",
+                r#"{"prompt":"which one?"}"#,
+            )
             .await
             .unwrap_err();
-        assert!(err.message.contains("no way to reach the user"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no way to reach the user"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -508,7 +566,11 @@ mod tests {
         for t in tasks {
             t.await.unwrap();
         }
-        assert!(peak.load(Ordering::SeqCst) <= 2, "peak {} exceeded the limit of 2", peak.load(Ordering::SeqCst));
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "peak {} exceeded the limit of 2",
+            peak.load(Ordering::SeqCst)
+        );
         assert_eq!(l.in_use(), 0, "guards must release every slot");
     }
 
@@ -534,15 +596,25 @@ mod tests {
             drop(g);
         });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        assert!(!got.load(Ordering::SeqCst), "should still be waiting at limit 1");
+        assert!(
+            !got.load(Ordering::SeqCst),
+            "should still be waiting at limit 1"
+        );
 
         l.set_limit(6);
         tokio::time::timeout(std::time::Duration::from_millis(500), blocked)
             .await
             .expect("raising the limit must release the waiter")
             .expect("task panicked");
-        assert!(got.load(Ordering::SeqCst), "the waiter got its slot after the limit grew");
-        assert_eq!(l.in_use(), 1, "only the original holder should still be in use");
+        assert!(
+            got.load(Ordering::SeqCst),
+            "the waiter got its slot after the limit grew"
+        );
+        assert_eq!(
+            l.in_use(),
+            1,
+            "only the original holder should still be in use"
+        );
     }
 
     #[tokio::test]
@@ -572,7 +644,14 @@ mod tests {
             .await
             .expect("cancelling must abort the wait")
             .expect("task panicked");
-        let msg = outcome.lock().unwrap().clone().expect("task should have reported");
-        assert!(msg.contains("canceled"), "expected cancellation, got {msg:?}");
+        let msg = outcome
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("task should have reported");
+        assert!(
+            msg.contains("canceled"),
+            "expected cancellation, got {msg:?}"
+        );
     }
 }

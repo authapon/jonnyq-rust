@@ -326,13 +326,14 @@ jonnyq -model qwen3:14b -web 8080     # then open http://127.0.0.1:8080
 are live at the same time, and neither can make the other run two turns at once.
 The page has one websocket and no scripts or bundler of its own, so it works
 against a local model on a machine with no internet; the only thing it reaches
-out for is the Google Fonts stylesheet behind the font picker, and a page that
-cannot fetch it simply draws the text in the same face installed locally, or in
-the browser's own sans-serif.
+out for is the Google Fonts stylesheet behind the two font pickers, and a page
+that cannot fetch it simply draws the text in the same face installed locally, or
+in the generic tail of the stack — a monospace for code, so columns and cells stay
+lined up either way.
 
 | Part | What it does |
 |---|---|
-| **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **font** and **size** pickers described below |
+| **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **text** and **code** font and size controls described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
 | **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files |
@@ -341,16 +342,23 @@ the browser's own sans-serif.
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
 | **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
 
-**Font and size.** The top bar's `font` picker offers nine Thai faces from Google
-Fonts — IBM Plex Sans Thai Looped (the default), Playpen Sans Thai, K2D,
-Kodchasan, Noto Serif Thai, Noto Sans Thai Looped, Athiti, Thasadith and Trirong
-— and `size` sets the text size in pt (8–40, default **14pt**). The face applies to
-the console, the prompt box and the bar itself; a file view keeps a monospaced
-face so source keeps its columns, and takes the size. Both settings are remembered
-per browser, so a reload or a second tab opens the way you left it, and `reset`
-goes back to 14pt IBM Plex Sans Thai Looped. Picking a face is never a network
-operation: it is one CSS family name, which resolves to the downloaded face, to a
-locally installed copy of it, or to the generic fallback.
+**Font and size.** The top bar has two pairs of controls, because the page draws
+two kinds of text. `text` picks the face of the console, the prompt box and the bar
+itself from nine Thai faces on Google Fonts (IBM Plex Sans Thai Looped is the
+default) and its number field sets that text's size in pt (8–40, default **14pt**).
+`code` picks the face of the terminal panes and the file views from eighteen
+monospaced faces — Source Code Pro, Roboto Mono, JetBrains Mono, IBM Plex Mono (the
+default), Space Mono, Fira Code, Google Sans Code, Ubuntu Mono, Ubuntu Sans Mono,
+Anonymous Pro, Nova Mono, Syne Mono, Iosevka Charon Mono, Sono, Intel One Mono, SUSE
+Mono, Cascadia Mono and Libertinus Mono — and its field sets their size (8–40,
+default **12pt**). The two lists are separate on purpose: a terminal pane and a file
+view are grids of cells, and a proportional face cannot tile one. All four settings
+are remembered per browser, so a reload or a second tab opens the way you left it,
+and `reset` goes back to 14pt IBM Plex Sans Thai Looped and 12pt IBM Plex Mono.
+Picking a face is never a network operation: it is one CSS family name, which
+resolves to the downloaded face, to a locally installed copy of it, or to the generic
+tail of the stack — a monospace for code, so a machine that never fetched the
+stylesheet still gets lined-up columns and cells.
 
 **The status line is live.** The `ctx` figure in the bar is the session's current
 context use, not a snapshot of connect time: it is re-read on a two-second
@@ -411,6 +419,18 @@ is the same shell you would have had in that folder: it reads your own profile
 and starts in `$SHELL` (falling back to `/bin/sh`), with `TERM=xterm-256color`
 and its own window size.
 
+* **Scrolling back.** Every terminal pane keeps a scrollback of the last 2000
+  rows, so a `cargo build` that flew past is still readable: scroll with the
+  wheel, drag the pane's scroll bar, or press `Shift-PgUp`/`Shift-PgDn` to page
+  through it a screen at a time — the plain keys stay the shell's, because `less`
+  and `man` are the reason anyone presses them. Any key you send brings the pane
+  back to the prompt. What you have scrolled up to read is not moved by the shell
+  printing more — new output arrives *below* it — so a long-running command never
+  yanks the view away, and only a pane that was already at the bottom follows the
+  output. Redrawing after a resize re-wraps the scrollback to the new width, so a
+  line that needed two rows in a narrow pane reads as one line in a wide one.
+  `Ctrl-C` in a terminal tab stays the shell's interrupt; it is never a way to
+  scroll.
 * **Many at once.** Every tab is its own shell, so `cargo build` in one can run
   while you read a log in another. `Alt-1`…`Alt-9` switch tabs, and each tab has
   **New** (another shell) and **Kill**. `Ctrl-C` in a terminal tab interrupts the

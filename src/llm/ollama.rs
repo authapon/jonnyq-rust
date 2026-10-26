@@ -27,7 +27,10 @@ fn trim_base(url: &str) -> String {
 
 impl OllamaProvider {
     pub fn new(base_url: &str, key: &str) -> Self {
-        Self { base_url: trim_base(base_url), key: key.to_string() }
+        Self {
+            base_url: trim_base(base_url),
+            key: key.to_string(),
+        }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -179,7 +182,9 @@ impl Provider for OllamaProvider {
 
         let resp = super::types::until_cancelled(
             &ctx,
-            self.request(reqwest::Method::POST, "/api/chat").json(&body).send(),
+            self.request(reqwest::Method::POST, "/api/chat")
+                .json(&body)
+                .send(),
         )
         .await??;
 
@@ -254,8 +259,11 @@ impl Provider for OllamaProvider {
     }
 
     async fn list_models(&self, ctx: CancellationToken) -> Result<Vec<String>, AgentError> {
-        let resp =
-            super::types::until_cancelled(&ctx, self.request(reqwest::Method::GET, "/api/tags").send()).await??;
+        let resp = super::types::until_cancelled(
+            &ctx,
+            self.request(reqwest::Method::GET, "/api/tags").send(),
+        )
+        .await??;
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
             let text = resp.text().await.unwrap_or_default();
@@ -279,20 +287,28 @@ async fn handle_line(line: &str, tx: &mpsc::UnboundedSender<ChatEvent>) -> bool 
     let chunk: OwChunk = match serde_json::from_str(line) {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(ChatEvent::Error { error: AgentError::new(format!("ollama: {}", e)) });
+            let _ = tx.send(ChatEvent::Error {
+                error: AgentError::new(format!("ollama: {}", e)),
+            });
             return false;
         }
     };
     if !chunk.error.is_empty() {
-        let _ = tx.send(ChatEvent::Error { error: AgentError::new(format!("ollama: {}", chunk.error)) });
+        let _ = tx.send(ChatEvent::Error {
+            error: AgentError::new(format!("ollama: {}", chunk.error)),
+        });
         return false;
     }
     if let Some(msg) = &chunk.message {
         if !msg.thinking.is_empty() {
-            let _ = tx.send(ChatEvent::Thinking { delta: msg.thinking.clone() });
+            let _ = tx.send(ChatEvent::Thinking {
+                delta: msg.thinking.clone(),
+            });
         }
         if !msg.content.is_empty() {
-            let _ = tx.send(ChatEvent::Content { delta: msg.content.clone() });
+            let _ = tx.send(ChatEvent::Content {
+                delta: msg.content.clone(),
+            });
         }
         if !msg.tool_calls.is_empty() {
             let calls: Vec<ToolCall> = msg
@@ -301,13 +317,20 @@ async fn handle_line(line: &str, tx: &mpsc::UnboundedSender<ChatEvent>) -> bool 
                 .enumerate()
                 .map(|(i, tc)| {
                     let args = match &tc.function.arguments {
-                        Some(Value::Object(_)) | Some(Value::Array(_)) | Some(Value::String(_))
-                        | Some(Value::Number(_)) | Some(Value::Bool(_)) => {
+                        Some(Value::Object(_))
+                        | Some(Value::Array(_))
+                        | Some(Value::String(_))
+                        | Some(Value::Number(_))
+                        | Some(Value::Bool(_)) => {
                             tc.function.arguments.as_ref().unwrap().to_string()
                         }
                         _ => "{}".to_string(),
                     };
-                    ToolCall { id: format!("call_{}", i), name: tc.function.name.clone(), arguments: args }
+                    ToolCall {
+                        id: format!("call_{}", i),
+                        name: tc.function.name.clone(),
+                        arguments: args,
+                    }
                 })
                 .collect();
             let _ = tx.send(ChatEvent::ToolCalls { tool_calls: calls });
@@ -355,7 +378,11 @@ mod tests {
     fn user(msg: &str) -> ChatRequest {
         ChatRequest {
             model: "test".into(),
-            messages: vec![Message { role: Role::User, content: msg.into(), ..Default::default() }],
+            messages: vec![Message {
+                role: Role::User,
+                content: msg.into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -391,7 +418,10 @@ mod tests {
         assert!(usage.has_timing);
         assert_eq!(usage.prompt_tokens, 5);
         assert_eq!(usage.completion_tokens, 2);
-        assert!(!usage.estimated, "ollama reports real timings, not estimates");
+        assert!(
+            !usage.estimated,
+            "ollama reports real timings, not estimates"
+        );
         assert!(
             !events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
             "unexpected error event: {:?}",
@@ -426,11 +456,16 @@ mod tests {
     #[tokio::test]
     async fn request_always_includes_content_key() {
         let srv =
-            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n")).await;
+            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n"))
+                .await;
         let req = ChatRequest {
             model: "test".into(),
             messages: vec![
-                Message { role: Role::User, content: "run cargo build".into(), ..Default::default() },
+                Message {
+                    role: Role::User,
+                    content: "run cargo build".into(),
+                    ..Default::default()
+                },
                 Message {
                     role: Role::Assistant,
                     content: String::new(),
@@ -457,7 +492,10 @@ mod tests {
         let msgs = body["messages"].as_array().expect("messages array");
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last["role"], "tool");
-        assert!(last.get("content").is_some(), "tool message must carry a content key: {last}");
+        assert!(
+            last.get("content").is_some(),
+            "tool message must carry a content key: {last}"
+        );
         assert_eq!(last["content"], "");
     }
 
@@ -468,7 +506,8 @@ mod tests {
     #[tokio::test]
     async fn options_carry_num_ctx_and_num_predict() {
         let srv =
-            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n")).await;
+            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n"))
+                .await;
         let req = ChatRequest {
             context_size: 32768,
             max_output_tokens: Some(700),
@@ -485,14 +524,28 @@ mod tests {
     #[tokio::test]
     async fn options_omit_what_was_not_requested() {
         let srv =
-            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n")).await;
-        collect(&OllamaProvider::new(&srv.url, ""), ChatRequest { context_size: 4096, ..user("hi") }).await;
+            TestServer::with_handler(|_r| StubResponse::ndjson("{\"message\":{},\"done\":true}\n"))
+                .await;
+        collect(
+            &OllamaProvider::new(&srv.url, ""),
+            ChatRequest {
+                context_size: 4096,
+                ..user("hi")
+            },
+        )
+        .await;
         let body = srv.last_request().body_json();
         assert_eq!(body["options"]["num_ctx"], 4096);
         assert!(body["options"].get("num_predict").is_none(), "body: {body}");
 
-        collect(&OllamaProvider::new(&srv.url, ""), ChatRequest { max_output_tokens: Some(64), ..user("hi") })
-            .await;
+        collect(
+            &OllamaProvider::new(&srv.url, ""),
+            ChatRequest {
+                max_output_tokens: Some(64),
+                ..user("hi")
+            },
+        )
+        .await;
         let body = srv.last_request().body_json();
         assert_eq!(body["options"]["num_predict"], 64);
         assert!(body["options"].get("num_ctx").is_none(), "body: {body}");
@@ -509,30 +562,52 @@ mod tests {
             StubResponse::json(r#"{"models":[{"name":"llama3:latest"},{"name":"qwen3:8b"}]}"#)
         })
         .await;
-        let names =
-            OllamaProvider::new(&srv.url, "").list_models(CancellationToken::new()).await.unwrap();
-        assert_eq!(names, vec!["llama3:latest".to_string(), "qwen3:8b".to_string()]);
+        let names = OllamaProvider::new(&srv.url, "")
+            .list_models(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            names,
+            vec!["llama3:latest".to_string(), "qwen3:8b".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn error_status_is_reported() {
-        let srv = TestServer::with_handler(|_r| StubResponse::status(404, r#"{"error":"model not found"}"#)).await;
+        let srv = TestServer::with_handler(|_r| {
+            StubResponse::status(404, r#"{"error":"model not found"}"#)
+        })
+        .await;
         let err = OllamaProvider::new(&srv.url, "")
             .chat(CancellationToken::new(), &user("hi"))
             .await
             .unwrap_err();
-        assert!(err.message.contains("unexpected status 404"), "got: {}", err.message);
-        assert!(err.message.contains("model not found"), "got: {}", err.message);
+        assert!(
+            err.message.contains("unexpected status 404"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("model not found"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
     async fn provider_error_in_stream_surfaces() {
-        let srv =
-            TestServer::with_handler(|_r| StubResponse::ndjson(r#"{"error":"model \"x\" not found"}"#)).await;
+        let srv = TestServer::with_handler(|_r| {
+            StubResponse::ndjson(r#"{"error":"model \"x\" not found"}"#)
+        })
+        .await;
         let events = collect(&OllamaProvider::new(&srv.url, ""), user("hi")).await;
         match events.last() {
             Some(ChatEvent::Error { error }) => {
-                assert!(error.message.contains("not found"), "got: {}", error.message)
+                assert!(
+                    error.message.contains("not found"),
+                    "got: {}",
+                    error.message
+                )
             }
             other => panic!("expected an error event, got {other:?}"),
         }

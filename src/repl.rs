@@ -180,14 +180,12 @@ impl Repl {
         // whichever keyboard it was stopped from. It reports whether there was
         // a turn to stop, so the button can admit it arrived too late.
         let turn = self.turn.clone();
-        web.set_stop(Arc::new(move || {
-            match turn.lock().unwrap().as_ref() {
-                Some(tok) => {
-                    tok.cancel();
-                    true
-                }
-                None => false,
+        web.set_stop(Arc::new(move || match turn.lock().unwrap().as_ref() {
+            Some(tok) => {
+                tok.cancel();
+                true
             }
+            None => false,
         }));
         *self.web.lock().await = Some(web);
     }
@@ -266,7 +264,8 @@ impl Repl {
             }
             // Waiting for a prompt, with the model as the console knows it:
             // the browser textarea is enabled only while this holds.
-            self.web_status(!model.is_empty(), "jonnyq is waiting for a prompt").await;
+            self.web_status(!model.is_empty(), "jonnyq is waiting for a prompt")
+                .await;
 
             // A trigger is drained here, never by cancelling the prompt.
             //
@@ -479,9 +478,9 @@ so it doesn't fire again.",
             self.ui.plainln("no model set; type /model <name> first");
             return false;
         }
-        self.run_cancellable(move |ctx| async move {
-            (false, self.agent.run_turn(ctx, &line).await)
-        })
+        self.run_cancellable(
+            move |ctx| async move { (false, self.agent.run_turn(ctx, &line).await) },
+        )
         .await;
         false
     }
@@ -1335,19 +1334,33 @@ mod tests {
         let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
         // The console only needs to exist for this: bind an OS-chosen port and
         // never start accepting.
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let web = crate::web::WebConsole::bind(port, ".", ui, Arc::new(String::new)).unwrap();
         t.repl.set_web(web).await;
 
         // A slash command, so no model turn is needed: what is being checked is
         // what the prompt path prints, not what the agent answers.
-        assert!(!t.repl.run_web_prompt("test-model", "/model other-model").await);
+        assert!(
+            !t.repl
+                .run_web_prompt("test-model", "/model other-model")
+                .await
+        );
         // The echo lands in the transcript the web console mirrors (the REPL's
         // writer), which is what `t.log_contents()` reads.
         let echoed = t.log_contents();
-        assert!(echoed.contains("/model other-model"), "prompt was not echoed: {echoed:?}");
+        assert!(
+            echoed.contains("/model other-model"),
+            "prompt was not echoed: {echoed:?}"
+        );
         assert_eq!(t.repl.cfg.lock().await.model, "other-model");
-        assert!(!t.repl.run_web_prompt("test-model", "   ").await, "blank prompt is dropped");
+        assert!(
+            !t.repl.run_web_prompt("test-model", "   ").await,
+            "blank prompt is dropped"
+        );
     }
 
     /// The console's **Stop** button is the browser's Ctrl-C, so the handle the

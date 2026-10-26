@@ -3,7 +3,7 @@
 //!
 //! One page, one websocket, no build step and no dependencies beyond what
 //! jonnyq already has (the page's only network request is the optional Google
-//! Fonts stylesheet behind its font picker — see [`page`]):
+//! Fonts stylesheet behind its two font pickers — see [`page`]):
 //!
 //! * **console tab** — everything [`Writer`] puts on stdout
 //!   is mirrored to the browser through [`ConsoleSink`], escape sequences
@@ -685,7 +685,10 @@ impl WebConsole {
     /// `None` means the console will not show it: the session is on its way
     /// out, and a question nobody is going to read should not be queued. The
     /// tool then falls back to the channels that still work.
-    fn show_question(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+    fn show_question(
+        &self,
+        question: &str,
+    ) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
         if self.closing.load(Ordering::SeqCst) {
             return None;
         }
@@ -750,7 +753,9 @@ impl WebConsole {
             self.send_all(&json!({"type": "ask_close", "id": id}).to_string());
         }
         if let Some((id, text)) = next {
-            self.send_all(&json!({"type": "ask", "id": id, "question": text, "open": true}).to_string());
+            self.send_all(
+                &json!({"type": "ask", "id": id, "question": text, "open": true}).to_string(),
+            );
         }
     }
 
@@ -1197,7 +1202,10 @@ fn remove_question(qs: &mut Vec<WebQuestion>, id: &str) -> Option<WebQuestion> {
 /// The console's other job: being the human on the other end of `ask_user`
 /// when the session is a browser's ([`crate::tools::ask_user`]'s web channel).
 impl WebAsk for WebConsole {
-    fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+    fn ask_web(
+        &self,
+        question: &str,
+    ) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
         self.show_question(question)
     }
 
@@ -2334,11 +2342,11 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
             let mut ready_states = Vec::new();
             /* Read until both ready frames are in rather than a fixed number of
-               frames: the greeting's shape (reset, term_reset, tail, info,
-               ready, any pending asks) is exactly the kind of thing that changes,
-               and a count here would fail for a reason that has nothing to do
-               with readiness. Bounded, so a session that never broadcasts the
-               second one ends the test rather than hanging it. */
+            frames: the greeting's shape (reset, term_reset, tail, info,
+            ready, any pending asks) is exactly the kind of thing that changes,
+            and a count here would fail for a reason that has nothing to do
+            with readiness. Bounded, so a session that never broadcasts the
+            second one ends the test rather than hanging it. */
             for _ in 0..16 {
                 let f = match read_server_frame(&mut s) {
                     Some(f) => f,
@@ -2528,9 +2536,9 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         let seen = tokio::task::spawn_blocking(move || {
             let mut s = connect_to(port);
             /* Generous on purpose: the driver below pushes on wall-clock
-               sleeps and this thread only hears on its own timeout, so a
-               loaded machine (a build running alongside the suite) must not be
-               able to end the read before the frames it is waiting for land. */
+            sleeps and this thread only hears on its own timeout, so a
+            loaded machine (a build running alongside the suite) must not be
+            able to end the read before the frames it is waiting for land. */
             s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
                 .unwrap();
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
@@ -2812,7 +2820,8 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ask_user_question_is_answered_from_a_tab() {
         let web = console(".");
-        let (id, mut answer) = WebAsk::ask_web(&*web, "Which DB?").expect("the console shows the question");
+        let (id, mut answer) =
+            WebAsk::ask_web(&*web, "Which DB?").expect("the console shows the question");
         assert_eq!(id, "q1");
         web.start().unwrap();
         let port = web.port();
@@ -2821,8 +2830,10 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
             use std::io::Write;
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
             // The greeting must carry the question that was already waiting.
-            s.write_all(&client_frame(r#"{"type":"answer","id":"a1","ask":"q1","text":"postgres"}"#))
-                .unwrap();
+            s.write_all(&client_frame(
+                r#"{"type":"answer","id":"a1","ask":"q1","text":"postgres"}"#,
+            ))
+            .unwrap();
             let (mut saw_ask, mut ack) = (None, None);
             for _ in 0..16 {
                 let f = read_server_frame(&mut s).unwrap();
@@ -2839,7 +2850,9 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         })
         .await
         .unwrap();
-        let ask = accepted.0.expect("the greeting replayed the pending question");
+        let ask = accepted
+            .0
+            .expect("the greeting replayed the pending question");
         assert_eq!(ask["open"], json!(true), "a lone question is popped up");
         assert_eq!(accepted.1.unwrap()["ok"], json!(true));
         assert_eq!(
@@ -2860,7 +2873,10 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         let (id, mut answer) = WebAsk::ask_web(&*web, "Which DB?").unwrap();
         assert!(web.take_answer(&id, "postgres".into()));
         assert_eq!(answer.recv().await.as_deref(), Some("postgres"));
-        assert!(!web.take_answer(&id, "sqlite".into()), "the question is gone");
+        assert!(
+            !web.take_answer(&id, "sqlite".into()),
+            "the question is gone"
+        );
         assert!(web.pending_asks().is_empty());
         // And an answer to a question that never existed is refused too, so a
         // stale tab gets a reason instead of silence.
@@ -2880,7 +2896,8 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
         let frames = tokio::task::spawn_blocking(move || {
             let mut s = connect_to(port);
-            s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
             let mut got: Vec<(String, String, Value)> = Vec::new();
             loop {
@@ -2896,7 +2913,9 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
                 // Handover seen: the first question closed and the second took
                 // the screen.
                 let closed = got.iter().any(|(k, i, _)| k == "ask_close" && i == "q1");
-                let handed = got.iter().any(|(k, i, o)| k == "ask" && i == "q2" && o == &json!(true));
+                let handed = got
+                    .iter()
+                    .any(|(k, i, o)| k == "ask" && i == "q2" && o == &json!(true));
                 if closed && handed {
                     return got;
                 }
@@ -2912,16 +2931,34 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
             .unwrap();
 
         // The greeting showed the front question and only listed the second.
-        assert_eq!(got[0], ("ask".to_string(), id1.clone(), json!(true)), "{got:?}");
-        assert_eq!(got[1], ("ask".to_string(), id2.clone(), json!(false)), "{got:?}");
+        assert_eq!(
+            got[0],
+            ("ask".to_string(), id1.clone(), json!(true)),
+            "{got:?}"
+        );
+        assert_eq!(
+            got[1],
+            ("ask".to_string(), id2.clone(), json!(false)),
+            "{got:?}"
+        );
         // ...and losing the first closed it and handed the popup over.
-        assert!(got.contains(&("ask_close".to_string(), id1.clone(), Value::Null)), "{got:?}");
-        assert!(got.contains(&("ask".to_string(), id2.clone(), json!(true))), "{got:?}");
+        assert!(
+            got.contains(&("ask_close".to_string(), id1.clone(), Value::Null)),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&("ask".to_string(), id2.clone(), json!(true))),
+            "{got:?}"
+        );
 
         let pending = web.pending_asks();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["id"], json!(id2));
-        assert_eq!(pending[0]["open"], json!(true), "the next question is the one to show");
+        assert_eq!(
+            pending[0]["open"],
+            json!(true),
+            "the next question is the one to show"
+        );
     }
 
     /// Dropping the tool's guard is what withdraws a question on every path out
@@ -2963,13 +3000,17 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
         let asking = {
             let tool = ask_tool.clone();
-            tokio::spawn(async move { tool.ask(&tokio_util::sync::CancellationToken::new(), "Which DB?").await })
+            tokio::spawn(async move {
+                tool.ask(&tokio_util::sync::CancellationToken::new(), "Which DB?")
+                    .await
+            })
         };
 
         let reply = tokio::task::spawn_blocking(move || {
             let mut s = connect_to(port);
             use std::io::Write;
-            s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
             ws_handshake(&mut s, "dGhlIHNhbXBsZSBub25jZQ==");
             // Wait for the popup frame, then answer into it.
             let mut question = None;
@@ -2979,10 +3020,12 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
                 if v["type"] == json!("ask") {
                     question = Some(v.clone());
                     let id = v["id"].as_str().unwrap_or("").to_string();
-                    s.write_all(&client_frame(&json!({
-                        "type": "answer", "id": "a1", "ask": id, "text": "postgres"
-                    })
-                    .to_string()))
+                    s.write_all(&client_frame(
+                        &json!({
+                            "type": "answer", "id": "a1", "ask": id, "text": "postgres"
+                        })
+                        .to_string(),
+                    ))
                     .unwrap();
                     break;
                 }
@@ -3017,7 +3060,10 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
         let transcript = std::fs::read_to_string(&log.file).unwrap();
         assert!(transcript.contains("Which DB?"), "got: {transcript}");
-        assert!(transcript.contains("You (via web)> postgres"), "got: {transcript}");
+        assert!(
+            transcript.contains("You (via web)> postgres"),
+            "got: {transcript}"
+        );
         assert!(web.pending_asks().is_empty(), "nothing is left on screen");
     }
 
@@ -3027,7 +3073,10 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         let (_id, _rx) = WebAsk::ask_web(&*web, "Which DB?").unwrap();
         assert_eq!(web.pending_asks().len(), 1);
         web.begin_shutdown();
-        assert!(web.pending_asks().is_empty(), "the popup is gone with the session");
+        assert!(
+            web.pending_asks().is_empty(),
+            "the popup is gone with the session"
+        );
         // And a question asked after that is refused rather than queued.
         assert!(WebAsk::ask_web(&*web, "still there?").is_none());
     }
@@ -3130,8 +3179,8 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         std::fs::write(dir.path().join("marker.txt"), b"on-disk\n").unwrap();
         let want_dir = dir.str();
         /* `/bin/sh` by default; see [`term_test_shell`]. What is under test
-           here is the frame plumbing, which does not care which shell is on the
-           other end of it. */
+        here is the frame plumbing, which does not care which shell is on the
+        other end of it. */
         let web = console_with_shell(&want_dir, &term_test_shell());
         web.start().unwrap();
         let port = web.port();
@@ -3144,7 +3193,10 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
             // Open the tab. The reply is the shell's identity: the id output
             // frames will name, and the folder the shell is in.
-            send_client(&mut s, &json!({"type": "term_open", "id": "o1", "path": ""}));
+            send_client(
+                &mut s,
+                &json!({"type": "term_open", "id": "o1", "path": ""}),
+            );
             let opened = await_reply(&mut s, "o1");
             assert_eq!(opened["ok"], json!(true), "term_open failed: {opened}");
             let session = opened["session"].as_str().unwrap().to_string();
@@ -3165,11 +3217,11 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
             let mut pane = String::new();
             /* Every binary frame is checked as it arrives: it must name this
-               shell and it must begin with real output. Truncating the payload,
-               shortening the id, or prefixing a byte would all fail here, even
-               though this test's own decoder reads the header the same way the
-               page's does — a shared misreading is exactly what a check that
-               looks at the *bytes* rather than the decoding catches. */
+            shell and it must begin with real output. Truncating the payload,
+            shortening the id, or prefixing a byte would all fail here, even
+            though this test's own decoder reads the header the same way the
+            page's does — a shared misreading is exactly what a check that
+            looks at the *bytes* rather than the decoding catches. */
             let mut frames: Vec<Vec<u8>> = Vec::new();
             for (cmd, want) in [
                 (b"pwd; echo e2e-marker; ls\r".as_slice(), "e2e-marker"),
@@ -3186,13 +3238,15 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
                     read_one(&mut s, &mut pane, &mut frames, &session, false);
                 }
                 /* Then drain what is still on its way, so the replay below gets
-                   the whole exchange and not a prefix that happens to contain
-                   the marker. A shell answers in several reads — echo, output,
-                   prompt — and short-timeout reads are how the tail is told
-                   from a shell that has gone quiet. */
-                s.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+                the whole exchange and not a prefix that happens to contain
+                the marker. A shell answers in several reads — echo, output,
+                prompt — and short-timeout reads are how the tail is told
+                from a shell that has gone quiet. */
+                s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                    .unwrap();
                 while read_one(&mut s, &mut pane, &mut frames, &session, true) {}
-                s.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+                    .unwrap();
             }
             (pane, frames, session)
         })
@@ -3201,19 +3255,32 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
 
         // What the shell printed, on the wire, in the folder it was started in,
         // with the window the page asked for.
-        assert!(out.contains("e2e-marker"), "command output missing: {out:?}");
-        assert!(out.contains("marker.txt"), "the listing is missing: {out:?}");
-        assert!(out.contains("43 132"), "the shell did not learn its size: {out:?}");
+        assert!(
+            out.contains("e2e-marker"),
+            "command output missing: {out:?}"
+        );
+        assert!(
+            out.contains("marker.txt"),
+            "the listing is missing: {out:?}"
+        );
+        assert!(
+            out.contains("43 132"),
+            "the shell did not learn its size: {out:?}"
+        );
         // Two commands, so the frames are more than one exchange's worth, and
         // each carries output — an empty frame is a read that saw nothing, and
         // the page would decode it into nothing drawn.
-        assert!(frames.len() >= 2, "expected output from both commands, got {} frame(s)", frames.len());
+        assert!(
+            frames.len() >= 2,
+            "expected output from both commands, got {} frame(s)",
+            frames.len()
+        );
 
         /* Now the part no Rust-only test can do: feed those exact bytes to the
-           page's own `termFrame` and read the pane back. The server's encoder
-           and the page's decoder are then checked against each other rather
-           than each against this file's reading of them — the only way a shared
-           misreading of the header shows up. */
+        page's own `termFrame` and read the pane back. The server's encoder
+        and the page's decoder are then checked against each other rather
+        than each against this file's reading of them — the only way a shared
+        misreading of the header shows up. */
         if let Some(pane) = replay_frames_in_page(&frames, &session) {
             assert!(
                 pane.contains("e2e-marker"),
@@ -3278,10 +3345,24 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
         );
         let dir = crate::testsupport::TempDir::new("term-replay");
         let js = dir.path().join("replay.js");
-        if std::fs::write(&js, driver.replace("__SESSION__", &serde_json::Value::String(session.to_string()).to_string()).as_bytes()).is_err() {
+        if std::fs::write(
+            &js,
+            driver
+                .replace(
+                    "__SESSION__",
+                    &serde_json::Value::String(session.to_string()).to_string(),
+                )
+                .as_bytes(),
+        )
+        .is_err()
+        {
             panic!("cannot write the replay driver");
         }
-        let list: Vec<serde_json::Value> = frames.iter().cloned().map(serde_json::Value::from).collect();
+        let list: Vec<serde_json::Value> = frames
+            .iter()
+            .cloned()
+            .map(serde_json::Value::from)
+            .collect();
         let run = std::process::Command::new("node")
             .arg(&js)
             .arg(serde_json::Value::Array(list).to_string())
@@ -3305,7 +3386,11 @@ Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBu
             .unwrap_or_else(|e| panic!("unreadable screen text {:?}: {e}", &line[MARKER.len()..]));
         // Frames named for a shell the page does not have are dropped silently,
         // which would otherwise look like a clean run that proved nothing.
-        assert!(!text.is_empty(), "the page drew nothing from {} frames", frames.len());
+        assert!(
+            !text.is_empty(),
+            "the page drew nothing from {} frames",
+            frames.len()
+        );
         Some(text)
     }
 

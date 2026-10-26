@@ -47,11 +47,18 @@ fn parse_event(line: &str) -> Option<NtfyMessage> {
         return None;
     }
     Some(NtfyMessage {
-        body: ev.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-        title: ev.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        body: ev
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: ev
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
-
 
 pub struct Notifier {
     url: String,
@@ -107,7 +114,12 @@ impl Notifier {
     /// plus a plain-language explanation of the likely cause from
     /// [`explain`]. `extra` is optional context appended after the
     /// explanation (e.g. timing). A no-op returning Ok when disabled.
-    pub async fn send_error(&self, title: &str, err: &AgentError, extra: &str) -> Result<(), AgentError> {
+    pub async fn send_error(
+        &self,
+        title: &str,
+        err: &AgentError,
+        extra: &str,
+    ) -> Result<(), AgentError> {
         let mut msg = format_error(err);
         if !extra.is_empty() {
             msg.push_str("\n\n");
@@ -119,7 +131,8 @@ impl Notifier {
     /// Posts message as a high-priority warning notification. A no-op
     /// returning Ok when disabled.
     pub async fn send_alert(&self, title: &str, message: &str) -> Result<(), AgentError> {
-        self.post(title, message, &[("Priority", "high"), ("Tags", "warning")]).await
+        self.post(title, message, &[("Priority", "high"), ("Tags", "warning")])
+            .await
     }
 
     /// Opens the topic's JSON stream (`<topic>/json?since=<since>`) and
@@ -151,7 +164,10 @@ impl Notifier {
             .await
             .map_err(|e| AgentError::new(format!("ntfy subscribe: {e}")))?;
         if resp.status().as_u16() >= 300 {
-            return Err(AgentError::new(format!("ntfy subscribe: server returned {}", resp.status())));
+            return Err(AgentError::new(format!(
+                "ntfy subscribe: server returned {}",
+                resp.status()
+            )));
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<NtfyMessage>(16);
@@ -188,7 +204,12 @@ impl Notifier {
         Ok(rx)
     }
 
-    async fn post(&self, title: &str, message: &str, headers: &[(&str, &str)]) -> Result<(), AgentError> {
+    async fn post(
+        &self,
+        title: &str,
+        message: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(), AgentError> {
         if !self.enabled() {
             return Ok(());
         }
@@ -197,15 +218,27 @@ impl Notifier {
         // value would be rejected by reqwest, so strip to visible ASCII.
         let safe_title: String = title
             .chars()
-            .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
             .collect();
         req = req.header("Title", safe_title);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = req.send().await.map_err(|e| AgentError::new(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentError::new(e.to_string()))?;
         if resp.status().as_u16() >= 300 {
-            return Err(AgentError::new(format!("ntfy: server returned {}", resp.status())));
+            return Err(AgentError::new(format!(
+                "ntfy: server returned {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
@@ -225,7 +258,10 @@ mod tests {
     #[tokio::test]
     async fn send_posts_title_and_body() {
         let srv = stub_ok().await;
-        Notifier::new(&srv.url).send("jonnyq: /coding", "task done").await.unwrap();
+        Notifier::new(&srv.url)
+            .send("jonnyq: /coding", "task done")
+            .await
+            .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].method, "POST");
@@ -249,20 +285,28 @@ mod tests {
         let n = Notifier::disabled();
         assert!(!n.enabled());
         n.send("title", "message").await.unwrap();
-        n.send_error("t", &AgentError::new("boom"), "").await.unwrap();
+        n.send_error("t", &AgentError::new("boom"), "")
+            .await
+            .unwrap();
         n.send_alert("t", "m").await.unwrap();
     }
 
     #[tokio::test]
     async fn send_returns_error_on_non_success_status() {
         let srv = TestServer::canned(vec![StubResponse::status(500, "nope")]).await;
-        let err = Notifier::new(&srv.url).send("title", "message").await.unwrap_err();
+        let err = Notifier::new(&srv.url)
+            .send("title", "message")
+            .await
+            .unwrap_err();
         assert!(err.message.contains("500"), "got: {}", err.message);
     }
 
     #[tokio::test]
     async fn enabled_trims_whitespace() {
-        assert!(!Notifier::new("   ").enabled(), "whitespace-only URL is disabled");
+        assert!(
+            !Notifier::new("   ").enabled(),
+            "whitespace-only URL is disabled"
+        );
     }
 
     #[tokio::test]
@@ -271,27 +315,49 @@ mod tests {
         let err = AgentError::new(
             "working on \"x\": Post http://localhost:11434: dial tcp: connect: connection refused",
         );
-        Notifier::new(&srv.url).send_error("jonnyq: error", &err, "Duration: 1s").await.unwrap();
+        Notifier::new(&srv.url)
+            .send_error("jonnyq: error", &err, "Duration: 1s")
+            .await
+            .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].header("Priority").as_deref(), Some("high"));
         assert_eq!(reqs[0].header("Tags").as_deref(), Some("warning"));
         assert_eq!(reqs[0].header("Title").as_deref(), Some("jonnyq: error"));
-        for want in ["Error: working on", "connection refused", "Reason:", "not running", "Duration: 1s"] {
-            assert!(reqs[0].body.contains(want), "body missing {want:?}: {}", reqs[0].body);
+        for want in [
+            "Error: working on",
+            "connection refused",
+            "Reason:",
+            "not running",
+            "Duration: 1s",
+        ] {
+            assert!(
+                reqs[0].body.contains(want),
+                "body missing {want:?}: {}",
+                reqs[0].body
+            );
         }
     }
 
     #[tokio::test]
     async fn send_error_noop_when_disabled() {
-        Notifier::disabled().send_error("t", &AgentError::new("boom"), "").await.unwrap();
+        Notifier::disabled()
+            .send_error("t", &AgentError::new("boom"), "")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn non_ascii_title_is_made_header_safe() {
         let srv = stub_ok().await;
-        Notifier::new(&srv.url).send("เกิด error ขึ้น", "body").await.unwrap();
+        Notifier::new(&srv.url)
+            .send("เกิด error ขึ้น", "body")
+            .await
+            .unwrap();
         let got = srv.requests()[0].header("Title").unwrap();
-        assert!(got.is_ascii(), "title must be plain ASCII for the HTTP header: {got}");
+        assert!(
+            got.is_ascii(),
+            "title must be plain ASCII for the HTTP header: {got}"
+        );
         assert_eq!(got.chars().count(), "เกิด error ขึ้น".chars().count());
     }
 
@@ -348,7 +414,10 @@ mod stream_tests {
         .await;
 
         let n = Notifier::new(&srv.url);
-        let mut rx = n.stream_messages(&CancellationToken::new(), 1700000000).await.unwrap();
+        let mut rx = n
+            .stream_messages(&CancellationToken::new(), 1700000000)
+            .await
+            .unwrap();
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("no message arrived from an open stream")
@@ -366,12 +435,18 @@ mod stream_tests {
     #[tokio::test]
     async fn stream_messages_stops_when_cancelled() {
         let srv = TestServer::canned(vec![StubResponse::ndjson_open(
-            vec![("{\"event\":\"open\"}\n".to_string(), std::time::Duration::ZERO)],
+            vec![(
+                "{\"event\":\"open\"}\n".to_string(),
+                std::time::Duration::ZERO,
+            )],
             30,
         )])
         .await;
         let cancel = CancellationToken::new();
-        let mut rx = Notifier::new(&srv.url).stream_messages(&cancel, 0).await.unwrap();
+        let mut rx = Notifier::new(&srv.url)
+            .stream_messages(&cancel, 0)
+            .await
+            .unwrap();
         cancel.cancel();
         // Draining ends (the task returns or the receiver closes) rather than
         // hanging on a stream that has nothing more to send.
@@ -379,12 +454,22 @@ mod stream_tests {
             while rx.recv().await.is_some() {}
         })
         .await;
-        assert!(drained.is_ok(), "the reader did not stop after cancellation");
+        assert!(
+            drained.is_ok(),
+            "the reader did not stop after cancellation"
+        );
     }
 
     #[tokio::test]
     async fn stream_messages_needs_a_topic() {
-        let err = Notifier::disabled().stream_messages(&CancellationToken::new(), 0).await.unwrap_err();
-        assert!(err.message.contains("not configured"), "got: {}", err.message);
+        let err = Notifier::disabled()
+            .stream_messages(&CancellationToken::new(), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not configured"),
+            "got: {}",
+            err.message
+        );
     }
 }

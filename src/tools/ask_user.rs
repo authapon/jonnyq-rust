@@ -70,7 +70,10 @@ pub trait WebAsk: Send + Sync {
     /// the stream its answer will arrive on. `None` means the console cannot
     /// show it (the session is closing), which is the tool's cue to fall back
     /// to the channels that can.
-    fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)>;
+    fn ask_web(
+        &self,
+        question: &str,
+    ) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)>;
 
     /// Takes a question back off the screen: someone answered at the keyboard
     /// or over ntfy, or the turn was cancelled, and the popup must not go on
@@ -170,7 +173,10 @@ async fn read_web(guard: &mut Option<WebAskGuard>) -> WebOutcome {
         // Trimmed like the terminal's line and an ntfy body: a trailing newline
         // from the textarea is not part of the answer, and a blank one is still
         // an answer ("no further input").
-        Some(text) => WebOutcome::Answer(Answer { text: text.trim().to_string(), source: ANSWER_SOURCE_WEB }),
+        Some(text) => WebOutcome::Answer(Answer {
+            text: text.trim().to_string(),
+            source: ANSWER_SOURCE_WEB,
+        }),
         // The console took the question back — see [`WebAskGuard`].
         None => WebOutcome::Closed,
     }
@@ -217,11 +223,15 @@ pub fn parse_ntfy_answer(body: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    const PREFIXES: [&str; 7] = ["answer:", "Answer:", "ANSWER:", "reply:", "Reply:", "a:", "A:"];
+    const PREFIXES: [&str; 7] = [
+        "answer:", "Answer:", "ANSWER:", "reply:", "Reply:", "a:", "A:",
+    ];
     let first_line = trimmed.split('\n').next().unwrap_or("");
     let head = first_line.trim_start();
     for p in PREFIXES {
-        let Some(rest) = head.strip_prefix(p) else { continue };
+        let Some(rest) = head.strip_prefix(p) else {
+            continue;
+        };
         // "answer: yes" -> "yes"; "answer:" alone means the text follows on
         // the next line.
         if !rest.trim().is_empty() {
@@ -249,8 +259,16 @@ pub struct Line {
 /// (not bold, so a multi-sentence question reads as body text).
 pub fn question_block(question: &str) -> Vec<Line> {
     vec![
-        Line { text: "Question from the model:".into(), color: crate::ui::COLOR_BRIGHT_BLUE, bold: true },
-        Line { text: question.to_string(), color: crate::ui::COLOR_BLUE, bold: false },
+        Line {
+            text: "Question from the model:".into(),
+            color: crate::ui::COLOR_BRIGHT_BLUE,
+            bold: true,
+        },
+        Line {
+            text: question.to_string(),
+            color: crate::ui::COLOR_BLUE,
+            bold: false,
+        },
     ]
 }
 
@@ -364,7 +382,8 @@ impl AskUserTool {
     }
 
     pub fn set_terminal_ok(&self, ok: bool) {
-        self.terminal_ok.store(ok, std::sync::atomic::Ordering::SeqCst);
+        self.terminal_ok
+            .store(ok, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn terminal_ok(&self) -> bool {
@@ -401,7 +420,8 @@ impl AskUserTool {
         // [`Writer::reset_color`] after the line has been read - that is what
         // makes the typed text itself bright white rather than only jonnyq's
         // own echo of it.
-        self.ui.colored_keep(ANSWER_PROMPT, crate::ui::COLOR_BRIGHT_WHITE, true);
+        self.ui
+            .colored_keep(ANSWER_PROMPT, crate::ui::COLOR_BRIGHT_WHITE, true);
     }
 
     /// A message that arrives *while* waiting (the remote channel dying). The
@@ -456,11 +476,15 @@ impl AskUserTool {
         // dropping the guard below (on any path out of this function) takes it
         // back off the screen.
         let mut web = self.web_ask().and_then(|w| WebAskGuard::new(w, question));
-        if let Err(e) = n.send_alert(NTFY_QUESTION_TITLE, &build_ntfy_message(question)).await {
+        if let Err(e) = n
+            .send_alert(NTFY_QUESTION_TITLE, &build_ntfy_message(question))
+            .await
+        {
             // Losing the remote notification must not break the ask: the
             // subscription below still gets tried, and the terminal still
             // works if it is there.
-            self.ui.plainln(&format!("warning: ntfy notification failed: {}", e.message));
+            self.ui
+                .plainln(&format!("warning: ntfy notification failed: {}", e.message));
         }
         let hint = waiting_hint(
             self.terminal_ok(),
@@ -533,12 +557,12 @@ is open (-web), and no ntfy topic is set (configure one with /ntfy <topic url>)"
                                 };
                                 self.note_while_waiting(&format!(
                                     "warning: ntfy answer channel unavailable ({why}) - still waiting for \
-{here}"
+                {here}"
                                 ));
                             } else {
                                 dead = Some(format!(
                                     "ask_user could not reach the user over ntfy ({why}); answer at a \
-terminal instead (or clear the topic with /ntfy off)"
+                terminal instead (or clear the topic with /ntfy off)"
                                 ));
                                 break;
                             }
@@ -559,7 +583,10 @@ terminal instead (or clear the topic with /ntfy off)"
             // Ctrl-D: the user has no answer rather than no jonnyq, so the
             // model is told that and can move on.
             self.ui.meta("[no answer]");
-            return Ok(Answer { text: String::new(), source: ANSWER_SOURCE_TERMINAL });
+            return Ok(Answer {
+                text: String::new(),
+                source: ANSWER_SOURCE_TERMINAL,
+            });
         };
         self.show_answer(&answer);
         Ok(answer)
@@ -572,7 +599,10 @@ terminal instead (or clear the topic with /ntfy off)"
         if cancel.is_cancelled() {
             return None;
         }
-        Some(Answer { text: text.trim().to_string(), source: ANSWER_SOURCE_TERMINAL })
+        Some(Answer {
+            text: text.trim().to_string(),
+            source: ANSWER_SOURCE_TERMINAL,
+        })
     }
 
     /// The ntfy half of the wait: subscribe from [`ask`](Self::ask)'s
@@ -594,7 +624,10 @@ terminal instead (or clear the topic with /ntfy off)"
                 continue; // our own question, replayed from the cache
             }
             return match parse_ntfy_answer(&msg.body) {
-                Some(text) => NtfyOutcome::Answer(Answer { text, source: ANSWER_SOURCE_NTFY }),
+                Some(text) => NtfyOutcome::Answer(Answer {
+                    text,
+                    source: ANSWER_SOURCE_NTFY,
+                }),
                 // keepalive / clear / a deleted or blank message: not an
                 // answer, keep waiting on the same stream.
                 None => continue,
@@ -678,7 +711,9 @@ mod tests {
         /// Ids taken back off the screen — i.e. every popup the tool closed.
         dismissed: std::sync::Mutex<Vec<String>>,
         /// id -> the pipe a tab answers over.
-        tabs: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
+        tabs: std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>,
+        >,
         next: std::sync::atomic::AtomicUsize,
         /// When false, the console refuses to show anything (a closing session).
         willing: bool,
@@ -687,7 +722,11 @@ mod tests {
 
     impl FakeWeb {
         fn open() -> std::sync::Arc<Self> {
-            std::sync::Arc::new(FakeWeb { willing: true, url: "http://127.0.0.1:8080".into(), ..Default::default() })
+            std::sync::Arc::new(FakeWeb {
+                willing: true,
+                url: "http://127.0.0.1:8080".into(),
+                ..Default::default()
+            })
         }
         /// The answer a human types into the popup.
         fn answer(&self, id: &str, text: &str) {
@@ -708,13 +747,19 @@ mod tests {
     }
 
     impl WebAsk for FakeWeb {
-        fn ask_web(&self, question: &str) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+        fn ask_web(
+            &self,
+            question: &str,
+        ) -> Option<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
             if !self.willing {
                 return None;
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let id = format!("q{}", self.next.fetch_add(1, Ordering::SeqCst) + 1);
-            self.shown.lock().unwrap().push((id.clone(), question.to_string()));
+            self.shown
+                .lock()
+                .unwrap()
+                .push((id.clone(), question.to_string()));
             self.tabs.lock().unwrap().insert(id.clone(), tx);
             Some((id, rx))
         }
@@ -729,10 +774,19 @@ mod tests {
 
     #[test]
     fn parses_a_prefixed_answer() {
-        assert_eq!(parse_ntfy_answer("answer: use postgres").as_deref(), Some("use postgres"));
-        assert_eq!(parse_ntfy_answer("  Answer:   yes  ").as_deref(), Some("yes"));
+        assert_eq!(
+            parse_ntfy_answer("answer: use postgres").as_deref(),
+            Some("use postgres")
+        );
+        assert_eq!(
+            parse_ntfy_answer("  Answer:   yes  ").as_deref(),
+            Some("yes")
+        );
         assert_eq!(parse_ntfy_answer("ANSWER: no").as_deref(), Some("no"));
-        assert_eq!(parse_ntfy_answer("reply: option B").as_deref(), Some("option B"));
+        assert_eq!(
+            parse_ntfy_answer("reply: option B").as_deref(),
+            Some("option B")
+        );
         assert_eq!(parse_ntfy_answer("a: ok").as_deref(), Some("ok"));
     }
 
@@ -746,8 +800,14 @@ mod tests {
 
     #[test]
     fn an_unprefixed_message_is_the_answer_whole() {
-        assert_eq!(parse_ntfy_answer("just do it").as_deref(), Some("just do it"));
-        assert_eq!(parse_ntfy_answer("line one\nline two").as_deref(), Some("line one\nline two"));
+        assert_eq!(
+            parse_ntfy_answer("just do it").as_deref(),
+            Some("just do it")
+        );
+        assert_eq!(
+            parse_ntfy_answer("line one\nline two").as_deref(),
+            Some("line one\nline two")
+        );
     }
 
     #[test]
@@ -769,16 +829,35 @@ mod tests {
         let cut = truncate_utf8(&thai, NTFY_QUESTION_LIMIT);
         assert!(cut.len() <= NTFY_QUESTION_LIMIT);
         assert!(cut.ends_with("(question truncated)"));
-        assert!(build_ntfy_message(&thai).len() < 4096, "must stay under ntfy's message limit");
+        assert!(
+            build_ntfy_message(&thai).len() < 4096,
+            "must stay under ntfy's message limit"
+        );
         assert_eq!(truncate_utf8("short", NTFY_QUESTION_LIMIT), "short");
     }
 
     #[tokio::test]
     async fn empty_prompt_is_rejected() {
         let (t, _log) = tool("");
-        let err = t.call(CallCtx { cancel: CancellationToken::new() }, &json!({"prompt": "  "})).await.unwrap_err();
+        let err = t
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({"prompt": "  "}),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(err.message, "prompt is required");
-        let err = t.call(CallCtx { cancel: CancellationToken::new() }, &json!({})).await.unwrap_err();
+        let err = t
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(err.message, "prompt is required");
     }
 
@@ -788,10 +867,19 @@ mod tests {
     async fn fails_when_there_is_no_channel_to_the_user() {
         let (t, _log) = tool("");
         let err = t
-            .call(CallCtx { cancel: CancellationToken::new() }, &json!({"prompt": "which one?"}))
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({"prompt": "which one?"}),
+            )
             .await
             .unwrap_err();
-        assert!(err.message.contains("no way to reach the user"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no way to reach the user"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -800,10 +888,19 @@ mod tests {
         // Reaches the same "no channel" failure, which proves the question
         // itself passed validation.
         let err = t
-            .call(CallCtx { cancel: CancellationToken::new() }, &json!({"question": "which one?"}))
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({"question": "which one?"}),
+            )
             .await
             .unwrap_err();
-        assert!(err.message.contains("no way to reach the user"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no way to reach the user"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -813,7 +910,12 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = t
-            .call(CallCtx { cancel: cancel.clone() }, &json!({"prompt": "which one?"}))
+            .call(
+                CallCtx {
+                    cancel: cancel.clone(),
+                },
+                &json!({"prompt": "which one?"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.message, "context canceled");
@@ -821,9 +923,15 @@ mod tests {
 
     #[test]
     fn answer_renders_for_the_model() {
-        let a = Answer { text: "postgres".into(), source: ANSWER_SOURCE_NTFY };
+        let a = Answer {
+            text: "postgres".into(),
+            source: ANSWER_SOURCE_NTFY,
+        };
         assert_eq!(a.for_model(), "Answer from ntfy:\npostgres");
-        let empty = Answer { text: String::new(), source: ANSWER_SOURCE_TERMINAL };
+        let empty = Answer {
+            text: String::new(),
+            source: ANSWER_SOURCE_TERMINAL,
+        };
         assert!(empty.for_model().contains("empty reply from terminal"));
     }
 
@@ -839,10 +947,21 @@ mod tests {
         assert_eq!(lines[0].text, "Question from the model:");
         assert_eq!(lines[0].color, crate::ui::COLOR_BRIGHT_BLUE);
         assert_eq!(lines[1].text, "Which port?");
-        assert_eq!(lines[1].color, crate::ui::COLOR_BLUE, "the question itself is blue");
+        assert_eq!(
+            lines[1].color,
+            crate::ui::COLOR_BLUE,
+            "the question itself is blue"
+        );
 
-        let echo = ntfy_answer_line(&Answer { text: "3000".into(), source: ANSWER_SOURCE_NTFY });
-        assert_eq!(echo.color, crate::ui::COLOR_BRIGHT_WHITE, "the answer is bright white");
+        let echo = ntfy_answer_line(&Answer {
+            text: "3000".into(),
+            source: ANSWER_SOURCE_NTFY,
+        });
+        assert_eq!(
+            echo.color,
+            crate::ui::COLOR_BRIGHT_WHITE,
+            "the answer is bright white"
+        );
         assert_eq!(echo.text, "You (via ntfy)> 3000");
 
         // What the styled() helper would actually put on the terminal.
@@ -867,7 +986,10 @@ mod tests {
         assert!(kept.starts_with(crate::ui::COLOR_BOLD));
         assert!(kept.contains(crate::ui::COLOR_BRIGHT_WHITE));
         let on_screen = kept.strip_suffix(crate::ui::COLOR_RESET).unwrap_or(&kept);
-        assert!(!on_screen.ends_with(crate::ui::COLOR_RESET), "the echo would not be bright white");
+        assert!(
+            !on_screen.ends_with(crate::ui::COLOR_RESET),
+            "the echo would not be bright white"
+        );
     }
 
     // --- the two channels ------------------------------------------------
@@ -891,8 +1013,14 @@ mod tests {
 
         let log = std::fs::read_to_string(&log.file).unwrap();
         assert!(log.contains("Question from the model:"));
-        assert!(log.contains("Which DB?"), "the question is in the transcript too");
-        assert!(log.contains("Your answer> "), "the prompt is in the transcript too");
+        assert!(
+            log.contains("Which DB?"),
+            "the question is in the transcript too"
+        );
+        assert!(
+            log.contains("Your answer> "),
+            "the prompt is in the transcript too"
+        );
         assert!(log.contains("[waiting for your answer - type below and press Enter]"));
     }
 
@@ -901,9 +1029,20 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_ntfy_is_reported_when_it_is_the_only_channel() {
         let (t, log) = tool("http://127.0.0.1:1/no-such-ntfy");
-        let err = t.call(CallCtx { cancel: CancellationToken::new() }, &json!({"prompt": "which one?"})).await;
+        let err = t
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({"prompt": "which one?"}),
+            )
+            .await;
         let err = err.unwrap_err();
-        assert!(err.message.contains("could not reach the user over ntfy"), "got: {}", err.message);
+        assert!(
+            err.message.contains("could not reach the user over ntfy"),
+            "got: {}",
+            err.message
+        );
         let log = std::fs::read_to_string(&log.file).unwrap();
         assert!(log.contains("which one?"), "the question was still shown");
     }
@@ -937,8 +1076,14 @@ mod tests {
         assert_eq!(answer.text, "yes");
         assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
         let log = std::fs::read_to_string(&log.file).unwrap();
-        assert!(log.contains("warning: ntfy answer channel unavailable"), "got: {log}");
-        assert!(log.contains("still waiting for you"), "the question stays open: {log}");
+        assert!(
+            log.contains("warning: ntfy answer channel unavailable"),
+            "got: {log}"
+        );
+        assert!(
+            log.contains("still waiting for you"),
+            "the question stays open: {log}"
+        );
     }
 
     /// The remote half, end to end: the question is published, then the next
@@ -976,11 +1121,18 @@ mod tests {
         // the moment of asking (so an older cached message cannot answer it).
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "POST");
-        assert_eq!(reqs[0].header("Title").as_deref(), Some(NTFY_QUESTION_TITLE));
+        assert_eq!(
+            reqs[0].header("Title").as_deref(),
+            Some(NTFY_QUESTION_TITLE)
+        );
         assert!(reqs[0].body.contains("Which DB?"));
         assert!(reqs[0].body.contains("answer: <your answer>"));
         assert_eq!(reqs[1].method, "GET");
-        assert!(reqs[1].path.starts_with("/json?since="), "got {}", reqs[1].path);
+        assert!(
+            reqs[1].path.starts_with("/json?since="),
+            "got {}",
+            reqs[1].path
+        );
 
         let log = std::fs::read_to_string(&log.file).unwrap();
         assert!(log.contains("You (via ntfy)> postgres"), "got: {log}");
@@ -1028,7 +1180,10 @@ mod tests {
             crate::testsupport::StubResponse::status(200, ""),
             // Streams the open event, then stays open without answering.
             crate::testsupport::StubResponse::ndjson_open(
-                vec![("{\"event\":\"open\"}\n".to_string(), std::time::Duration::ZERO)],
+                vec![(
+                    "{\"event\":\"open\"}\n".to_string(),
+                    std::time::Duration::ZERO,
+                )],
                 30,
             ),
         ])
@@ -1059,7 +1214,10 @@ mod tests {
         let quiet = crate::testsupport::TestServer::canned(vec![
             crate::testsupport::StubResponse::status(200, ""),
             crate::testsupport::StubResponse::ndjson_open(
-                vec![("{\"event\":\"open\"}\n".to_string(), std::time::Duration::ZERO)],
+                vec![(
+                    "{\"event\":\"open\"}\n".to_string(),
+                    std::time::Duration::ZERO,
+                )],
                 30,
             ),
         ])
@@ -1071,10 +1229,13 @@ mod tests {
             "typed first",
         )])))
         .await;
-        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), t.ask(&CancellationToken::new(), "q?"))
-            .await
-            .expect("the typed answer should have won")
-            .unwrap();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            t.ask(&CancellationToken::new(), "q?"),
+        )
+        .await
+        .expect("the typed answer should have won")
+        .unwrap();
         input::set_source(old).await;
         assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
         assert_eq!(answer.text, "typed first");
@@ -1094,10 +1255,13 @@ mod tests {
         let (t, _log) = tool(&answering.url);
         t.set_terminal_ok(true);
         let old = input::set_source(Box::new(crate::testsupport::SilentLines)).await;
-        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), t.ask(&CancellationToken::new(), "q?"))
-            .await
-            .expect("the remote answer should have won")
-            .unwrap();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            t.ask(&CancellationToken::new(), "q?"),
+        )
+        .await
+        .expect("the remote answer should have won")
+        .unwrap();
         input::set_source(old).await;
         assert_eq!(answer.source, ANSWER_SOURCE_NTFY);
         assert_eq!(answer.text, "remote first");
@@ -1113,11 +1277,16 @@ mod tests {
         let (t, log) = tool("");
         t.set_terminal_ok(true);
         let old = input::set_source(Box::new(input::ScriptedLines::new(""))).await;
-        let answer = t.ask(&CancellationToken::new(), "still there?").await.unwrap();
+        let answer = t
+            .ask(&CancellationToken::new(), "still there?")
+            .await
+            .unwrap();
         input::set_source(old).await;
         assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
         assert!(answer.for_model().contains("empty reply from terminal"));
-        assert!(std::fs::read_to_string(&log.file).unwrap().contains("[no answer]"));
+        assert!(std::fs::read_to_string(&log.file)
+            .unwrap()
+            .contains("[no answer]"));
     }
 
     // --- the browser channel (-web) --------------------------------------
@@ -1140,7 +1309,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(web.shown(), vec![("q1".to_string(), "Which DB?".to_string())]);
+        assert_eq!(
+            web.shown(),
+            vec![("q1".to_string(), "Which DB?".to_string())]
+        );
         web.answer_first("postgres");
 
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
@@ -1156,7 +1328,10 @@ mod tests {
         // The question, the console's address in the hint, and the echo of an
         // answer that was never typed on this screen.
         assert!(log.contains("Which DB?"), "got: {log}");
-        assert!(log.contains("answer in the browser popup at http://127.0.0.1:8080"), "got: {log}");
+        assert!(
+            log.contains("answer in the browser popup at http://127.0.0.1:8080"),
+            "got: {log}"
+        );
         assert!(log.contains("You (via web)> postgres"), "got: {log}");
         // And the popup is closed: an answered question must not sit there.
         assert_eq!(web.dismissed(), vec!["q1".to_string()]);
@@ -1186,7 +1361,11 @@ mod tests {
             .expect("the wait must end once the console is gone")
             .unwrap()
             .unwrap_err();
-        assert!(err.message.contains("withdrawn from the browser console"), "got: {}", err.message);
+        assert!(
+            err.message.contains("withdrawn from the browser console"),
+            "got: {}",
+            err.message
+        );
     }
 
     /// The console can refuse a question (a session that is closing). The tool
@@ -1194,13 +1373,25 @@ mod tests {
     #[tokio::test]
     async fn a_console_that_will_not_show_a_question_is_not_a_channel() {
         let (t, _log) = tool("");
-        let web = std::sync::Arc::new(FakeWeb { willing: false, ..Default::default() });
+        let web = std::sync::Arc::new(FakeWeb {
+            willing: false,
+            ..Default::default()
+        });
         t.set_web(web.clone());
         let err = t
-            .call(CallCtx { cancel: CancellationToken::new() }, &json!({"prompt": "which one?"}))
+            .call(
+                CallCtx {
+                    cancel: CancellationToken::new(),
+                },
+                &json!({"prompt": "which one?"}),
+            )
             .await
             .unwrap_err();
-        assert!(err.message.contains("no way to reach the user"), "got: {}", err.message);
+        assert!(
+            err.message.contains("no way to reach the user"),
+            "got: {}",
+            err.message
+        );
         assert!(web.shown().is_empty(), "nothing was popped up");
     }
 
@@ -1226,8 +1417,16 @@ mod tests {
         input::set_source(old).await;
 
         assert_eq!(answer.source, ANSWER_SOURCE_TERMINAL);
-        assert_eq!(web.shown().len(), 1, "the question was shown to the browser too");
-        assert_eq!(web.dismissed(), vec!["q1".to_string()], "the popup is taken back");
+        assert_eq!(
+            web.shown().len(),
+            1,
+            "the question was shown to the browser too"
+        );
+        assert_eq!(
+            web.dismissed(),
+            vec!["q1".to_string()],
+            "the popup is taken back"
+        );
     }
 
     /// Cancelling the turn takes the popup back as well: a question nobody is
@@ -1270,9 +1469,16 @@ mod tests {
         );
         let all = waiting_hint(true, Some("http://x".into()), true);
         assert!(all.contains("type below and press Enter"), "{all}");
-        assert!(all.contains("answer in the browser popup at http://x"), "{all}");
+        assert!(
+            all.contains("answer in the browser popup at http://x"),
+            "{all}"
+        );
         assert!(all.contains("reply to the ntfy notification"), "{all}");
-        assert_eq!(all.matches(", or ").count(), 2, "three channels, two joins: {all}");
+        assert_eq!(
+            all.matches(", or ").count(),
+            2,
+            "three channels, two joins: {all}"
+        );
         assert!(waiting_hint(false, None, false).contains("no channel is open"));
     }
 

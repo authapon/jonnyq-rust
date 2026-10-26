@@ -22,7 +22,9 @@ pub struct PicTool {
 
 impl PicTool {
     pub fn new(work_dir: &str) -> Self {
-        Self { work_dir: work_dir.to_string() }
+        Self {
+            work_dir: work_dir.to_string(),
+        }
     }
 }
 
@@ -77,9 +79,12 @@ fn detect_content_type(data: &[u8]) -> &'static str {
         "image/bmp"
     } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
         "image/webp"
-    } else if b.len() >= 12 && &b[4..8] == b"ftyp" && (&b[8..11] == b"avif" || &b[8..11] == b"avis") {
+    } else if b.len() >= 12 && &b[4..8] == b"ftyp" && (&b[8..11] == b"avif" || &b[8..11] == b"avis")
+    {
         "image/avif"
-    } else if b.starts_with(b"<svg") || b.starts_with(b"<?xml") && b.windows(20).any(|w| w.starts_with(b"<svg")) {
+    } else if b.starts_with(b"<svg")
+        || b.starts_with(b"<?xml") && b.windows(20).any(|w| w.starts_with(b"<svg"))
+    {
         "image/svg+xml"
     } else {
         "application/octet-stream"
@@ -104,7 +109,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.png"), b"\x89PNG\r\n\x1a\nabc").unwrap();
         let t = PicTool::new(&dir.to_string_lossy());
-        let ctx = CallCtx { cancel: tokio_util::sync::CancellationToken::new() };
+        let ctx = CallCtx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
         let out = t.call(ctx, &json!({"path": "a.png"})).await.unwrap();
         assert!(out.starts_with("data:image/png;base64,"));
         let _ = std::fs::remove_dir_all(&dir);

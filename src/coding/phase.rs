@@ -36,7 +36,12 @@ fn describe_phases(d: &ProgressDoc) -> String {
         if p.tasks.is_empty() {
             continue;
         }
-        lines.push(format!("  {} ({}/{} tasks done)", p.name, p.done_count(), p.tasks.len()));
+        lines.push(format!(
+            "  {} ({}/{} tasks done)",
+            p.name,
+            p.done_count(),
+            p.tasks.len()
+        ));
     }
     lines.join("\n")
 }
@@ -56,7 +61,10 @@ pub fn select_phase(d: &ProgressDoc, arg: &str) -> R<i64> {
         return Ok(d.first_incomplete_phase());
     }
     let lowered = arg.to_lowercase();
-    let num_str = lowered.strip_prefix("phase").unwrap_or(lowered.as_str()).trim();
+    let num_str = lowered
+        .strip_prefix("phase")
+        .unwrap_or(lowered.as_str())
+        .trim();
     let Ok(n) = num_str.parse::<i64>() else {
         return Err(AgentError::new(format!(
             "usage: /coding_phase [phase number] - {arg:?} is not a phase number"
@@ -109,17 +117,15 @@ impl<'a> Coding<'a> {
         let result = self.coding_phase_body(cancel, &n, arg, start).await;
         match result {
             Ok(()) => Ok(()),
-            Err(e) => {
-                Err(crate::coding::notify_failure(
-                    &n,
-                    &self.ui,
-                    "jonnyq: /coding_phase failed",
-                    start,
-                    cancel,
-                    e,
-                )
-                .await)
-            }
+            Err(e) => Err(crate::coding::notify_failure(
+                &n,
+                &self.ui,
+                "jonnyq: /coding_phase failed",
+                start,
+                cancel,
+                e,
+            )
+            .await),
         }
     }
 
@@ -141,10 +147,14 @@ impl<'a> Coding<'a> {
 
         if idx == -1 {
             // nothing left anywhere
-            self.ui.plainln(&format!("[coding_phase] all tasks in {PROGRESS_FILE} are checked off"));
+            self.ui.plainln(&format!(
+                "[coding_phase] all tasks in {PROGRESS_FILE} are checked off"
+            ));
             let tasks = super::parse_progress(&prog_path).unwrap_or_default();
-            let mut summary =
-                format!("All tasks already complete: {}", progress_summary_line(&tasks));
+            let mut summary = format!(
+                "All tasks already complete: {}",
+                progress_summary_line(&tasks)
+            );
             let g = doc.guide_text();
             if !g.is_empty() {
                 summary.push_str("\n\n");
@@ -162,7 +172,10 @@ impl<'a> Coding<'a> {
 
         let target: &PhaseInfo = &doc.phases[idx as usize];
         if target.complete() {
-            self.ui.plainln(&format!("[coding_phase] {} is already complete", target.name));
+            self.ui.plainln(&format!(
+                "[coding_phase] {} is already complete",
+                target.name
+            ));
             return Ok(());
         }
         let earlier = doc.first_incomplete_phase();
@@ -212,9 +225,13 @@ while working); check {PROGRESS_FILE} manually"
         if i < 0 {
             i = idx;
         }
-        self.ui.plainln(&format!("[coding_phase] {name} is complete"));
+        self.ui
+            .plainln(&format!("[coding_phase] {name} is complete"));
 
-        let mut sb = format!("Phase complete: {name}\n{}", progress_summary_line(&tasks_after));
+        let mut sb = format!(
+            "Phase complete: {name}\n{}",
+            progress_summary_line(&tasks_after)
+        );
         if (i as usize) < doc_after.phases.len() {
             sb.push_str("\n\nTasks in this phase:");
             for (k, t) in doc_after.phases[i as usize].tasks.iter().enumerate() {
@@ -241,7 +258,11 @@ while working); check {PROGRESS_FILE} manually"
         }
         // The reported usage is the last task's turn only; the duration
         // covers the whole phase.
-        let u = if ran_turn { self.agent.last_usage.lock().unwrap().usage } else { Usage::default() };
+        let u = if ran_turn {
+            self.agent.last_usage.lock().unwrap().usage
+        } else {
+            Usage::default()
+        };
         notify_or_warn(n, &self.ui, &title, &with_timing(&sb, start, u)).await;
         Ok(())
     }
@@ -320,7 +341,11 @@ mod tests {
         assert!(select_phase(&doc(), "-2").is_err());
         let e = select_phase(&doc(), "9").unwrap_err();
         assert!(e.message.contains("has no phase 9"), "{}", e.message);
-        assert!(e.message.contains("Phase 2: Orders (0/2 tasks done)"), "{}", e.message);
+        assert!(
+            e.message.contains("Phase 2: Orders (0/2 tasks done)"),
+            "{}",
+            e.message
+        );
 
         let empty = parse_progress_doc_text("# App\n\n## Phase 1: nothing\n\ntext only\n").unwrap();
         let e = select_phase(&empty, "").unwrap_err();
@@ -332,6 +357,8 @@ mod tests {
         let s = describe_phases(&doc());
         assert_eq!(s.lines().count(), 3);
         assert!(s.contains("  Phase 1: Setup (1/1 tasks done)"));
-        assert!(!describe_phases(&parse_progress_doc_text("# x\nno tasks\n").unwrap()).contains('['));
+        assert!(
+            !describe_phases(&parse_progress_doc_text("# x\nno tasks\n").unwrap()).contains('[')
+        );
     }
 }

@@ -90,15 +90,19 @@ impl Tool for SearxngTool {
 
     fn configure(&self, cfg: &Config) {
         *self.base_url.lock().unwrap() = normalize_base_url(&cfg.searxng_url);
-        self.max_results.store(cfg.searxng_max_results, Ordering::SeqCst);
-        self.timeout_sec.store(cfg.searxng_timeout_sec, Ordering::SeqCst);
+        self.max_results
+            .store(cfg.searxng_max_results, Ordering::SeqCst);
+        self.timeout_sec
+            .store(cfg.searxng_timeout_sec, Ordering::SeqCst);
         self.sem.set_limit(cfg.searxng_concurrency);
     }
 
     async fn call(&self, ctx: CallCtx, args: &Value) -> R<String> {
         let base_url = self.base_url();
         if base_url.is_empty() {
-            return Err(AgentError::new("web_search is disabled: no searxng url configured"));
+            return Err(AgentError::new(
+                "web_search is disabled: no searxng url configured",
+            ));
         }
         let query = string_arg(args, "query").unwrap_or("");
         if query.trim().is_empty() {
@@ -129,9 +133,15 @@ impl Tool for SearxngTool {
         if status != reqwest::StatusCode::OK {
             let text = resp.text().await.unwrap_or_default();
             let text: String = text.chars().take(4096).collect();
-            return Err(AgentError::new(format!("searxng: unexpected status {}: {}", status, text)));
+            return Err(AgentError::new(format!(
+                "searxng: unexpected status {}: {}",
+                status, text
+            )));
         }
-        let parsed: SearxngResponse = resp.json().await.map_err(|e| AgentError::new(e.to_string()))?;
+        let parsed: SearxngResponse = resp
+            .json()
+            .await
+            .map_err(|e| AgentError::new(e.to_string()))?;
 
         let mut max = self.max_results().max(0) as usize;
         if max == 0 || max > parsed.results.len() {
@@ -142,7 +152,13 @@ impl Tool for SearxngTool {
         }
         let mut out = String::new();
         for (i, r) in parsed.results.iter().enumerate().take(max) {
-            out.push_str(&format!("{}. {}\n{}\n{}\n\n", i + 1, r.title, r.url, r.content));
+            out.push_str(&format!(
+                "{}. {}\n{}\n{}\n\n",
+                i + 1,
+                r.title,
+                r.url,
+                r.content
+            ));
         }
         Ok(out)
     }

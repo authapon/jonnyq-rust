@@ -136,7 +136,12 @@ impl ProgressDoc {
             if p.complete() {
                 status = "done".to_string();
             }
-            sb.push_str(&format!("\n\n{} [{}]\n{}", p.name, status, indent(&p.check, "  ")));
+            sb.push_str(&format!(
+                "\n\n{} [{}]\n{}",
+                p.name,
+                status,
+                indent(&p.check, "  ")
+            ));
         }
         sb
     }
@@ -160,7 +165,10 @@ impl ProgressDoc {
 }
 
 fn indent(s: &str, prefix: &str) -> String {
-    s.split('\n').map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+    s.split('\n')
+        .map(|l| format!("{prefix}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn parse_progress_doc(path: &Path) -> super::R<ProgressDoc> {
@@ -183,14 +191,20 @@ pub fn parse_progress_doc_text(data: &str) -> super::R<ProgressDoc> {
         }
         flush_block(&mut doc, cur, &mut block);
         if let Some(caps) = phase_heading_re().captures(&line) {
-            doc.phases.push(PhaseInfo { name: caps[1].to_string(), ..Default::default() });
+            doc.phases.push(PhaseInfo {
+                name: caps[1].to_string(),
+                ..Default::default()
+            });
             cur = doc.phases.len() as i64 - 1;
             continue;
         }
         if let Some(caps) = checklist_re().captures(&line) {
             if cur < 0 {
                 // checkbox before any phase heading
-                doc.phases.push(PhaseInfo { name: "(no phase)".into(), ..Default::default() });
+                doc.phases.push(PhaseInfo {
+                    name: "(no phase)".into(),
+                    ..Default::default()
+                });
                 cur = 0;
             }
             let t = Task {
@@ -273,7 +287,11 @@ pub fn human_plan_rules() -> String {
 }
 
 pub fn build_generate_for_human_prompt() -> String {
-    format!("{}\n\n{}", super::build_generate_prompt(), human_plan_rules())
+    format!(
+        "{}\n\n{}",
+        super::build_generate_prompt(),
+        human_plan_rules()
+    )
 }
 
 pub fn build_reconcile_for_human_prompt() -> String {
@@ -338,7 +356,10 @@ mod tests {
     #[test]
     fn parses_phases_checks_and_tasks() {
         let doc = parse_progress_doc_text(DOC).unwrap();
-        assert_eq!(doc.how_to_run, "cargo run\nserves http://localhost:3000, login demo/demo");
+        assert_eq!(
+            doc.how_to_run,
+            "cargo run\nserves http://localhost:3000, login demo/demo"
+        );
         assert_eq!(doc.phases.len(), 2);
         assert_eq!(doc.phases[0].name, "Phase 1: Login");
         assert_eq!(doc.phases[0].tasks.len(), 2);
@@ -379,9 +400,10 @@ mod tests {
 
     #[test]
     fn multiple_checks_in_one_phase_are_joined() {
-        let doc =
-            parse_progress_doc_text("## Phase 1\n> Human check: first\n\n> Human check: second\n- [ ] t\n")
-                .unwrap();
+        let doc = parse_progress_doc_text(
+            "## Phase 1\n> Human check: first\n\n> Human check: second\n- [ ] t\n",
+        )
+        .unwrap();
         assert_eq!(doc.phases[0].check, "first\nsecond");
     }
 
@@ -390,7 +412,9 @@ mod tests {
         let s = "กขค".repeat(2000); // 3 bytes per char in UTF-8
         let t = truncate_bytes(&s, NOTIFY_GUIDE_LIMIT);
         assert!(t.len() <= NOTIFY_GUIDE_LIMIT);
-        assert!(t.ends_with(&format!("(truncated; see {PROGRESS_FILE} for the full guide)")));
+        assert!(t.ends_with(&format!(
+            "(truncated; see {PROGRESS_FILE} for the full guide)"
+        )));
         // Cutting mid-character would panic; getting here means it didn't.
         assert!(truncate_bytes("short", NOTIFY_GUIDE_LIMIT) == "short".to_string());
     }
@@ -412,7 +436,11 @@ mod tests {
         let mut doc = ProgressDoc::default();
         assert_eq!(human_guide_note(&doc), "");
         doc.how_to_run = "cargo run".into();
-        doc.phases.push(PhaseInfo { name: "P".into(), check: "click".into(), ..Default::default() });
+        doc.phases.push(PhaseInfo {
+            name: "P".into(),
+            check: "click".into(),
+            ..Default::default()
+        });
         assert!(human_guide_note(&doc).contains("Never turn those notes into checkboxes"));
     }
 }

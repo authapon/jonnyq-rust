@@ -167,7 +167,10 @@ pub async fn notify_failure(
         crate::ui::go_duration_string((now - start).as_millis() as i64)
     );
     if let Err(send_err) = n.send_error(title, &err, &footer).await {
-        ui.plainln(&format!("warning: ntfy notification failed: {}", send_err.message));
+        ui.plainln(&format!(
+            "warning: ntfy notification failed: {}",
+            send_err.message
+        ));
         return err;
     }
     err.mark_notified()
@@ -177,7 +180,9 @@ pub async fn notify_failure(
 /// message, so a notification's timestamps read consistently with what the
 /// model itself was told.
 fn chrono_now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
 }
 
 /// Renders "now minus the given Instant" as the same formatted timestamp.
@@ -218,7 +223,9 @@ fn file_hash(data: &[u8]) -> String {
 }
 
 fn read_stored_hash(path: &Path) -> String {
-    std::fs::read_to_string(path).map(|s| s.trim().to_string()).unwrap_or_default()
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn write_stored_hash(path: &Path, hash: &str) -> std::io::Result<()> {
@@ -250,7 +257,11 @@ fn load_retry_state(path: &Path) -> RetryState {
     let Ok(n) = parts[0].parse::<i64>() else {
         return RetryState::default();
     };
-    RetryState { count: n, untouched: parts[1] == "1", text: parts[2].to_string() }
+    RetryState {
+        count: n,
+        untouched: parts[1] == "1",
+        text: parts[2].to_string(),
+    }
 }
 
 fn write_retry_state(path: &Path, s: &RetryState) -> std::io::Result<()> {
@@ -408,11 +419,25 @@ impl<'a> Coding<'a> {
         let result = self.plan_body(cancel, &n, human, start).await;
         match result {
             Ok(()) => Ok(()),
-            Err(e) => Err(notify_failure(&n, &self.ui, &format!("jonnyq: {} failed", cmd), start, cancel, e).await),
+            Err(e) => Err(notify_failure(
+                &n,
+                &self.ui,
+                &format!("jonnyq: {} failed", cmd),
+                start,
+                cancel,
+                e,
+            )
+            .await),
         }
     }
 
-    async fn plan_body(&self, cancel: &CancellationToken, n: &Notifier, human: bool, start: Instant) -> R<()> {
+    async fn plan_body(
+        &self,
+        cancel: &CancellationToken,
+        n: &Notifier,
+        human: bool,
+        start: Instant,
+    ) -> R<()> {
         let cmd = if human { "/plan_for_human" } else { "/plan" };
         let req_path = self.path(REQUIREMENTS_FILE);
         let Ok(req_data) = std::fs::read(&req_path) else {
@@ -437,19 +462,35 @@ impl<'a> Coding<'a> {
         }
 
         let outcome: R<String> = if !prog_path.exists() {
-            self.ui.plainln(&format!("[plan] no {} found, generating task list from {}", PROGRESS_FILE, REQUIREMENTS_FILE));
-            let prompt = if human { human::build_generate_for_human_prompt() } else { build_generate_prompt() };
+            self.ui.plainln(&format!(
+                "[plan] no {} found, generating task list from {}",
+                PROGRESS_FILE, REQUIREMENTS_FILE
+            ));
+            let prompt = if human {
+                human::build_generate_for_human_prompt()
+            } else {
+                build_generate_prompt()
+            };
             if let Err(e) = run_turn!(prompt) {
-                return Err(AgentError::new(format!("generating {}: {}", PROGRESS_FILE, e.message)));
+                return Err(AgentError::new(format!(
+                    "generating {}: {}",
+                    PROGRESS_FILE, e.message
+                )));
             }
             let Ok(_tasks) = parse_progress(&prog_path) else {
-                return Err(AgentError::new(format!("model did not create {}", PROGRESS_FILE)));
+                return Err(AgentError::new(format!(
+                    "model did not create {}",
+                    PROGRESS_FILE
+                )));
             };
             write_stored_hash(&hash_path, &current_hash)
                 .map_err(|e| AgentError::new(format!("recording requirements hash: {}", e)))?;
             let mut warn = String::new();
             if human && !human_guide_present(&prog_path) {
-                self.ui.plainln(&format!("[plan_for_human] adding human verification notes to {}", PROGRESS_FILE));
+                self.ui.plainln(&format!(
+                    "[plan_for_human] adding human verification notes to {}",
+                    PROGRESS_FILE
+                ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
@@ -483,7 +524,10 @@ impl<'a> Coding<'a> {
             let had_guide = human_guide_present(&prog_path);
             let mut warn = String::new();
             if !had_guide {
-                self.ui.plainln(&format!("[plan_for_human] adding human verification notes to {}", PROGRESS_FILE));
+                self.ui.plainln(&format!(
+                    "[plan_for_human] adding human verification notes to {}",
+                    PROGRESS_FILE
+                ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
@@ -513,15 +557,25 @@ impl<'a> Coding<'a> {
                 "[plan] {} changed since {} was last updated; reconciling",
                 REQUIREMENTS_FILE, PROGRESS_FILE
             ));
-            let prompt = if human { human::build_reconcile_for_human_prompt() } else { build_reconcile_prompt() };
+            let prompt = if human {
+                human::build_reconcile_for_human_prompt()
+            } else {
+                build_reconcile_prompt()
+            };
             if let Err(e) = run_turn!(prompt) {
-                return Err(AgentError::new(format!("reconciling {}: {}", PROGRESS_FILE, e.message)));
+                return Err(AgentError::new(format!(
+                    "reconciling {}: {}",
+                    PROGRESS_FILE, e.message
+                )));
             }
             write_stored_hash(&hash_path, &current_hash)
                 .map_err(|e| AgentError::new(format!("recording requirements hash: {}", e)))?;
             let mut warn = String::new();
             if human && !human_guide_present(&prog_path) {
-                self.ui.plainln(&format!("[plan_for_human] adding human verification notes to {}", PROGRESS_FILE));
+                self.ui.plainln(&format!(
+                    "[plan_for_human] adding human verification notes to {}",
+                    PROGRESS_FILE
+                ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
@@ -559,8 +613,18 @@ impl<'a> Coding<'a> {
                 }
             }
         }
-        let u = if turn_ran { self.agent.last_usage.lock().unwrap().usage } else { Usage::default() };
-        notify_or_warn(n, &self.ui, &format!("jonnyq: {} complete", cmd), &with_timing(&summary, start, u)).await;
+        let u = if turn_ran {
+            self.agent.last_usage.lock().unwrap().usage
+        } else {
+            Usage::default()
+        };
+        notify_or_warn(
+            n,
+            &self.ui,
+            &format!("jonnyq: {} complete", cmd),
+            &with_timing(&summary, start, u),
+        )
+        .await;
         Ok(())
     }
 }
@@ -596,7 +660,12 @@ impl<'a> Coding<'a> {
         }
     }
 
-    async fn run_one_task_body(&self, cancel: &CancellationToken, n: &Notifier, start: Instant) -> R<()> {
+    async fn run_one_task_body(
+        &self,
+        cancel: &CancellationToken,
+        n: &Notifier,
+        start: Instant,
+    ) -> R<()> {
         let prog_path = self.path(PROGRESS_FILE);
         if !prog_path.exists() {
             return Err(AgentError::new(format!(
@@ -608,8 +677,14 @@ impl<'a> Coding<'a> {
         let tasks = parse_progress(&prog_path)
             .map_err(|e| AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message)))?;
         let Some(next) = first_unfinished(&tasks) else {
-            self.ui.plainln(&format!("[coding] all tasks in {} are checked off", PROGRESS_FILE));
-            let mut summary = format!("All tasks already complete: {}", progress_summary_line_local(&tasks));
+            self.ui.plainln(&format!(
+                "[coding] all tasks in {} are checked off",
+                PROGRESS_FILE
+            ));
+            let mut summary = format!(
+                "All tasks already complete: {}",
+                progress_summary_line_local(&tasks)
+            );
             if let Ok(doc) = human::parse_progress_doc(&prog_path) {
                 let g = doc.guide_text();
                 if !g.is_empty() {
@@ -620,8 +695,13 @@ impl<'a> Coding<'a> {
             // No run_turn happened, so there's no fresh last_usage to report
             // - Usage::default() renders as "n/a" rather than stale figures
             // from an unrelated earlier turn.
-            notify_or_warn(n, &self.ui, "jonnyq: /coding complete", &with_timing(&summary, start, Usage::default()))
-                .await;
+            notify_or_warn(
+                n,
+                &self.ui,
+                "jonnyq: /coding complete",
+                &with_timing(&summary, start, Usage::default()),
+            )
+            .await;
             return Ok(());
         };
 
@@ -635,16 +715,20 @@ impl<'a> Coding<'a> {
         }
 
         let _mode_guard = CodingModeGuard::on(&self.agent);
-        self.ui.plainln(&format!("[coding] working on: {}", next.text));
+        self.ui
+            .plainln(&format!("[coding] working on: {}", next.text));
         let before = std::fs::read(&prog_path).unwrap_or_default();
         let doc_before = human::parse_progress_doc(&prog_path).ok();
-        let phase_idx = doc_before.as_ref().map(|d| d.first_incomplete_phase()).unwrap_or(-1);
+        let phase_idx = doc_before
+            .as_ref()
+            .map(|d| d.first_incomplete_phase())
+            .unwrap_or(-1);
         let prompt = build_task_prompt(&next.text, stall, prev_untouched)
-            + &doc_before.map(|d| human::human_guide_note(&d)).unwrap_or_default();
+            + &doc_before
+                .map(|d| human::human_guide_note(&d))
+                .unwrap_or_default();
         let turn = self.agent.run_turn(cancel.child_token(), &prompt).await;
-        turn.map_err(|e| {
-            AgentError::new(format!("working on {:?}: {}", next.text, e.message))
-        })?;
+        turn.map_err(|e| AgentError::new(format!("working on {:?}: {}", next.text, e.message)))?;
 
         let tasks_after = parse_progress(&prog_path)
             .map_err(|e| AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message)))?;
@@ -668,10 +752,17 @@ impl<'a> Coding<'a> {
                         let msg = format!(
                             "{}\n\n{}",
                             crate::notify::format_error(&stall_err),
-                            with_timing(&summary, start, self.agent.last_usage.lock().unwrap().usage)
+                            with_timing(
+                                &summary,
+                                start,
+                                self.agent.last_usage.lock().unwrap().usage
+                            )
                         );
                         if let Err(e) = n.send_alert("jonnyq: /coding stalled", &msg).await {
-                            self.ui.plainln(&format!("warning: ntfy notification failed: {}", e.message));
+                            self.ui.plainln(&format!(
+                                "warning: ntfy notification failed: {}",
+                                e.message
+                            ));
                         }
                         return Err(stall_err.mark_notified());
                     }
@@ -680,7 +771,11 @@ impl<'a> Coding<'a> {
                 let untouched = progress_unchanged(&prog_path, &before);
                 write_retry_state(
                     &retry_path,
-                    &RetryState { text: next.text.clone(), count: new_count, untouched },
+                    &RetryState {
+                        text: next.text.clone(),
+                        count: new_count,
+                        untouched,
+                    },
                 )
                 .map_err(|e| AgentError::new(format!("recording retry state: {}", e)))?;
                 return Ok(());
@@ -753,12 +848,20 @@ impl<'a> Coding<'a> {
         match result {
             Ok(()) => Ok(()),
             Err(e) => {
-                Err(notify_failure(&n, &self.ui, "jonnyq: /autocoding failed", start, cancel, e).await)
+                Err(
+                    notify_failure(&n, &self.ui, "jonnyq: /autocoding failed", start, cancel, e)
+                        .await,
+                )
             }
         }
     }
 
-    async fn auto_run_body(&self, cancel: &CancellationToken, n: &Notifier, start: Instant) -> R<()> {
+    async fn auto_run_body(
+        &self,
+        cancel: &CancellationToken,
+        n: &Notifier,
+        start: Instant,
+    ) -> R<()> {
         self.plan(cancel, false).await?;
 
         let prog_path = self.path(PROGRESS_FILE);
@@ -766,8 +869,9 @@ impl<'a> Coding<'a> {
         let _mode_guard = CodingModeGuard::on(&self.agent);
         let loop_res = self
             .run_task_loop(cancel, "autocoding", &|c: &Coding, _p: &Path| {
-                let tasks = parse_progress(&c.path(PROGRESS_FILE))
-                    .map_err(|e| AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message)))?;
+                let tasks = parse_progress(&c.path(PROGRESS_FILE)).map_err(|e| {
+                    AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message))
+                })?;
                 let next = first_unfinished(&tasks);
                 Ok((tasks, next))
             })
@@ -775,8 +879,14 @@ impl<'a> Coding<'a> {
         let (ran_turn, ()) = loop_res?;
 
         let tasks = parse_progress(&prog_path).unwrap_or_default();
-        self.ui.plainln(&format!("[autocoding] all tasks in {} are checked off", PROGRESS_FILE));
-        let mut summary = format!("All tasks complete: {}", progress_summary_line_local(&tasks));
+        self.ui.plainln(&format!(
+            "[autocoding] all tasks in {} are checked off",
+            PROGRESS_FILE
+        ));
+        let mut summary = format!(
+            "All tasks complete: {}",
+            progress_summary_line_local(&tasks)
+        );
         if let Ok(doc) = human::parse_progress_doc(&prog_path) {
             let g = doc.guide_text();
             if !g.is_empty() {
@@ -784,8 +894,18 @@ impl<'a> Coding<'a> {
                 summary.push_str(&human::truncate_bytes(&g, human::NOTIFY_GUIDE_LIMIT));
             }
         }
-        let u = if ran_turn { self.agent.last_usage.lock().unwrap().usage } else { Usage::default() };
-        notify_or_warn(n, &self.ui, "jonnyq: /autocoding complete", &with_timing(&summary, start, u)).await;
+        let u = if ran_turn {
+            self.agent.last_usage.lock().unwrap().usage
+        } else {
+            Usage::default()
+        };
+        notify_or_warn(
+            n,
+            &self.ui,
+            "jonnyq: /autocoding complete",
+            &with_timing(&summary, start, u),
+        )
+        .await;
         Ok(())
     }
 
@@ -854,7 +974,8 @@ impl<'a> Coding<'a> {
                 untouched = false;
             }
 
-            self.ui.plainln(&format!("[{}] working on: {}", label, next.text));
+            self.ui
+                .plainln(&format!("[{}] working on: {}", label, next.text));
             // Start each task with a clean slate: no memory of the planning
             // step or any earlier task. The model re-discovers whatever it
             // needs (via read_file/run_command) instead of relying on
@@ -864,9 +985,14 @@ impl<'a> Coding<'a> {
             let doc_before = human::parse_progress_doc(&prog_path).ok();
             ran_turn = true;
             let prompt = build_task_prompt(&next.text, stall, untouched)
-                + &doc_before.map(|d| human::human_guide_note(&d)).unwrap_or_default();
+                + &doc_before
+                    .map(|d| human::human_guide_note(&d))
+                    .unwrap_or_default();
             if let Err(e) = self.agent.run_turn(cancel.child_token(), &prompt).await {
-                return Err(AgentError::new(format!("working on {:?}: {}", next.text, e.message)));
+                return Err(AgentError::new(format!(
+                    "working on {:?}: {}",
+                    next.text, e.message
+                )));
             }
             untouched = progress_unchanged(&prog_path, &before);
         }
@@ -894,7 +1020,6 @@ impl Drop for CodingModeGuard<'_> {
 
 #[allow(dead_code)]
 fn unused(_: Duration) {}
-
 
 #[cfg(test)]
 mod port_tests;

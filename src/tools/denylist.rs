@@ -19,28 +19,57 @@ static PATTERNS: [(&str, LazyLock<Regex>); 20] = [
     // rm -rf (in any flag order/spelling) targeting root-ish paths.
     (
         r"(?i)\brm\s+(-[a-z]*[rf][a-z]*[rf]?[a-z]*|--recursive)\s+(--no-preserve-root\s+)?(/|/\*|~|~/\*|\$HOME|\$HOME/\*)(\s|$)",
-        LazyLock::new(|| Regex::new(r"(?i)\brm\s+(-[a-z]*[rf][a-z]*[rf]?[a-z]*|--recursive)\s+(--no-preserve-root\s+)?(/|/\*|~|~/\*|\$HOME|\$HOME/\*)(\s|$)").unwrap()),
+        LazyLock::new(|| {
+            Regex::new(r"(?i)\brm\s+(-[a-z]*[rf][a-z]*[rf]?[a-z]*|--recursive)\s+(--no-preserve-root\s+)?(/|/\*|~|~/\*|\$HOME|\$HOME/\*)(\s|$)").unwrap()
+        }),
     ),
-    (r"(?i)--no-preserve-root", LazyLock::new(|| Regex::new(r"(?i)--no-preserve-root").unwrap())),
+    (
+        r"(?i)--no-preserve-root",
+        LazyLock::new(|| Regex::new(r"(?i)--no-preserve-root").unwrap()),
+    ),
     // classic fork bomb.
     (
         r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
         LazyLock::new(|| Regex::new(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:").unwrap()),
     ),
     // filesystem/partition destruction.
-    (r"(?i)\bmkfs(\.[a-z0-9]+)?\b", LazyLock::new(|| Regex::new(r"(?i)\bmkfs(\.[a-z0-9]+)?\b").unwrap())),
-    (r"(?i)\bfdisk\b", LazyLock::new(|| Regex::new(r"(?i)\bfdisk\b").unwrap())),
-    (r"(?i)\bparted\b", LazyLock::new(|| Regex::new(r"(?i)\bparted\b").unwrap())),
-    (r"(?i)\bwipefs\b", LazyLock::new(|| Regex::new(r"(?i)\bwipefs\b").unwrap())),
-    (r"(?i)\bdd\s+.*\bof=/dev/", LazyLock::new(|| Regex::new(r"(?i)\bdd\s+.*\bof=/dev/").unwrap())),
-    (r"(?i)>\s*/dev/sd[a-z][0-9]*\b", LazyLock::new(|| Regex::new(r"(?i)>\s*/dev/sd[a-z][0-9]*\b").unwrap())),
-    (r"(?i)>\s*/dev/nvme\d+n\d+", LazyLock::new(|| Regex::new(r"(?i)>\s*/dev/nvme\d+n\d+").unwrap())),
+    (
+        r"(?i)\bmkfs(\.[a-z0-9]+)?\b",
+        LazyLock::new(|| Regex::new(r"(?i)\bmkfs(\.[a-z0-9]+)?\b").unwrap()),
+    ),
+    (
+        r"(?i)\bfdisk\b",
+        LazyLock::new(|| Regex::new(r"(?i)\bfdisk\b").unwrap()),
+    ),
+    (
+        r"(?i)\bparted\b",
+        LazyLock::new(|| Regex::new(r"(?i)\bparted\b").unwrap()),
+    ),
+    (
+        r"(?i)\bwipefs\b",
+        LazyLock::new(|| Regex::new(r"(?i)\bwipefs\b").unwrap()),
+    ),
+    (
+        r"(?i)\bdd\s+.*\bof=/dev/",
+        LazyLock::new(|| Regex::new(r"(?i)\bdd\s+.*\bof=/dev/").unwrap()),
+    ),
+    (
+        r"(?i)>\s*/dev/sd[a-z][0-9]*\b",
+        LazyLock::new(|| Regex::new(r"(?i)>\s*/dev/sd[a-z][0-9]*\b").unwrap()),
+    ),
+    (
+        r"(?i)>\s*/dev/nvme\d+n\d+",
+        LazyLock::new(|| Regex::new(r"(?i)>\s*/dev/nvme\d+n\d+").unwrap()),
+    ),
     // power/system state changes.
     (
         r"(?i)\b(shutdown|reboot|poweroff|halt)\b",
         LazyLock::new(|| Regex::new(r"(?i)\b(shutdown|reboot|poweroff|halt)\b").unwrap()),
     ),
-    (r"(?i)\binit\s+[06]\b", LazyLock::new(|| Regex::new(r"(?i)\binit\s+[06]\b").unwrap())),
+    (
+        r"(?i)\binit\s+[06]\b",
+        LazyLock::new(|| Regex::new(r"(?i)\binit\s+[06]\b").unwrap()),
+    ),
     (
         r"(?i)\bsystemctl\s+(poweroff|reboot|halt)\b",
         LazyLock::new(|| Regex::new(r"(?i)\bsystemctl\s+(poweroff|reboot|halt)\b").unwrap()),
@@ -55,16 +84,30 @@ static PATTERNS: [(&str, LazyLock<Regex>); 20] = [
         LazyLock::new(|| Regex::new(r"(?i)>\s*/etc/(passwd|shadow|sudoers)\b").unwrap()),
     ),
     // wiping cron/firewall wholesale.
-    (r"(?i)\bcrontab\s+-r\b", LazyLock::new(|| Regex::new(r"(?i)\bcrontab\s+-r\b").unwrap())),
-    (r"(?i)\biptables\s+(-F|--flush)\b", LazyLock::new(|| Regex::new(r"(?i)\biptables\s+(-F|--flush)\b").unwrap())),
+    (
+        r"(?i)\bcrontab\s+-r\b",
+        LazyLock::new(|| Regex::new(r"(?i)\bcrontab\s+-r\b").unwrap()),
+    ),
+    (
+        r"(?i)\biptables\s+(-F|--flush)\b",
+        LazyLock::new(|| Regex::new(r"(?i)\biptables\s+(-F|--flush)\b").unwrap()),
+    ),
     // remote script piped straight into a shell.
     (
         r"(?i)\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b",
-        LazyLock::new(|| Regex::new(r"(?i)\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b").unwrap()),
+        LazyLock::new(|| {
+            Regex::new(r"(?i)\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b").unwrap()
+        }),
     ),
     // recursive chmod/chown starting from root.
-    (r"(?i)\bchmod\s+-R\s+\S+\s+/(\s|$)", LazyLock::new(|| Regex::new(r"(?i)\bchmod\s+-R\s+\S+\s+/(\s|$)").unwrap())),
-    (r"(?i)\bchown\s+-R\s+\S+\s+/(\s|$)", LazyLock::new(|| Regex::new(r"(?i)\bchown\s+-R\s+\S+\s+/(\s|$)").unwrap())),
+    (
+        r"(?i)\bchmod\s+-R\s+\S+\s+/(\s|$)",
+        LazyLock::new(|| Regex::new(r"(?i)\bchmod\s+-R\s+\S+\s+/(\s|$)").unwrap()),
+    ),
+    (
+        r"(?i)\bchown\s+-R\s+\S+\s+/(\s|$)",
+        LazyLock::new(|| Regex::new(r"(?i)\bchown\s+-R\s+\S+\s+/(\s|$)").unwrap()),
+    ),
 ];
 
 /// Returns a non-empty reason if `cmd` matches a known-dangerous pattern.

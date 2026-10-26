@@ -31,7 +31,9 @@ impl RepeatDetector {
         self.buf.push_str(delta);
         let mut detected = false;
         loop {
-            let Some(pos) = self.buf.find('\n') else { break };
+            let Some(pos) = self.buf.find('\n') else {
+                break;
+            };
             let chunk = self.buf[..pos].trim().to_string();
             self.buf.drain(..pos + 1);
             if chunk.len() < MIN_CHUNK_LEN {
@@ -86,7 +88,10 @@ mod tests {
         let mut d = RepeatDetector::default();
         assert!(!d.add("---\n---\n---\n---\n"));
         for i in 0..10 {
-            assert!(!d.add(&format!("a distinct line number {} with plenty of length to matter\n", i)));
+            assert!(!d.add(&format!(
+                "a distinct line number {} with plenty of length to matter\n",
+                i
+            )));
         }
     }
 

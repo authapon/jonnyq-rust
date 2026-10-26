@@ -112,11 +112,26 @@ mod tests {
     #[test]
     fn known_reasons() {
         for (msg, needle) in [
-            ("ollama: unexpected status 404 Not Found: model not found", "could not find the endpoint or model"),
-            ("dial tcp 127.0.0.1:11434: connect: connection refused", "Nothing is listening at the provider URL"),
-            ("requirements.md not found in the working directory", "no requirements.md"),
-            ("task \"x\" made no progress after 5 attempts", "kept retrying the same task"),
-            ("tool call budget exceeded for this turn (limit 50)", "too many tool calls"),
+            (
+                "ollama: unexpected status 404 Not Found: model not found",
+                "could not find the endpoint or model",
+            ),
+            (
+                "dial tcp 127.0.0.1:11434: connect: connection refused",
+                "Nothing is listening at the provider URL",
+            ),
+            (
+                "requirements.md not found in the working directory",
+                "no requirements.md",
+            ),
+            (
+                "task \"x\" made no progress after 5 attempts",
+                "kept retrying the same task",
+            ),
+            (
+                "tool call budget exceeded for this turn (limit 50)",
+                "too many tool calls",
+            ),
             ("deadline exceeded", "took too long"),
         ] {
             let got = explain(&AgentError::new(msg));

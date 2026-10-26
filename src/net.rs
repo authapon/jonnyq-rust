@@ -86,19 +86,28 @@ impl Default for ProxyConfig {
 impl ProxyConfig {
     /// "jonnyq has no opinion" - follow the environment.
     pub fn system() -> Self {
-        Self { mode: ProxyMode::System, no_proxy: String::new() }
+        Self {
+            mode: ProxyMode::System,
+            no_proxy: String::new(),
+        }
     }
 
     /// Direct connections, whatever the environment says.
     pub fn direct() -> Self {
-        Self { mode: ProxyMode::Direct, no_proxy: String::new() }
+        Self {
+            mode: ProxyMode::Direct,
+            no_proxy: String::new(),
+        }
     }
 
     /// Routes through `url`, bypassing `no_proxy`. `url` is normalised exactly
     /// as [`ProxyConfig::parse`] would; an unusable value is an error.
     pub fn socks(url: &str, no_proxy: &str) -> R<Self> {
         let url = normalize_proxy_url(url)?;
-        Ok(Self { mode: ProxyMode::Socks(url), no_proxy: no_proxy.trim().to_string() })
+        Ok(Self {
+            mode: ProxyMode::Socks(url),
+            no_proxy: no_proxy.trim().to_string(),
+        })
     }
 
     /// Turns the raw `socks-proxy` / `no-proxy` setting values into a config,
@@ -113,13 +122,22 @@ impl ProxyConfig {
         let raw = raw.trim();
         let no_proxy = no_proxy.trim().to_string();
         if raw.is_empty() {
-            return Ok(Self { mode: ProxyMode::System, no_proxy });
+            return Ok(Self {
+                mode: ProxyMode::System,
+                no_proxy,
+            });
         }
         if is_disabled(raw) {
-            return Ok(Self { mode: ProxyMode::Direct, no_proxy });
+            return Ok(Self {
+                mode: ProxyMode::Direct,
+                no_proxy,
+            });
         }
         if is_system(raw) {
-            return Ok(Self { mode: ProxyMode::System, no_proxy });
+            return Ok(Self {
+                mode: ProxyMode::System,
+                no_proxy,
+            });
         }
         Self::socks(raw, &no_proxy)
     }
@@ -170,8 +188,9 @@ impl ProxyConfig {
             ProxyMode::System => Ok(builder),
             ProxyMode::Direct => Ok(builder.no_proxy()),
             ProxyMode::Socks(url) => {
-                let mut proxy = reqwest::Proxy::all(url)
-                    .map_err(|e| AgentError::new(format!("invalid socks-proxy {:?}: {}", url, e)))?;
+                let mut proxy = reqwest::Proxy::all(url).map_err(|e| {
+                    AgentError::new(format!("invalid socks-proxy {:?}: {}", url, e))
+                })?;
                 if !self.no_proxy.is_empty() {
                     proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&self.no_proxy));
                 }
@@ -288,14 +307,25 @@ struct Net {
 
 impl Net {
     fn new() -> Self {
-        Self { proxy: ProxyConfig::system(), generation: 0, next_id: 0, pool: HashMap::new() }
+        Self {
+            proxy: ProxyConfig::system(),
+            generation: 0,
+            next_id: 0,
+            pool: HashMap::new(),
+        }
     }
 
     /// Installs `proxy` as the transport for clients built from here on,
     /// dropping every cached client. Validated first (see [`set_current`]).
     fn set(&mut self, proxy: ProxyConfig) -> R<()> {
         // Build before installing: `apply` is where reqwest re-parses the URL.
-        self.build(Kind { timeout: None, connect_timeout: None }, &proxy)?;
+        self.build(
+            Kind {
+                timeout: None,
+                connect_timeout: None,
+            },
+            &proxy,
+        )?;
         self.proxy = proxy;
         self.generation += 1;
         // Clients built for a proxy that is no longer in effect would otherwise
@@ -342,7 +372,8 @@ impl Net {
             b = b.connect_timeout(Duration::from_millis(ms as u64));
         }
         b = proxy.apply(b)?;
-        b.build().map_err(|e| AgentError::new(format!("cannot build HTTP client: {}", e)))
+        b.build()
+            .map_err(|e| AgentError::new(format!("cannot build HTTP client: {}", e)))
     }
 }
 
@@ -377,7 +408,10 @@ pub fn client(timeout: Option<Duration>, connect_timeout: Option<Duration>) -> r
 /// [`client`] plus the pool entry's identity, so a test can tell "the same
 /// client came back out of the pool" from "a client was rebuilt" - the ids are
 /// ours, and a caller that does not care ignores the second half of the tuple.
-fn client_with_id(timeout: Option<Duration>, connect_timeout: Option<Duration>) -> (reqwest::Client, u64) {
+fn client_with_id(
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+) -> (reqwest::Client, u64) {
     let kind = Kind {
         timeout: timeout.map(|d| d.as_millis()),
         connect_timeout: connect_timeout.map(|d| d.as_millis()),
@@ -405,7 +439,6 @@ pub fn setting_value(proxy: &ProxyConfig) -> String {
         ProxyMode::Socks(u) => u.clone(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -447,16 +480,27 @@ mod tests {
         // Empty = the environment decides.
         let p = ProxyConfig::parse("", "").unwrap();
         assert_eq!(p.mode, ProxyMode::System);
-        assert_eq!(p.describe(), "not set (follows ALL_PROXY/HTTPS_PROXY if exported)");
+        assert_eq!(
+            p.describe(),
+            "not set (follows ALL_PROXY/HTTPS_PROXY if exported)"
+        );
 
         // off/none/no = explicit direct (case- and space-insensitive).
         for v in ["off", "NONE", " no "] {
-            assert_eq!(ProxyConfig::parse(v, "").unwrap().mode, ProxyMode::Direct, "{v}");
+            assert_eq!(
+                ProxyConfig::parse(v, "").unwrap().mode,
+                ProxyMode::Direct,
+                "{v}"
+            );
         }
 
         // auto/system/env/default = back to following the environment.
         for v in ["auto", "SYSTEM", "env"] {
-            assert_eq!(ProxyConfig::parse(v, "").unwrap().mode, ProxyMode::System, "{v}");
+            assert_eq!(
+                ProxyConfig::parse(v, "").unwrap().mode,
+                ProxyMode::System,
+                "{v}"
+            );
         }
 
         // A bare host:port means socks5h (remote DNS).
@@ -481,28 +525,42 @@ mod tests {
     #[test]
     fn rejects_values_that_could_never_connect() {
         // An http proxy is not a socks proxy - say so instead of failing later.
-        assert!(
-            ProxyConfig::parse("http://proxy:3128", "").unwrap_err().message.contains("not a SOCKS proxy")
-        );
-        assert!(
-            ProxyConfig::parse("https://proxy:8443", "").unwrap_err().message.contains("not a SOCKS proxy")
-        );
+        assert!(ProxyConfig::parse("http://proxy:3128", "")
+            .unwrap_err()
+            .message
+            .contains("not a SOCKS proxy"));
+        assert!(ProxyConfig::parse("https://proxy:8443", "")
+            .unwrap_err()
+            .message
+            .contains("not a SOCKS proxy"));
         // Unknown scheme, missing host, impossible port, embedded space.
-        assert!(ProxyConfig::parse("ftp://proxy:21", "").unwrap_err().message.contains("unsupported"));
+        assert!(ProxyConfig::parse("ftp://proxy:21", "")
+            .unwrap_err()
+            .message
+            .contains("unsupported"));
         assert!(ProxyConfig::parse("socks5://", "").is_err());
-        assert!(ProxyConfig::parse("socks5://proxy:99999", "").unwrap_err().message.contains("invalid port"));
+        assert!(ProxyConfig::parse("socks5://proxy:99999", "")
+            .unwrap_err()
+            .message
+            .contains("invalid port"));
         assert!(normalize_proxy_url("   ").is_err());
         assert!(normalize_proxy_url("socks5://local host:1080").is_err());
         // A whitespace-only *setting* is "unset", not "invalid" - the same
         // leniency every other string setting has.
-        assert_eq!(ProxyConfig::parse("   ", "").unwrap().mode, ProxyMode::System);
+        assert_eq!(
+            ProxyConfig::parse("   ", "").unwrap().mode,
+            ProxyMode::System
+        );
     }
 
     #[test]
     fn redact_url_touches_only_urls_with_credentials() {
         assert_eq!(redact_url("off"), "off");
         assert_eq!(redact_url(""), "");
-        assert_eq!(redact_url("socks5h://127.0.0.1:1080"), "socks5h://127.0.0.1:1080");
+        assert_eq!(
+            redact_url("socks5h://127.0.0.1:1080"),
+            "socks5h://127.0.0.1:1080"
+        );
         assert_eq!(
             redact_url("socks5h://u:p%40ss@proxy.example:1080/deep"),
             "socks5h://u:***@proxy.example:1080/deep"
@@ -512,7 +570,10 @@ mod tests {
     #[test]
     fn describe_shows_the_bypass_list_only_when_proxying() {
         let p = ProxyConfig::socks("127.0.0.1:1080", "localhost,192.168.0.0/16").unwrap();
-        assert_eq!(p.describe(), "socks5h://127.0.0.1:1080 (direct for: localhost,192.168.0.0/16)");
+        assert_eq!(
+            p.describe(),
+            "socks5h://127.0.0.1:1080 (direct for: localhost,192.168.0.0/16)"
+        );
         assert_eq!(ProxyConfig::direct().describe(), "off (direct connections)");
         assert!(!ProxyConfig::system().describe().contains("direct for"));
     }
@@ -531,7 +592,12 @@ mod tests {
             let built = p
                 .apply(reqwest::Client::builder())
                 .and_then(|b| b.build().map_err(|e| AgentError::new(e.to_string())));
-            assert!(built.is_ok(), "{:?}: {:?}", p, built.err().map(|e| e.message));
+            assert!(
+                built.is_ok(),
+                "{:?}: {:?}",
+                p,
+                built.err().map(|e| e.message)
+            );
         }
     }
 
@@ -549,8 +615,14 @@ mod tests {
     #[test]
     fn clients_are_pooled_per_timeout_and_dropped_on_a_change() {
         let mut net = Net::new();
-        let no = Kind { timeout: None, connect_timeout: None };
-        let ten = Kind { timeout: Some(10_000), connect_timeout: None };
+        let no = Kind {
+            timeout: None,
+            connect_timeout: None,
+        };
+        let ten = Kind {
+            timeout: Some(10_000),
+            connect_timeout: None,
+        };
 
         // Same request twice = the pooled client...
         let (_, id_a) = net.client_for(no);
@@ -564,9 +636,15 @@ mod tests {
         // A new proxy invalidates every pooled client, so the next request of
         // each kind gets a fresh one.
         net.set(ProxyConfig::direct()).unwrap();
-        assert!(pool_ids(&net).is_empty(), "the pool is dropped with the proxy");
+        assert!(
+            pool_ids(&net).is_empty(),
+            "the pool is dropped with the proxy"
+        );
         let (_, id_b) = net.client_for(no);
-        assert_ne!(id_a, id_b, "a cached client must not survive a proxy change");
+        assert_ne!(
+            id_a, id_b,
+            "a cached client must not survive a proxy change"
+        );
         assert_eq!(pool_ids(&net), vec![id_b]);
         // And the proxy the clients are built from is the new one.
         assert_eq!(net.proxy.mode, ProxyMode::Direct);
@@ -580,7 +658,11 @@ mod tests {
             no_proxy: String::new(),
         };
         assert!(net.set(broken).is_err());
-        assert_eq!(net.proxy.mode, ProxyMode::System, "a rejected change changes nothing");
+        assert_eq!(
+            net.proxy.mode,
+            ProxyMode::System,
+            "a rejected change changes nothing"
+        );
         assert_eq!(net.generation, 0, "and does not invalidate the pool");
 
         let _g = SlotGuard::new();
@@ -591,7 +673,10 @@ mod tests {
     }
 
     fn broken_from(url: &str) -> ProxyConfig {
-        ProxyConfig { mode: ProxyMode::Socks(url.to_string()), no_proxy: String::new() }
+        ProxyConfig {
+            mode: ProxyMode::Socks(url.to_string()),
+            no_proxy: String::new(),
+        }
     }
 
     /// End-to-end: a client built from a `socks-proxy` setting really does put
@@ -618,20 +703,48 @@ mod tests {
             .build()
             .expect("client for a valid socks proxy");
 
-        let body: String = client.get(format!("{}/hello", srv.url)).send().await.unwrap().text().await.unwrap();
-        assert!(body.contains("/hello"), "response through the proxy: {body}");
+        let body: String = client
+            .get(format!("{}/hello", srv.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("/hello"),
+            "response through the proxy: {body}"
+        );
         let tunnels = proxy.tunnels();
         assert_eq!(tunnels.len(), 1, "exactly one tunnel: {tunnels:?}");
         let hostport = srv.url.strip_prefix("http://").unwrap();
-        assert_eq!(tunnels[0], hostport, "the proxy was asked for the model server");
+        assert_eq!(
+            tunnels[0], hostport,
+            "the proxy was asked for the model server"
+        );
 
         // The bypass list is honoured: the same host is reached directly when
         // loopback is listed, so no tunnel is opened at all.
         let direct_cfg = ProxyConfig::socks(&proxy.url, "127.0.0.1").unwrap();
-        let direct = direct_cfg.apply(reqwest::Client::builder()).unwrap().build().unwrap();
-        let body: String = direct.get(format!("{}/hello", srv.url)).send().await.unwrap().text().await.unwrap();
+        let direct = direct_cfg
+            .apply(reqwest::Client::builder())
+            .unwrap()
+            .build()
+            .unwrap();
+        let body: String = direct
+            .get(format!("{}/hello", srv.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert!(body.contains("/hello"), "{body}");
-        assert_eq!(proxy.tunnels().len(), 1, "the bypassed request never reached the proxy");
+        assert_eq!(
+            proxy.tunnels().len(),
+            1,
+            "the bypassed request never reached the proxy"
+        );
     }
 
     /// `off` must beat a configured proxy: the same destination is reached
@@ -649,7 +762,11 @@ mod tests {
 
         // A proxy that is in effect: the request is tunnelled to this host.
         let on = ProxyConfig::socks(&proxy.url, "").unwrap();
-        let client = on.apply(reqwest::Client::builder()).unwrap().build().unwrap();
+        let client = on
+            .apply(reqwest::Client::builder())
+            .unwrap()
+            .build()
+            .unwrap();
         client.get(&srv.url).send().await.unwrap();
         let tunnels = proxy.tunnels_to(&hostport).len();
         assert_eq!(tunnels, 1);
@@ -657,8 +774,16 @@ mod tests {
         // The very same setting turned off: the request still succeeds and the
         // proxy is not consulted at all.
         let off = ProxyConfig::parse("off", "").unwrap();
-        let client = off.apply(reqwest::Client::builder()).unwrap().build().unwrap();
+        let client = off
+            .apply(reqwest::Client::builder())
+            .unwrap()
+            .build()
+            .unwrap();
         client.get(&srv.url).send().await.unwrap();
-        assert_eq!(proxy.tunnels_to(&hostport).len(), tunnels, "off must connect directly");
+        assert_eq!(
+            proxy.tunnels_to(&hostport).len(),
+            tunnels,
+            "off must connect directly"
+        );
     }
 }

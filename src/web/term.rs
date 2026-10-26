@@ -259,7 +259,10 @@ impl Terminals {
             return term_err(
                 id,
                 "term_open",
-                &format!("{} terminals are already open; close one first", MAX_TERM_SESSIONS),
+                &format!(
+                    "{} terminals are already open; close one first",
+                    MAX_TERM_SESSIONS
+                ),
             );
         }
         let dir = match self.start_dir(msg) {
@@ -286,7 +289,10 @@ impl Terminals {
         if !id.is_empty() {
             v["id"] = json!(id);
         }
-        self.live.lock().unwrap().insert(session.clone(), pty.clone());
+        self.live
+            .lock()
+            .unwrap()
+            .insert(session.clone(), pty.clone());
         tokio::spawn(copy(pty, conn.clone(), self.clone()));
         v
     }
@@ -345,7 +351,11 @@ impl Terminals {
         let cols = size_field(msg, "cols", DEFAULT_COLS, MIN_COLS, MAX_COLS);
         let rows = size_field(msg, "rows", DEFAULT_ROWS, MIN_ROWS, MAX_ROWS);
         if let Err(e) = pty.set_size(cols, rows) {
-            return term_err(id, "term_resize", &format!("cannot resize the terminal: {e}"));
+            return term_err(
+                id,
+                "term_resize",
+                &format!("cannot resize the terminal: {e}"),
+            );
         }
         let mut v = json!({
             "type": "term_resize", "ok": true, "session": pty.id,
@@ -542,7 +552,11 @@ impl Pty {
 
     /// A second handle on the master, for the copy task.
     fn try_clone_master(&self) -> Option<OwnedFd> {
-        self.master.lock().unwrap().as_ref().and_then(|f| f.try_clone().ok())
+        self.master
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|f| f.try_clone().ok())
     }
 
     /// Types into the shell — on a blocking thread, where it is allowed to wait.
@@ -595,7 +609,9 @@ impl Pty {
     /// Waits for the shell and reports how it ended.
     async fn wait(&self) -> Waited {
         let mut child = self.child.lock().await;
-        let Some(mut c) = child.take() else { return Waited::Unknown };
+        let Some(mut c) = child.take() else {
+            return Waited::Unknown;
+        };
         match tokio::time::timeout(TERM_EXIT_WAIT, c.wait()).await {
             Ok(Ok(status)) => {
                 drop(c);
@@ -677,7 +693,9 @@ async fn copy(pty: Arc<Pty>, conn: Arc<ws::Conn>, terms: Terminals) {
         match ready {
             Err(_elapsed) => continue, // idle shell: loop round and look at the tab
             Ok(Err(e)) => {
-                terms.note(&format!("terminal {session}: the terminal could not be watched: {e}"));
+                terms.note(&format!(
+                    "terminal {session}: the terminal could not be watched: {e}"
+                ));
                 break;
             }
             Ok(Ok(mut guard)) => {
@@ -711,7 +729,11 @@ async fn copy(pty: Arc<Pty>, conn: Arc<ws::Conn>, terms: Terminals) {
     drop(reader);
     pty.close_master();
     terms.live.lock().unwrap().remove(&session);
-    let waited = if pty.gone() { Waited::Unknown } else { pty.wait().await };
+    let waited = if pty.gone() {
+        Waited::Unknown
+    } else {
+        pty.wait().await
+    };
     let code = match waited {
         Waited::Code(c) => Some(c),
         // Still there after the grace period: it was not listening, so it is
@@ -733,9 +755,7 @@ async fn copy(pty: Arc<Pty>, conn: Arc<ws::Conn>, terms: Terminals) {
     // Tell the tab how it ended. A shell that exits by itself (`exit`, a broken
     // `exec`) is otherwise a pane that has stopped answering with nothing on
     // screen to say why.
-    let _ = conn.send(
-        &json!({"type": "term_exit", "session": session, "code": code}).to_string(),
-    );
+    let _ = conn.send(&json!({"type": "term_exit", "session": session, "code": code}).to_string());
     // The last handle to the shell goes when this task ends, and `Pty::drop`
     // makes sure nothing is left running behind it.
     drop(pty);
@@ -761,7 +781,15 @@ fn open_pty() -> R<(OwnedFd, OwnedFd)> {
     ws.ws_row = DEFAULT_ROWS;
     // SAFETY: the three pointers are a valid `winsize` and two `c_int`s; the
     // tty paths are left to the library (the default, which is `/dev/ptmx`).
-    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
     if rc != 0 {
         return Err(AgentError::new(format!(
             "cannot open a terminal: {}",
@@ -946,13 +974,25 @@ mod tests {
         assert_eq!(col(json!({"cols": 99_999})), DEFAULT_COLS);
         assert_eq!(col(json!({"cols": "80"})), DEFAULT_COLS);
         assert_eq!(col(json!({})), DEFAULT_COLS);
-        assert_eq!(size_field(&json!({"rows": 4}), "rows", DEFAULT_ROWS, MIN_ROWS, MAX_ROWS), 4);
+        assert_eq!(
+            size_field(
+                &json!({"rows": 4}),
+                "rows",
+                DEFAULT_ROWS,
+                MIN_ROWS,
+                MAX_ROWS
+            ),
+            4
+        );
     }
 
     #[test]
     fn input_is_base64_and_bounded() {
         // `ls -la` and a CR: what Enter means to a cooked terminal.
-        assert_eq!(decode_input(&json!({"data": "bHMgLWxhDQ=="})).unwrap(), b"ls -la\r");
+        assert_eq!(
+            decode_input(&json!({"data": "bHMgLWxhDQ=="})).unwrap(),
+            b"ls -la\r"
+        );
         assert_eq!(decode_input(&json!({"data": ""})).unwrap(), b"");
         assert!(decode_input(&json!({"data": "not base64 !!"})).is_err());
         assert!(decode_input(&json!({})).is_err(), "no data at all");
@@ -964,7 +1004,10 @@ mod tests {
             &base64::engine::general_purpose::STANDARD,
             vec![b'x'; MAX_TERM_INPUT + 1],
         );
-        assert!(decode_input(&json!({"data": big})).is_err(), "a paste cannot be unbounded");
+        assert!(
+            decode_input(&json!({"data": big})).is_err(),
+            "a paste cannot be unbounded"
+        );
     }
 
     /// Every byte value, including the ones no JSON string can carry, survives
@@ -982,7 +1025,11 @@ mod tests {
         // SAFETY: single-threaded test (no `#[tokio::test]`), and the value is
         // put back before the test ends.
         unsafe { std::env::set_var("SHELL", "/definitely/not/a/shell") };
-        assert_eq!(shell_program(), "/bin/sh", "a $SHELL that is gone is not a terminal");
+        assert_eq!(
+            shell_program(),
+            "/bin/sh",
+            "a $SHELL that is gone is not a terminal"
+        );
         unsafe { std::env::set_var("SHELL", "/bin/sh") };
         assert_eq!(shell_program(), "/bin/sh");
         unsafe {
@@ -997,9 +1044,14 @@ mod tests {
     async fn an_unknown_terminal_message_is_answered_not_hung() {
         let (terms, _log) = terminals(".");
         let (conn, _peer) = test_conn();
-        let reply = terms.handle(&conn, "term_nonsense", &json!({"session": "t1"}), "x1").await;
+        let reply = terms
+            .handle(&conn, "term_nonsense", &json!({"session": "t1"}), "x1")
+            .await;
         assert_eq!(reply["ok"], json!(false));
-        assert!(reply["error"].as_str().unwrap().contains("unknown terminal message"));
+        assert!(reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown terminal message"));
         assert_eq!(reply["id"], json!("x1"));
     }
 
@@ -1008,17 +1060,29 @@ mod tests {
         let (terms, _log) = terminals(".");
         let (conn, _peer) = test_conn();
         let reply = terms
-            .handle(&conn, "term_in", &json!({"session": "nope", "data": "ZWNobyEK"}), "i1")
+            .handle(
+                &conn,
+                "term_in",
+                &json!({"session": "nope", "data": "ZWNobyEK"}),
+                "i1",
+            )
             .await;
         assert_eq!(reply["ok"], json!(false));
         assert_eq!(reply["id"], json!("i1"));
         assert!(reply["error"].as_str().unwrap().contains("gone"));
         let resize = terms
-            .handle(&conn, "term_resize", &json!({"session": "nope", "cols": 80, "rows": 24}), "r1")
+            .handle(
+                &conn,
+                "term_resize",
+                &json!({"session": "nope", "cols": 80, "rows": 24}),
+                "r1",
+            )
             .await;
         assert_eq!(resize["ok"], json!(false));
         // A close of something already gone is not an error.
-        let closed = terms.handle(&conn, "term_close", &json!({"session": "nope"}), "c1").await;
+        let closed = terms
+            .handle(&conn, "term_close", &json!({"session": "nope"}), "c1")
+            .await;
         assert_eq!(closed["ok"], json!(true));
         let list = terms.handle(&conn, "term_list", &json!({}), "l1").await;
         assert_eq!(list["terminals"], json!([]));
@@ -1052,23 +1116,37 @@ mod tests {
         // the only proof that the resize reached the terminal rather than a
         // counter in this process.
         let resized = terms
-            .handle(&conn, "term_resize", &json!({"session": session, "cols": 132, "rows": 43}), "r1")
+            .handle(
+                &conn,
+                "term_resize",
+                &json!({"session": session, "cols": 132, "rows": 43}),
+                "r1",
+            )
             .await;
         assert_eq!(resized["cols"], json!(132));
         type_in(&terms, &conn, &session, b"stty size\r").await;
         let size = read_term_output(&peer, &session, "43 132").await;
-        assert!(size.contains("43 132"), "the shell did not learn its size: {size:?}");
+        assert!(
+            size.contains("43 132"),
+            "the shell did not learn its size: {size:?}"
+        );
 
         // A list names the live shell, so a reload can find out what exists.
         let list = terms.handle(&conn, "term_list", &json!({}), "l1").await;
         assert_eq!(list["terminals"].as_array().unwrap().len(), 1);
         assert_eq!(list["terminals"][0]["session"], json!(session));
 
-        terms.handle(&conn, "term_close", &json!({"session": session}), "c1").await;
+        terms
+            .handle(&conn, "term_close", &json!({"session": session}), "c1")
+            .await;
         wait_until(|| terms.count() == 0, "the shell outlived its tab").await;
         // And the transcript says nothing about a terminal that was closed on
         // purpose: closing a tab is not a failure worth a line in the log.
-        assert!(!transcript(&_log).contains("terminal"), "{:?}", transcript(&_log));
+        assert!(
+            !transcript(&_log).contains("terminal"),
+            "{:?}",
+            transcript(&_log)
+        );
     }
 
     /// A tab that never says goodbye (a browser that goes away, a network that
@@ -1080,7 +1158,13 @@ mod tests {
         let opened = terms.handle(&conn, "term_open", &json!({}), "o1").await;
         assert_eq!(opened["ok"], json!(true), "opened: {}", opened["error"]);
         let pid = opened["pid"].as_u64().unwrap() as libc::pid_t;
-        type_in(&terms, &conn, opened["session"].as_str().unwrap(), b"sleep 30\r").await;
+        type_in(
+            &terms,
+            &conn,
+            opened["session"].as_str().unwrap(),
+            b"sleep 30\r",
+        )
+        .await;
         assert_eq!(terms.count(), 1);
 
         // The socket pair is hung up, which is what a closed tab looks like from
@@ -1112,10 +1196,19 @@ mod tests {
         let exit = exit.expect("no term_exit notice was sent to the tab");
         assert_eq!(exit["session"], json!(session));
         assert_eq!(exit["code"], json!(0), "exit said 0: {exit:?}");
-        wait_until(|| terms.count() == 0, "the exited shell was left in the table").await;
+        wait_until(
+            || terms.count() == 0,
+            "the exited shell was left in the table",
+        )
+        .await;
         // Typing into it afterwards is answered, not swallowed.
         let late = terms
-            .handle(&conn, "term_in", &json!({"session": session, "data": "ZWNobyEK"}), "i2")
+            .handle(
+                &conn,
+                "term_in",
+                &json!({"session": session, "data": "ZWNobyEK"}),
+                "i2",
+            )
             .await;
         assert_eq!(late["ok"], json!(false));
     }
@@ -1134,11 +1227,21 @@ mod tests {
         let over = terms.handle(&conn, "term_open", &json!({}), "over").await;
         assert_eq!(over["ok"], json!(false));
         assert!(over["error"].as_str().unwrap().contains("already open"));
-        assert_eq!(terms.count(), MAX_TERM_SESSIONS, "a refused open still started one");
+        assert_eq!(
+            terms.count(),
+            MAX_TERM_SESSIONS,
+            "a refused open still started one"
+        );
 
         // Freeing one makes room again.
-        terms.handle(&conn, "term_close", &json!({"session": kept[0]}), "c").await;
-        wait_until(|| terms.count() < MAX_TERM_SESSIONS, "the closed shell was not retired").await;
+        terms
+            .handle(&conn, "term_close", &json!({"session": kept[0]}), "c")
+            .await;
+        wait_until(
+            || terms.count() < MAX_TERM_SESSIONS,
+            "the closed shell was not retired",
+        )
+        .await;
         let again = terms.handle(&conn, "term_open", &json!({}), "again").await;
         assert_eq!(again["ok"], json!(true), "opened: {}", again["error"]);
         terms.shutdown();
@@ -1168,9 +1271,15 @@ mod tests {
         let (terms, _log) = terminals(&dir.str());
         let (conn, _peer) = test_conn();
 
-        let ok = terms.handle(&conn, "term_open", &json!({"path": "sub"}), "o1").await;
+        let ok = terms
+            .handle(&conn, "term_open", &json!({"path": "sub"}), "o1")
+            .await;
         assert_eq!(ok["ok"], json!(true), "opened: {}", ok["error"]);
-        assert!(ok["dir"].as_str().unwrap().ends_with("/sub"), "{:?}", ok["dir"]);
+        assert!(
+            ok["dir"].as_str().unwrap().ends_with("/sub"),
+            "{:?}",
+            ok["dir"]
+        );
         let outside = terms
             .handle(&conn, "term_open", &json!({"path": "../outside"}), "o2")
             .await;
@@ -1210,7 +1319,8 @@ mod tests {
         let a = std::net::TcpStream::connect(addr).unwrap();
         let (b, _) = listener.accept().unwrap();
         a.set_nonblocking(true).unwrap();
-        b.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
+        b.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
         let conn = ws::Conn::new(tokio::net::TcpStream::from_std(a).unwrap(), Vec::new());
         (conn, b)
     }
@@ -1218,7 +1328,12 @@ mod tests {
     async fn type_in(terms: &Terminals, conn: &Arc<ws::Conn>, session: &str, bytes: &[u8]) {
         let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
         let reply = terms
-            .handle(conn, "term_in", &json!({"session": session, "data": data}), "i")
+            .handle(
+                conn,
+                "term_in",
+                &json!({"session": session, "data": data}),
+                "i",
+            )
             .await;
         assert_eq!(reply["ok"], json!(true), "typed: {:?}", reply["error"]);
     }
@@ -1253,7 +1368,9 @@ mod tests {
         if frame.len() < 1 + n {
             return None;
         }
-        frame[1..1 + n].eq(session.as_bytes()).then(|| &frame[1 + n..])
+        frame[1..1 + n]
+            .eq(session.as_bytes())
+            .then(|| &frame[1 + n..])
     }
 
     /// Reads what the server sent until a JSON frame of type `kind` arrives —
@@ -1287,7 +1404,10 @@ mod tests {
     /// budget runs out. A quiet socket is a `read` that times out, and that is
     /// *not* the end: the shell decides when it has something to say, so a slow
     /// one is waited for rather than written off.
-    fn each_frame(peer: &mut std::net::TcpStream, mut seen: impl FnMut(Option<&ws::Frame>) -> bool) {
+    fn each_frame(
+        peer: &mut std::net::TcpStream,
+        mut seen: impl FnMut(Option<&ws::Frame>) -> bool,
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             match ws_read_frame(peer) {
@@ -1312,9 +1432,7 @@ mod tests {
     }
 
     /// One frame off the peer, as the browser would read it.
-    fn ws_read_frame(
-        stream: &mut std::net::TcpStream,
-    ) -> io::Result<Option<ws::Frame>> {
+    fn ws_read_frame(stream: &mut std::net::TcpStream) -> io::Result<Option<ws::Frame>> {
         use std::io::Read;
         let mut h = [0u8; 2];
         stream.read_exact(&mut h)?;
@@ -1336,7 +1454,9 @@ mod tests {
         stream.read_exact(&mut body)?;
         match opcode {
             ws::OP_BINARY => Ok(Some(ws::Frame::Binary(body))),
-            ws::OP_TEXT => Ok(Some(ws::Frame::Text(String::from_utf8_lossy(&body).into_owned()))),
+            ws::OP_TEXT => Ok(Some(ws::Frame::Text(
+                String::from_utf8_lossy(&body).into_owned(),
+            ))),
             _ => Ok(Some(ws::Frame::Binary(body))),
         }
     }

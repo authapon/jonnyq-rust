@@ -75,10 +75,18 @@ async fn main() {
     };
 
     let mut reg = tools::Registry::new();
-    reg.register(Arc::new(tools::file::ReadFileTool { work_dir: work_dir.clone() }));
-    reg.register(Arc::new(tools::file::WriteFileTool { work_dir: work_dir.clone() }));
-    reg.register(Arc::new(tools::file::EditFileTool { work_dir: work_dir.clone() }));
-    reg.register(Arc::new(tools::file::CreateFolderTool { work_dir: work_dir.clone() }));
+    reg.register(Arc::new(tools::file::ReadFileTool {
+        work_dir: work_dir.clone(),
+    }));
+    reg.register(Arc::new(tools::file::WriteFileTool {
+        work_dir: work_dir.clone(),
+    }));
+    reg.register(Arc::new(tools::file::EditFileTool {
+        work_dir: work_dir.clone(),
+    }));
+    reg.register(Arc::new(tools::file::CreateFolderTool {
+        work_dir: work_dir.clone(),
+    }));
     reg.register(Arc::new(tools::search::SearxngTool::new(
         &cfg.searxng_url,
         cfg.searxng_max_results,
@@ -89,11 +97,17 @@ async fn main() {
         cfg.fetch_concurrency,
         cfg.fetch_timeout_sec,
     )));
-    reg.register(Arc::new(tools::pdf::PdfTool::new(&work_dir, cfg.pdf_max_pages, cfg.pdf_dpi)));
+    reg.register(Arc::new(tools::pdf::PdfTool::new(
+        &work_dir,
+        cfg.pdf_max_pages,
+        cfg.pdf_dpi,
+    )));
     reg.register(Arc::new(tools::pic::PicTool::new(&work_dir)));
     let run_command = Arc::new(RunCommandTool::new(&work_dir, cfg.run_command_timeout_sec));
     reg.register(run_command.clone());
-    reg.register(Arc::new(tools::skill_tool::SkillTool::new(cfg.skill_paths.clone())));
+    reg.register(Arc::new(tools::skill_tool::SkillTool::new(
+        cfg.skill_paths.clone(),
+    )));
     // Always available, in every configuration - see Registry::install_always.
     // The handle is kept because the web console is bolted onto it further
     // down: a session started with `-web` answers `ask_user` from a popup.
@@ -110,7 +124,9 @@ async fn main() {
         w.clone(),
         cfg.skill_paths.clone(),
     );
-    agent.set_tool_call_mode(jonnyq::agent::ToolCallMode::from_config(&cfg.tool_call_mode));
+    agent.set_tool_call_mode(jonnyq::agent::ToolCallMode::from_config(
+        &cfg.tool_call_mode,
+    ));
     agent.set_output_file(&cfg.output_file);
     agent.configure(&cfg);
     let agent = Arc::new(agent);

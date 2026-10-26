@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 
-use super::{guard::resolve_path, bool_arg, string_arg, CallCtx, Tool};
+use super::{bool_arg, guard::resolve_path, string_arg, CallCtx, Tool};
 use crate::error::{AgentError, R};
 use crate::llm::ToolSpec;
 
@@ -64,7 +64,9 @@ impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Create or overwrite a file inside the working directory with the given content.".into(),
+            description:
+                "Create or overwrite a file inside the working directory with the given content."
+                    .into(),
             parameters: obj(
                 json!({
                     "path": { "type": "string", "description": "File path, relative to the working directory." },
@@ -190,25 +192,49 @@ mod tests {
     #[tokio::test]
     async fn write_read_edit() {
         let work = wd("wre");
-        let ctx = CallCtx { cancel: tokio_util::sync::CancellationToken::new() };
-        let w = WriteFileTool { work_dir: work.clone() };
+        let ctx = CallCtx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let w = WriteFileTool {
+            work_dir: work.clone(),
+        };
         let out = w
-            .call(ctx.clone(), &json(r#"{"path":"a/b.txt","content":"hello"}"#))
+            .call(
+                ctx.clone(),
+                &json(r#"{"path":"a/b.txt","content":"hello"}"#),
+            )
             .await
             .unwrap();
         assert_eq!(out, "wrote 5 bytes to a/b.txt");
 
-        let r = ReadFileTool { work_dir: work.clone() };
-        assert_eq!(r.call(ctx.clone(), &json(r#"{"path":"a/b.txt"}"#)).await.unwrap(), "hello");
+        let r = ReadFileTool {
+            work_dir: work.clone(),
+        };
+        assert_eq!(
+            r.call(ctx.clone(), &json(r#"{"path":"a/b.txt"}"#))
+                .await
+                .unwrap(),
+            "hello"
+        );
 
-        let e = EditFileTool { work_dir: work.clone() };
+        let e = EditFileTool {
+            work_dir: work.clone(),
+        };
         let out = e
-            .call(ctx.clone(), &json(r#"{"path":"a/b.txt","old_string":"hello","new_string":"hi"}"#))
+            .call(
+                ctx.clone(),
+                &json(r#"{"path":"a/b.txt","old_string":"hello","new_string":"hi"}"#),
+            )
             .await
             .unwrap();
         assert_eq!(out, "replaced 1 occurrence(s) in a/b.txt");
 
-        let err = e.call(ctx.clone(), &json(r#"{"path":"a/b.txt","old_string":"zzz","new_string":"x"}"#)).await;
+        let err = e
+            .call(
+                ctx.clone(),
+                &json(r#"{"path":"a/b.txt","old_string":"zzz","new_string":"x"}"#),
+            )
+            .await;
         assert!(err.unwrap_err().message.contains("old_string not found"));
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -216,10 +242,22 @@ mod tests {
     #[tokio::test]
     async fn create_folder_and_traversal_guard() {
         let work = wd("cfd");
-        let ctx = CallCtx { cancel: tokio_util::sync::CancellationToken::new() };
-        let c = CreateFolderTool { work_dir: work.clone() };
-        assert_eq!(c.call(ctx.clone(), &json(r#"{"path":"x/y/z"}"#)).await.unwrap(), "created folder x/y/z");
-        assert!(c.call(ctx.clone(), &json(r#"{"path":"../out"}"#)).await.is_err());
+        let ctx = CallCtx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let c = CreateFolderTool {
+            work_dir: work.clone(),
+        };
+        assert_eq!(
+            c.call(ctx.clone(), &json(r#"{"path":"x/y/z"}"#))
+                .await
+                .unwrap(),
+            "created folder x/y/z"
+        );
+        assert!(c
+            .call(ctx.clone(), &json(r#"{"path":"../out"}"#))
+            .await
+            .is_err());
         let _ = std::fs::remove_dir_all(&work);
     }
 }

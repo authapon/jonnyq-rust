@@ -66,7 +66,11 @@ pub fn parse_prompt_tool_calls(content: &str) -> Vec<ToolCall> {
 }
 
 fn malformed_prompt_tool_call(id: &str, reason: &str) -> ToolCall {
-    ToolCall { id: id.to_string(), name: parse_error_tool_name().to_string(), arguments: reason.to_string() }
+    ToolCall {
+        id: id.to_string(),
+        name: parse_error_tool_name().to_string(),
+        arguments: reason.to_string(),
+    }
 }
 
 /// Appended to the system message in prompt mode, ahead of the tool list,
@@ -96,7 +100,10 @@ pub fn build_prompt_tool_call_section(specs: &[ToolSpec]) -> String {
     }
     let mut sb = String::from(PROMPT_TOOL_CALL_INSTRUCTIONS);
     for s in specs {
-        sb.push_str(&format!("- {}: {}\n  parameters: {}\n", s.name, s.description, s.parameters));
+        sb.push_str(&format!(
+            "- {}: {}\n  parameters: {}\n",
+            s.name, s.description, s.parameters
+        ));
     }
     sb
 }
@@ -117,7 +124,8 @@ mod tests {
 
     #[test]
     fn multiple_blocks_in_order() {
-        let content = "```tool\n{\"name\":\"a\",\"arguments\":{}}\n```\nmid\n```tool\n{\"name\":\"b\"}\n```";
+        let content =
+            "```tool\n{\"name\":\"a\",\"arguments\":{}}\n```\nmid\n```tool\n{\"name\":\"b\"}\n```";
         let calls = parse_prompt_tool_calls(content);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
@@ -138,7 +146,9 @@ mod tests {
         let calls = parse_prompt_tool_calls("```tool\n{\"arguments\": {\"x\": 1}}\n```");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, parse_error_tool_name());
-        assert!(calls[0].arguments.contains("missing the required \"name\" field"));
+        assert!(calls[0]
+            .arguments
+            .contains("missing the required \"name\" field"));
     }
 
     #[test]

@@ -109,8 +109,9 @@ impl Dotenv {
                 DISABLE_VALUES[0]
             )));
         }
-        let text = std::fs::read_to_string(&p)
-            .map_err(|e| AgentError::new(format!("cannot read env file {:?}: {}", p.display(), e)))?;
+        let text = std::fs::read_to_string(&p).map_err(|e| {
+            AgentError::new(format!("cannot read env file {:?}: {}", p.display(), e))
+        })?;
         let mut d = parse(&text, &p.display().to_string())?;
         d.path = p;
         Ok(d)
@@ -177,7 +178,12 @@ struct Scan<'a> {
 
 impl<'a> Scan<'a> {
     fn new(text: &'a str) -> Self {
-        Self { chars: text.chars().collect(), text, i: 0, line: 1 }
+        Self {
+            chars: text.chars().collect(),
+            text,
+            i: 0,
+            line: 1,
+        }
     }
 
     fn eof(&self) -> bool {
@@ -615,7 +621,11 @@ mod tests {
         assert_eq!(d.get("JONNYQ_MODEL"), Some("llama3"));
         assert_eq!(d.get("JONNYQ_CONTEXT_SIZE"), Some("8192"));
         assert_eq!(d.len(), 2);
-        assert!(d.warnings.is_empty(), "unexpected warnings: {:?}", d.warnings);
+        assert!(
+            d.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            d.warnings
+        );
     }
 
     #[test]
@@ -672,7 +682,11 @@ mod tests {
         let d = vars("A=\nB=\"\"\n");
         assert_eq!(d.get("A"), Some(""));
         assert_eq!(d.get("B"), Some(""));
-        assert!(d.warnings.is_empty(), "unexpected warnings: {:?}", d.warnings);
+        assert!(
+            d.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            d.warnings
+        );
     }
 
     #[test]
@@ -710,7 +724,9 @@ mod tests {
         // exports the same name.
         let key = "JONNYQ_DOTENV_SHADOWED_BASE";
         unsafe { std::env::set_var(key, "/from/env") };
-        let d = vars(&format!("{key}=/from/file\nPATH2=${{{key}}}/sub\nPATH3=${key}/sub\n"));
+        let d = vars(&format!(
+            "{key}=/from/file\nPATH2=${{{key}}}/sub\nPATH3=${key}/sub\n"
+        ));
         unsafe { std::env::remove_var(key) };
         assert_eq!(d.get("PATH2"), Some("/from/file/sub"));
         assert_eq!(d.get("PATH3"), Some("/from/file/sub"));
@@ -740,9 +756,17 @@ mod tests {
     #[test]
     fn unterminated_quote_is_an_error() {
         let e = parse("A=\"never closed\nB=x\n", "t.env").unwrap_err();
-        assert!(e.message.contains("unterminated double-quoted value"), "{}", e.message);
+        assert!(
+            e.message.contains("unterminated double-quoted value"),
+            "{}",
+            e.message
+        );
         let e = parse("A='never closed\n", "t.env").unwrap_err();
-        assert!(e.message.contains("unterminated single-quoted value"), "{}", e.message);
+        assert!(
+            e.message.contains("unterminated single-quoted value"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
@@ -799,7 +823,10 @@ mod tests {
         if std::env::var("HOME").is_err() {
             return;
         }
-        assert_eq!(expand_tilde("~/x.env"), format!("{}/x.env", std::env::var("HOME").unwrap()));
+        assert_eq!(
+            expand_tilde("~/x.env"),
+            format!("{}/x.env", std::env::var("HOME").unwrap())
+        );
         assert_eq!(expand_tilde("~"), std::env::var("HOME").unwrap());
         assert_eq!(expand_tilde("./x.env"), "./x.env");
     }

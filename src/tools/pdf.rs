@@ -62,7 +62,11 @@ impl Tool for PdfTool {
         };
         let full = resolve_path(&self.work_dir, p)?;
 
-        let max_pages = if self.max_pages() <= 0 { 50 } else { self.max_pages() };
+        let max_pages = if self.max_pages() <= 0 {
+            50
+        } else {
+            self.max_pages()
+        };
 
         if which("pdftotext").is_none() {
             return Err(AgentError::new(
@@ -161,9 +165,15 @@ async fn run_capture(ctx: &CallCtx, name: &str, args: &[String]) -> R<(Vec<u8>, 
                 stderr
             )));
         }
-        return Err(AgentError::new(format!("exit status {}", out.status.code().unwrap_or(-1))));
+        return Err(AgentError::new(format!(
+            "exit status {}",
+            out.status.code().unwrap_or(-1)
+        )));
     }
-    Ok((out.stdout, String::from_utf8_lossy(&out.stderr).into_owned()))
+    Ok((
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {

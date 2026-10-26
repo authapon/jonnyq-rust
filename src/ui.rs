@@ -187,7 +187,14 @@ impl std::fmt::Display for RequestStats {
                 "n/a".to_string()
             },
         );
-        write!(f, "{} in/{} out, {} tok/s, {}", in_s, out_s, tps, format_elapsed(self.duration))
+        write!(
+            f,
+            "{} in/{} out, {} tok/s, {}",
+            in_s,
+            out_s,
+            tps,
+            format_elapsed(self.duration)
+        )
     }
 }
 
@@ -224,7 +231,11 @@ impl UiState {
     /// specs + history is estimated.
     pub fn context_status(&self) -> ContextStatus {
         let est = self.sys_tokens + self.spec_tokens + self.history_tokens;
-        let mut cs = ContextStatus { used: 0, total: self.context_total, estimated: true };
+        let mut cs = ContextStatus {
+            used: 0,
+            total: self.context_total,
+            estimated: true,
+        };
         if self.real_prompt_tokens > 0 {
             let delta = (est - self.real_base_tokens).max(0);
             cs.used = self.real_prompt_tokens + delta;
@@ -370,13 +381,21 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(output_file: &str) -> std::io::Result<Self> {
-        let f = std::fs::OpenOptions::new().append(true).create(true).open(output_file)?;
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(output_file)?;
         Ok(Self {
             log: Mutex::new(f),
             log_path: Mutex::new(output_file.to_string()),
             color_out: std::io::stdout().is_terminal(),
-            inner: Mutex::new(WriterInner { current: Section::None, at_line_start: true }),
-            state: RwLock::new(UiState { ..Default::default() }),
+            inner: Mutex::new(WriterInner {
+                current: Section::None,
+                at_line_start: true,
+            }),
+            state: RwLock::new(UiState {
+                ..Default::default()
+            }),
             closed: AtomicBool::new(false),
             sinks: Mutex::new(Vec::new()),
         })
@@ -427,7 +446,10 @@ impl Writer {
     /// Returns an error - and keeps writing to the old file - if the new one
     /// cannot be opened.
     pub fn set_output_file(&self, path: &str) -> std::io::Result<()> {
-        let f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
         *self.log.lock().unwrap() = f;
         *self.log_path.lock().unwrap() = path.to_string();
         Ok(())
@@ -492,7 +514,11 @@ impl Writer {
         }
         self.plain("\n");
 
-        let stamped = format!("{} ({})", label, chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        let stamped = format!(
+            "{} ({})",
+            label,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
 
         let mut ctx_text = String::new();
         let mut ctx_color = COLOR_GRAY;
@@ -568,7 +594,11 @@ impl Writer {
     /// switches the attributes off again once the line has been read.
     pub fn colored_keep(&self, text: &str, color: &str, bold: bool) {
         if self.color_out {
-            self.out(styled(text, color, bold).strip_suffix(COLOR_RESET).unwrap_or(text));
+            self.out(
+                styled(text, color, bold)
+                    .strip_suffix(COLOR_RESET)
+                    .unwrap_or(text),
+            );
         } else {
             self.out(text);
         }
@@ -743,11 +773,23 @@ mod tests {
 
     #[test]
     fn context_status_formatting_and_colors() {
-        let cs = ContextStatus { used: 1234567, total: 2000000, estimated: false };
+        let cs = ContextStatus {
+            used: 1234567,
+            total: 2000000,
+            estimated: false,
+        };
         assert_eq!(cs.to_string(), "ctx 1,234,567/2,000,000 (61%) left 765,433");
-        let est = ContextStatus { used: 10, total: 100, estimated: true };
+        let est = ContextStatus {
+            used: 10,
+            total: 100,
+            estimated: true,
+        };
         assert_eq!(est.to_string(), "ctx ~10/100 (~10%) left ~90");
-        let over = ContextStatus { used: 150, total: 100, estimated: false };
+        let over = ContextStatus {
+            used: 150,
+            total: 100,
+            estimated: false,
+        };
         assert_eq!(over.left(), 0);
         for (used, want) in [
             (10, COLOR_GRAY),
@@ -757,7 +799,11 @@ mod tests {
             (85, COLOR_RED),
             (150, COLOR_RED),
         ] {
-            let cs = ContextStatus { used, total: 100, estimated: false };
+            let cs = ContextStatus {
+                used,
+                total: 100,
+                estimated: false,
+            };
             assert_eq!(cs.color(), want, "used={}", used);
         }
     }

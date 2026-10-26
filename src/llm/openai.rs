@@ -32,7 +32,12 @@ struct StreamTimer {
 
 impl StreamTimer {
     fn new() -> Self {
-        Self { start: Instant::now(), first: None, last: None, chars: 0 }
+        Self {
+            start: Instant::now(),
+            first: None,
+            last: None,
+            chars: 0,
+        }
     }
 
     /// Records a streamed delta carrying `n` characters of output.
@@ -80,7 +85,10 @@ fn trim_base(url: &str) -> String {
 
 impl OpenAiProvider {
     pub fn new(base_url: &str, key: &str) -> Self {
-        Self { base_url: trim_base(base_url), key: key.to_string() }
+        Self {
+            base_url: trim_base(base_url),
+            key: key.to_string(),
+        }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -103,7 +111,11 @@ fn to_openai_messages(msgs: &[Message]) -> Vec<Value> {
                 .tool_calls
                 .iter()
                 .map(|tc| {
-                    let args = if tc.arguments.trim().is_empty() { "{}" } else { &tc.arguments };
+                    let args = if tc.arguments.trim().is_empty() {
+                        "{}"
+                    } else {
+                        &tc.arguments
+                    };
                     json!({
                         "id": tc.id,
                         "type": "function",
@@ -324,7 +336,9 @@ impl Provider for OpenAiProvider {
                     }
                     if payload == "[DONE]" {
                         flush_tool_calls!();
-                        let _ = tx.send(ChatEvent::Done { usage: timer.apply(usage) });
+                        let _ = tx.send(ChatEvent::Done {
+                            usage: timer.apply(usage),
+                        });
                         // Returning here is what prevents the tail of the
                         // loop below from emitting a second Done.
                         return;
@@ -332,7 +346,9 @@ impl Provider for OpenAiProvider {
                     let parsed: OaChunk = match serde_json::from_str(payload) {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = tx.send(ChatEvent::Error { error: AgentError::new(e.to_string()) });
+                            let _ = tx.send(ChatEvent::Error {
+                                error: AgentError::new(e.to_string()),
+                            });
                             return;
                         }
                     };
@@ -342,17 +358,22 @@ impl Provider for OpenAiProvider {
                         usage.total_tokens = u.total_tokens;
                     }
                     for choice in parsed.choices {
-                        let mut n =
-                            choice.delta.reasoning_content.chars().count() + choice.delta.content.chars().count();
+                        let mut n = choice.delta.reasoning_content.chars().count()
+                            + choice.delta.content.chars().count();
                         for tc in &choice.delta.tool_calls {
-                            n += tc.function.name.chars().count() + tc.function.arguments.chars().count();
+                            n += tc.function.name.chars().count()
+                                + tc.function.arguments.chars().count();
                         }
                         timer.mark(n);
                         if !choice.delta.reasoning_content.is_empty() {
-                            let _ = tx.send(ChatEvent::Thinking { delta: choice.delta.reasoning_content.clone() });
+                            let _ = tx.send(ChatEvent::Thinking {
+                                delta: choice.delta.reasoning_content.clone(),
+                            });
                         }
                         if !choice.delta.content.is_empty() {
-                            let _ = tx.send(ChatEvent::Content { delta: choice.delta.content.clone() });
+                            let _ = tx.send(ChatEvent::Content {
+                                delta: choice.delta.content.clone(),
+                            });
                         }
                         for tc in choice.delta.tool_calls {
                             let b = builders.entry(tc.index).or_default();
@@ -378,15 +399,20 @@ impl Provider for OpenAiProvider {
             // the stream with a Done so the caller sees a completion instead
             // of a truncated reply.
             flush_tool_calls!();
-            let _ = tx.send(ChatEvent::Done { usage: timer.apply(usage) });
+            let _ = tx.send(ChatEvent::Done {
+                usage: timer.apply(usage),
+            });
         });
 
         Ok((rx, cancel))
     }
 
     async fn list_models(&self, ctx: CancellationToken) -> Result<Vec<String>, AgentError> {
-        let resp = super::types::until_cancelled(&ctx, self.request(reqwest::Method::GET, "/models").send())
-            .await??;
+        let resp = super::types::until_cancelled(
+            &ctx,
+            self.request(reqwest::Method::GET, "/models").send(),
+        )
+        .await??;
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
             let text = resp.text().await.unwrap_or_default();
@@ -416,7 +442,10 @@ mod tests {
     #[tokio::test]
     async fn max_tokens_is_sent_when_requested() {
         let srv = TestServer::with_handler(|_r| StubResponse::sse("data: [DONE]\n\n")).await;
-        let req = ChatRequest { max_output_tokens: Some(512), ..user("summarize") };
+        let req = ChatRequest {
+            max_output_tokens: Some(512),
+            ..user("summarize")
+        };
         collect(&OpenAiProvider::new(&srv.url, ""), req).await;
         let body = srv.last_request().body_json();
         assert_eq!(body["max_tokens"], 512, "body: {body}");
@@ -433,7 +462,9 @@ mod tests {
         while let Some(ev) = rx.recv().await {
             let done = matches!(ev, ChatEvent::Done { .. } | ChatEvent::Error { .. });
             out.push(ev);
-            if done { break; }
+            if done {
+                break;
+            }
         }
         out
     }
@@ -441,7 +472,11 @@ mod tests {
     fn user(msg: &str) -> ChatRequest {
         ChatRequest {
             model: "test".into(),
-            messages: vec![Message { role: Role::User, content: msg.into(), ..Default::default() }],
+            messages: vec![Message {
+                role: Role::User,
+                content: msg.into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -457,17 +492,23 @@ mod tests {
     }
 
     fn content_of(events: &[ChatEvent]) -> String {
-        events.iter().filter_map(|e| match e {
-            ChatEvent::Content { delta } => Some(delta.as_str()),
-            _ => None,
-        }).collect()
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Content { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn usage_of(events: &[ChatEvent]) -> Usage {
-        events.iter().find_map(|e| match e {
-            ChatEvent::Done { usage } => Some(*usage),
-            _ => None,
-        }).expect("done event")
+        events
+            .iter()
+            .find_map(|e| match e {
+                ChatEvent::Done { usage } => Some(*usage),
+                _ => None,
+            })
+            .expect("done event")
     }
 
     #[tokio::test]
@@ -482,9 +523,11 @@ mod tests {
         let u = usage_of(&ev);
         assert!(u.has_timing && u.estimated, "client-measured: {u:?}");
         assert!(!u.completion_estimated, "usage block supplied real tokens");
-        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (10, 3, 13));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (10, 3, 13)
+        );
     }
-
 
     use serde_json::{json, Value};
 
@@ -515,7 +558,9 @@ mod tests {
         let ev = collect(&OpenAiProvider::new(&srv.url, ""), user("read a.txt")).await;
         let mut calls = Vec::new();
         for e in &ev {
-            if let ChatEvent::ToolCalls { tool_calls } = e { calls.extend(tool_calls.clone()); }
+            if let ChatEvent::ToolCalls { tool_calls } = e {
+                calls.extend(tool_calls.clone());
+            }
         }
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
@@ -531,7 +576,11 @@ mod tests {
         let r = ChatRequest {
             model: "test".into(),
             messages: vec![
-                Message { role: Role::User, content: "run cargo build".into(), ..Default::default() },
+                Message {
+                    role: Role::User,
+                    content: "run cargo build".into(),
+                    ..Default::default()
+                },
                 Message {
                     role: Role::Assistant,
                     content: String::new(),
@@ -571,20 +620,34 @@ mod tests {
     async fn measures_timing_client_side() {
         let ms = |v: u64| std::time::Duration::from_millis(v);
         let p1 = json!({"choices":[{"delta":{"content":"Hello"}}]}).to_string();
-        let p2 = json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}).to_string();
+        let p2 =
+            json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}).to_string();
         let pieces = vec![
-            (piece(&p1), ms(60)),   // "prompt processing" before the first token
-            (piece(&p2), ms(80)),   // "generation"
+            (piece(&p1), ms(60)), // "prompt processing" before the first token
+            (piece(&p2), ms(80)), // "generation"
             (piece("[DONE]"), ms(0)),
         ];
         let srv =
             TestServer::with_handler(move |_r| StubResponse::sse_staged(pieces.clone())).await;
         let ev = collect(&OpenAiProvider::new(&srv.url, ""), user("hi")).await;
         let u = usage_of(&ev);
-        assert!(u.has_timing && u.estimated, "expected estimated timing: {u:?}");
-        assert!(u.prompt_eval_duration >= std::time::Duration::from_millis(50), "ttft too small");
-        assert!(u.eval_duration >= std::time::Duration::from_millis(70), "gen time too small");
-        assert_eq!(u.load_duration, std::time::Duration::ZERO, "not measurable client-side");
+        assert!(
+            u.has_timing && u.estimated,
+            "expected estimated timing: {u:?}"
+        );
+        assert!(
+            u.prompt_eval_duration >= std::time::Duration::from_millis(50),
+            "ttft too small"
+        );
+        assert!(
+            u.eval_duration >= std::time::Duration::from_millis(70),
+            "gen time too small"
+        );
+        assert_eq!(
+            u.load_duration,
+            std::time::Duration::ZERO,
+            "not measurable client-side"
+        );
         // No usage block was sent: tokens come from the 11 streamed chars.
         assert!(u.completion_estimated, "{u:?}");
         assert_eq!(u.completion_tokens, 3);
@@ -597,6 +660,10 @@ mod tests {
             .chat(CancellationToken::new(), &user("hi"))
             .await
             .unwrap_err();
-        assert!(err.message.contains("unexpected status 401"), "got: {}", err.message);
+        assert!(
+            err.message.contains("unexpected status 401"),
+            "got: {}",
+            err.message
+        );
     }
 }

@@ -18,7 +18,9 @@ pub struct SkillTool {
 
 impl SkillTool {
     pub fn new(paths: Vec<String>) -> Self {
-        Self { paths: std::sync::RwLock::new(paths) }
+        Self {
+            paths: std::sync::RwLock::new(paths),
+        }
     }
 
     pub fn set_paths(&self, paths: Vec<String>) {
@@ -39,7 +41,9 @@ impl Tool for SkillTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_skill".into(),
-            description: "Read the full content of a skill by name (see the skill list provided each turn).".into(),
+            description:
+                "Read the full content of a skill by name (see the skill list provided each turn)."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "name": { "type": "string", "description": "Skill name, as listed." } },
