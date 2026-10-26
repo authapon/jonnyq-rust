@@ -336,11 +336,11 @@ lined up either way.
 | **top bar** | `model · ctx … · mode` for the session, updated as the turn runs, plus the **text** and **code** font and size controls described below |
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
-| **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files |
+| **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files. The head of each has a **Download** that saves that file to your computer |
 | **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **Stop button** (next to Send) | The browser's Ctrl-C: it cancels the turn in flight and is enabled only while there is one. It presses the same cancellation as Ctrl-C at the terminal, so the model's stream is dropped, a running command's process group is killed and a pending `ask_user` question is withdrawn — and the session survives to take the next prompt, with `[cancelled]` in the transcript. The popup carries its own copy, since a question covers the prompt box |
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
-| **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown |
+| **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown — and offers it as a download |
 
 **Font and size.** The top bar has two pairs of controls, because the page draws
 two kinds of text. `text` picks the face of the console, the prompt box and the bar
@@ -410,6 +410,20 @@ file is being searched rather than read, and building a span per token would
 freeze the tab for a second to no purpose. The header of every file tab says
 which language it was read as, so an unhighlighted file never leaves you
 wondering whether the feature is broken.
+
+**A file can be saved.** The head of every file tab has a **Download** button,
+and so does the popup that says a file cannot be viewed — a PDF you cannot read
+in the pane is usually one you still want. Both hand the browser a link to
+`GET /file?path=…`, which answers with the file's own bytes offered as an
+attachment, so the browser's own save box does the rest: no copy-and-paste, no
+reformatting, and the console tab stays where it was instead of navigating to
+the file. A download is deliberately *not* the rules the file view goes through
+— no text check, because the PDF, image and archive the view refuses are most of
+what you would want to keep, and no 2 MB cap, because a truncated archive is a
+corrupt one; the bytes are streamed, so a large file costs a chunk of memory
+rather than its own size. What is held to is the same rule the tree is: the name
+must stay inside the working directory, and only a page served to loopback can
+ask at all.
 
 **Terminal tabs.** The **Terminal** button under the prompt box opens a shell in
 the browser, in the session's working directory — a real PTY with a real
@@ -509,11 +523,15 @@ The listener binds to `127.0.0.1` and answers only requests whose `Host` (and
 and nothing else. `GET /health` reports the session as JSON, including `asks` —
 how many `ask_user` questions are unanswered, i.e. that jonnyq is waiting for a
 human rather than working — and `busy`, whether a turn is in flight and so
-whether there is anything for a `stop` message to cancel. It is *not* a
+whether there is anything for a `stop` message to cancel. `GET /file?path=…`,
+which is what the **Download** buttons hit, keeps the same rule plus the tree's:
+the name must resolve inside the working directory, and a browser that says it
+is being sent from another site (`Sec-Fetch-Site: cross-site`) is refused, so a
+stranger's page cannot drop a file into your Downloads folder. It is *not* a
 boundary against something already running as you: any browser tab can read the
 working directory. Changing the model, provider, proxy or ntfy topic stays under
-the keyboard — the page's controls cover typeface, text size and stopping a turn,
-nothing else.
+the keyboard — the page's controls cover typeface, text size, saving a file the
+tree already listed and stopping a turn, nothing else.
 
 ## Notifications (ntfy)
 

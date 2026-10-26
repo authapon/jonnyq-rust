@@ -22,9 +22,12 @@
 //! * centre: a tab strip (always a `console` tab, plus one per opened file)
 //!   over the panel for the selected tab — the console is an ANSI-rendered
 //!   transcript with the prompt textarea under it; a file tab is its text,
-//!   syntax-highlighted by the scanner near `openFile` in the same palette
+//!   syntax-highlighted by the scanner near `openFile` in the same palette, with
+//!   a **Download** in its head that saves the file itself
 //! * right: the working directory as a lazily expanded tree; clicking a file
-//!   opens it in a new tab, clicking a non-text file pops up a refusal
+//!   opens it in a new tab, clicking a non-text file pops up a refusal — which
+//!   offers the file as a download, since a PDF you cannot read is often one you
+//!   still want
 //!
 //! The prompt textarea is disabled unless the session says it is ready for a
 //! prompt, and is resizable (`resize: vertical` plus a draggable splitter).
@@ -185,9 +188,23 @@ body {
   font-size: var(--mono-size);
 }
 .file-head {
-  flex: 0 0 auto; padding: 4px 12px; background: var(--bg0);
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 4px 12px; background: var(--bg0);
   border-bottom: 1px solid var(--bg2); color: var(--fg4); font-size: 12px;
 }
+/* The path, the size and the language on the left; the button pushed to the
+   right by the spacer, so the header reads like the terminal head it sits
+   beside rather than as a sentence with a control glued to it. */
+.file-head .file-info { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-head .spacer { flex: 1 1 auto; }
+.file-head .dl, #popup-dl {
+  background: var(--bg1); color: var(--fg1); border: 1px solid var(--bg2);
+  border-radius: 4px; padding: 2px 8px; font: inherit; cursor: pointer; flex: 0 0 auto;
+}
+.file-head .dl:hover, #popup-dl:hover { border-color: var(--accent); color: var(--accent); }
+/* A download with nothing to download it of: the popup is shared with every
+   other notice, so the button hides rather than lies. */
+.hide { display: none !important; }
 /* --- syntax colours, one class per role, in the same gruvbox dark palette the
        console's SGR classes are drawn from (gruvbox's own role mapping: comment
        gray, statement red, type yellow, string green, constant purple,
@@ -414,6 +431,10 @@ body {
   border-radius: 4px; padding: 4px 16px; font: inherit; cursor: pointer;
 }
 #popup .ok:hover { border-color: var(--accent); color: var(--accent); }
+/* The two buttons share the row so a Download sits beside OK rather than
+   stacking a second line under it, and stays right-aligned like the rest of the
+   page's button rows. */
+#popup-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 
 /* --- the ask_user popup: the browser's answer field ---
    The question the model is blocked on, the text to answer it with, and a
@@ -499,7 +520,11 @@ body {
   </div>
 </div>
 <div id="mask"><div id="popup">
-  <h3 id="popup-title"></h3><pre id="popup-body"></pre><button class="ok" id="popup-ok">OK</button>
+  <h3 id="popup-title"></h3><pre id="popup-body"></pre>
+  <div id="popup-row">
+    <button class="ok hide" id="popup-dl" title="save this file">Download</button>
+    <button class="ok" id="popup-ok">OK</button>
+  </div>
 </div></div>
 <div id="ask-mask"><div id="ask" role="dialog" aria-modal="true" aria-labelledby="ask-title">
   <h3 id="ask-title">Question from the model</h3>
@@ -717,12 +742,22 @@ const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">":
    either way, not like "Error: ..." or "[object Object]". */
 const why = (e) => (e && e.message ? e.message : String(e));
 
-function popup(title, body) {
+/* The notice box: what it says, and — when the notice is about a file the pane
+   cannot draw — the file it is about. `path` is optional; only the "cannot be
+   viewed" answer passes one, and every other notice (a failed prompt, a stopped
+   turn, a refused folder) gets the box with the Download button hidden, because
+   a button that downloads nothing is a button that lies. */
+let popupPath = "";
+
+function popup(title, body, path) {
   $("popup-title").textContent = title;
   $("popup-body").textContent = body;
+  popupPath = path || "";
+  $("popup-dl").classList.toggle("hide", !popupPath);
   $("mask").classList.add("show");
 }
 $("popup-ok").onclick = () => $("mask").classList.remove("show");
+$("popup-dl").onclick = () => downloadFile(popupPath);
 $("mask").onclick = (e) => { if (e.target === $("mask")) $("mask").classList.remove("show"); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("mask").classList.remove("show"); });
 
@@ -2388,7 +2423,10 @@ function makeTab(name, kind, path) {
     /* A file view keeps its own monospaced face (source is read by its
        columns) and takes only the chosen size — the CSS on .file-out says so,
        so nothing here has to know about the picker. */
-    panel.innerHTML = '<div class="file-head"></div><pre class="file-out"></pre>';
+    panel.innerHTML =
+      '<div class="file-head"><span class="file-info"></span><span class="spacer"></span>' +
+      '<button class="dl" title="save a copy of this file to your computer">Download</button></div>' +
+      '<pre class="file-out"></pre>';
   }
   $("tabs").appendChild(tab);
   $("panels").appendChild(panel);
@@ -2400,10 +2438,16 @@ function makeTab(name, kind, path) {
   });
   if (kind === "console") wireConsole(panel);
   else if (kind === "term") wireTerm(t);
-  else t.el.querySelector(".file-out").addEventListener("wheel", (e) => {
-    /* horizontal scroll with shift, like the terminal panes people expect */
-    if (e.shiftKey) { t.el.querySelector(".file-out").scrollLeft += e.deltaY; e.preventDefault(); }
-  });
+  else {
+    /* The file view's two controls: shift-wheel scrolls sideways through long
+       lines, like the terminal panes people expect, and Download hands the file
+       itself to the browser — which is the only way to get at a file the pane
+       cannot draw, and a quicker way to keep a copy than select-and-copy. */
+    t.el.querySelector(".file-out").addEventListener("wheel", (e) => {
+      if (e.shiftKey) { t.el.querySelector(".file-out").scrollLeft += e.deltaY; e.preventDefault(); }
+    });
+    t.el.querySelector(".dl").addEventListener("click", () => downloadFile(t.path));
+  }
   return t;
 }
 
@@ -3576,18 +3620,42 @@ function hlPaint(t, name, content) {
   return lang;
 }
 
+/* The one route that hands out a file's own bytes (see the server's
+   `serve_download`). `downloadFile` is the only caller, and the browser does
+   the rest: this is a plain navigation to an `attachment`, so no fetch, no blob
+   and no cap on what can be saved. */
+const downloadUrl = (path) => "/file?path=" + encodeURIComponent(path);
+
+/* Save a copy. An `<a download>` click rather than a `window.open`, because the
+   point is that nothing opens: a tab that navigated away from the console to
+   show a PDF would have thrown away the session you were reading. */
+function downloadFile(path) {
+  if (!path) return;
+  const a = document.createElement("a");
+  a.href = downloadUrl(path);
+  a.download = path.slice(path.lastIndexOf("/") + 1);
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 /* Opening a file: one request; the server decides whether it is text. A
-   binary/image/PDF answer comes back as an error and is shown in the popup,
-   which is what the feature asks for ("cannot be viewed"). */
+   binary/image/PDF answer comes back as an error, which is the one case with
+   nothing to show — so the popup says why and offers the file as a download
+   instead, since "cannot be viewed" is not a reason you cannot want it. */
 async function openFile(path, name) {
   let res;
   try { res = await rpc({ type: "file", path }); }
   catch (e) { popup("Cannot open file", why(e)); return; }
-  if (!res.ok) { popup("This file cannot be viewed", (res.error || "not a text file") + "\n\n" + path); return; }
+  if (!res.ok) {
+    popup("This file cannot be viewed", (res.error || "not a text file") + "\n\n" + path, path);
+    return;
+  }
   let t = tabs.find((x) => x.kind === "file" && x.path === path);
   if (t) { select(t.id); return; }
   t = makeTab(name, "file", path);
-  const head = t.el.querySelector(".file-head");
+  const head = t.el.querySelector(".file-info");
   const content = res.content || "";
   /* Colour it first, then label it: the header says which language it was read
      as, so "no colours here" is never a mystery. */
@@ -5301,6 +5369,87 @@ mod tests {
         assert!(
             paint.contains("content.length > HL_MAX"),
             "and a file too big to be worth colouring is capped rather than frozen: {paint}"
+        );
+    }
+
+    /// A file tab offers a **Download**, and so does the popup that says a file
+    /// cannot be viewed — the two places a reader finds a file they may want a
+    /// copy of. Pinned on the page side (the button exists, is wired, points at
+    /// the route and carries the tab's own path); the route answering with the
+    /// file's bytes is the server's own tests.
+    #[test]
+    fn a_file_can_be_saved_from_the_page_that_shows_it() {
+        for needle in [
+            "class=\"dl\"",    /* the button in a file tab's head */
+            "id=\"popup-dl\"", /* and the one in the notice box     */
+            "Download",        /* spelled out for the reader        */
+            "downloadFile",    /* what a press does                 */
+            "/file?path=",     /* the route that hands out the file */
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+
+        /* One anchor to the route, its path percent-encoded so a name with a
+        slash, a space or a Thai word in it survives being a URL. */
+        let url = INDEX_HTML
+            .split("const downloadUrl = ")
+            .nth(1)
+            .and_then(|s| s.split("\n").next())
+            .expect("downloadUrl");
+        assert!(
+            url.contains("encodeURIComponent(path)"),
+            "the path must be encoded: {url}"
+        );
+        let dl = INDEX_HTML
+            .split("function downloadFile(path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("downloadFile");
+        assert!(dl.contains("createElement(\"a\")"), "a link, {dl}");
+        assert!(
+            dl.contains("a.download ="),
+            "so the browser saves it instead of navigating the console away: {dl}"
+        );
+        assert!(
+            !dl.contains("window.open") && !dl.contains("location.href"),
+            "nothing may open a window or move this tab off the console: {dl}"
+        );
+        assert!(
+            dl.contains("if (!path) return"),
+            "and it does nothing to nothing: {dl}"
+        );
+
+        /* The button is wired where the tab is built, from the tab's own path —
+        so several file tabs each save the file they show. */
+        let wire = INDEX_HTML
+            .split("if (kind === \"console\") wireConsole(panel);")
+            .nth(1)
+            .and_then(|s| s.split("\n  return t;").next())
+            .expect("the wiring of a new tab");
+        assert!(
+            wire.contains(".dl") && wire.contains("downloadFile(t.path)"),
+            "a file tab's own button, its own file: {wire}"
+        );
+
+        /* The notice box is shared by everything on the page that can go wrong,
+        so the button hides unless the notice named a file: a Download with
+        nothing to download is a button that lies. */
+        let box_ = INDEX_HTML
+            .split("function popup(title, body, path)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("popup");
+        assert!(
+            box_.contains("classList.toggle(\"hide\", !popupPath)"),
+            "the button shows only for a notice that is about a file: {box_}"
+        );
+        assert!(
+            INDEX_HTML.contains("popupPath = path || \"\";"),
+            "and a notice that passed no path clears the last one's"
+        );
+        assert!(
+            INDEX_HTML.contains("popup(\"This file cannot be viewed\", (res.error || \"not a text file\") + \"\\n\\n\" + path, path)"),
+            "the refusal of a file passes the file, so it can be had as a download"
         );
     }
 

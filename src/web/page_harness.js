@@ -31,7 +31,7 @@
    from the built page and runs it through this file. */
 
 /* ---- the smallest DOM that lets the page's script boot ------------------- */
-const seen = { sent: [], selected: [], focus: [] };
+const seen = { sent: [], selected: [], focus: [], clicks: [] };
 let selection = "";
 
 function node(name, cls, id) {
@@ -75,7 +75,13 @@ function node(name, cls, id) {
       if (i >= 0) p.children.splice(i, 1);
       this.parentNode = null;
     },
-    querySelector(sel) { return this.querySelectorImpl ? this.querySelectorImpl(sel) : node("div"); },
+    /* A real click: it fires this node's own listeners and is recorded, so a
+       test can say what the page pressed rather than that it did not throw. */
+    click() {
+      seen.clicks.push(this);
+      for (const fn of this.listeners.click || []) fn({ target: this, preventDefault() {} });
+    },
+    querySelector(sel) { return this.querySelectorImpl ? this.querySelectorImpl(sel) : (this._q = this._q || {}, this._q[sel] || (this._q[sel] = node("div"))); },
     querySelectorAll() { return []; },
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
@@ -131,6 +137,10 @@ globalThis.document = {
   documentElement: { style: { setProperty() {} } },
   getElementById: getEl,
   createElement: (name) => node(name),
+  /* A body to append a download anchor to, and one that keeps what was put on
+     it: an `<a download>` exists for the length of a click, so recording it is
+     the only way a test can read the href and the file name off it. */
+  body: node("body"),
   querySelectorAll: () => [],
   addEventListener: () => {},
 };
@@ -734,6 +744,68 @@ function filePanel() {
   hlRender(many, HL_LANG.rust);
   ok(Date.now() - t0 < 3000, "highlighting " + many.length + " characters took " +
      (Date.now() - t0) + "ms");
+}
+
+/* ---- 4. taking a file out of the browser ---------------------------------
+   A file tab's Download button and the popup's: the page's only job here is to
+   hand the browser a link to the file's own bytes, under the file's own name,
+   without navigating the console away. The server's half (that `/file` really
+   answers with the file) is checked in Rust. */
+{
+  /* The URL names the file with the path percent-encoded: a name with a slash
+     in it (a file in a folder) has to survive as data, not as a delimiter. */
+  eq(downloadUrl("src/main.rs"), "/file?path=src%2Fmain.rs", "the path is encoded");
+  eq(downloadUrl("a b#c.txt"), "/file?path=a%20b%23c.txt", "spaces and hashes too");
+  eq(decodeURIComponent(downloadUrl("หมายเหตุ.md").split("path=")[1]), "หมายเหตุ.md",
+     "a Thai name arrives back as the name it started as");
+}
+{
+  /* Pressing it clicks a link rather than opening one: a tab that navigated to
+     show a PDF would have thrown away the console you were reading. */
+  seen.clicks.length = 0;
+  downloadFile("src/main.rs");
+  const a = seen.clicks.pop();
+  ok(!!a, "a download clicks something");
+  eq(a.nodeName, "A", "and that thing is a link");
+  eq(a.href, "/file?path=src%2Fmain.rs", "pointed at the file");
+  eq(a.download, "main.rs", "and named for the file, so the save box is pre-filled");
+  downloadFile("");
+  eq(seen.clicks.length, 0, "nothing to download means no click at all");
+}
+{
+  /* The button belongs to the tab that has the file, so several open at once
+     each save their own. */
+  const ft = makeTab("notes.txt", "file", "dir/notes.txt");
+  const dl = ft.el.querySelector(".dl");
+  ok(!!dl && (dl.listeners.click || []).length > 0, "a file tab's Download is wired");
+  seen.clicks.length = 0;
+  for (const fn of dl.listeners.click) fn({ target: dl, preventDefault() {} });
+  const a = seen.clicks.pop();
+  eq(a && a.href, "/file?path=dir%2Fnotes.txt", "and it downloads its own file");
+  closeTab(ft);
+}
+{
+  /* The popup is shared by every notice on the page, so the button shows only
+     when the notice is about a file that can be had. */
+  const press = (el) => {
+    for (const fn of el.listeners.click || []) fn({ target: el, preventDefault() {} });
+    if (typeof el.onclick === "function") el.onclick({ target: el, preventDefault() {} });
+  };
+  popup("This file cannot be viewed", "PDF document is not a text file\n\ndoc.pdf", "doc.pdf");
+  eq($("popup-body").textContent, "PDF document is not a text file\n\ndoc.pdf",
+     "the notice says what it said before");
+  ok(!$("popup-dl").classList.contains("hide"), "a refusal of a file offers the file");
+  seen.clicks.length = 0;
+  press($("popup-dl"));
+  const a = seen.clicks.pop();
+  eq(a && a.href, "/file?path=doc.pdf", "and the popup's button downloads that file");
+
+  popup("jonnyq is busy", "A turn is in progress.");
+  ok($("popup-dl").classList.contains("hide"),
+     "a notice about something else hides the button rather than lying");
+  seen.clicks.length = 0;
+  downloadFile(popupPath);
+  eq(seen.clicks.length, 0, "and there is nothing left to download");
 }
 
 console.log(pass + " passed, " + fail + " failed");

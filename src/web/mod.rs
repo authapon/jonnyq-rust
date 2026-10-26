@@ -36,6 +36,12 @@
 //!   expanded. Clicking a text file opens it in a new tab (any number at a
 //!   time, switchable from the tab strip); clicking a PDF/image/binary pops up
 //!   why it cannot be shown.
+//! * **download** — a file tab's head and that refusal popup both carry a
+//!   **Download** button, backed by `GET /file?path=…`: the file's own bytes with
+//!   `Content-Disposition: attachment`, streamed, with neither the text check nor
+//!   the size cap the file view goes through (a download cut in half is a corrupt
+//!   file). Same loopback rule and the same stay-inside-the-working-directory rule
+//!   as the tree; see [`WebConsole::serve_download`].
 //! * **terminal tabs** — a **Terminal** button beside the Send button opens a
 //!   real interactive shell (`$SHELL` in a PTY, in the working directory) in a
 //!   new tab, where the human can type any command line: `git status`,
@@ -935,8 +941,140 @@ impl WebConsole {
                 respond(&mut socket, &status(200), CONTENT_JSON, &body).await
             }
             ("GET", "/favicon.ico") => respond(&mut socket, &status(404), CONTENT_TEXT, "").await,
+            /* A file tab's **Download** button. Matched apart from the table
+            above because its request target carries a query string, and the
+            table compares whole targets. */
+            ("GET", p) if p == "/file" || p.starts_with("/file?") => {
+                self.serve_download(&mut socket, &head, true).await
+            }
+            ("HEAD", p) if p == "/file" || p.starts_with("/file?") => {
+                self.serve_download(&mut socket, &head, false).await
+            }
             _ => respond(&mut socket, &status(404), CONTENT_TEXT, "not found\n").await,
         }
+    }
+
+    /// `GET /file?path=<rel>`: the file's own bytes, offered as an attachment —
+    /// what the **Download** button of a file tab asks for.
+    ///
+    /// Deliberately *not* the rules the file view goes through: no text check,
+    /// because a PDF or an archive in the tree is most of what you would want to
+    /// save, and no [`MAX_FILE_BYTES`] ceiling, because a download cut in half is
+    /// a corrupt file rather than a smaller one. The bytes are streamed, so a
+    /// 100 MB one costs a chunk of memory instead of its own size.
+    ///
+    /// The path is held to the same rule as the tree's ([`inside`]): the browser
+    /// was shown this folder and may ask of it for anything in it and nothing
+    /// outside it.
+    async fn serve_download(
+        &self,
+        socket: &mut TcpStream,
+        head: &ws::RequestHead,
+        want_body: bool,
+    ) -> R<()> {
+        use tokio::io::AsyncReadExt;
+        let target = head.path.as_str();
+        /* A save is a download of *this* folder's file into the human's own
+        Downloads, and a page on the internet has no business triggering one:
+        it cannot read the bytes back (no CORS header is ever sent here), but
+        dropping a file someone else chose onto someone's disk is its own
+        trick. A same-origin request from the page itself carries
+        `same-origin`, and a hand-rolled client or a test carries nothing, so
+        refusing only `cross-site` costs the page nothing. */
+        if head
+            .header("sec-fetch-site")
+            .map(|v| v.eq_ignore_ascii_case("cross-site"))
+            .unwrap_or(false)
+        {
+            return respond(
+                socket,
+                &status(403),
+                CONTENT_TEXT,
+                "cross-origin download refused\n",
+            )
+            .await;
+        }
+        let rel = match query_param(target, "path") {
+            Some(p) => p,
+            None => {
+                return respond(
+                    socket,
+                    &status(400),
+                    CONTENT_TEXT,
+                    "which file? name one with ?path=\n",
+                )
+                .await
+            }
+        };
+        let path = match inside(&self.work_dir, &rel) {
+            Ok(p) => p,
+            Err(e) => return respond(socket, &status(403), CONTENT_TEXT, &e.message).await,
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                return respond(
+                    socket,
+                    &status(404),
+                    CONTENT_TEXT,
+                    &format!("cannot read it: {e}\n"),
+                )
+                .await
+            }
+        };
+        if meta.is_dir() {
+            return respond(
+                socket,
+                &status(400),
+                CONTENT_TEXT,
+                "that is a folder, not a file\n",
+            )
+            .await;
+        }
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                return respond(
+                    socket,
+                    &status(404),
+                    CONTENT_TEXT,
+                    &format!("cannot read it: {e}\n"),
+                )
+                .await
+            }
+        };
+        /* A download is the one response here that is not text, so the type
+        says so: `attachment` below is what makes the browser save it, and
+        guessing a media type would only change what opens it afterwards. */
+        let extra = disposition(&rel);
+        write_head(
+            socket,
+            &status(200),
+            CONTENT_STREAM,
+            &extra,
+            meta.len() as usize,
+        )
+        .await?;
+        if !want_body {
+            // A HEAD gets the length and the name, and nothing else — which is
+            // all of it that is answerable without sending the file.
+            return socket.flush().await.map_err(AgentError::from);
+        }
+        let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| AgentError::new(format!("the download stopped: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            socket
+                .write_all(&buf[..n])
+                .await
+                .map_err(AgentError::from)?;
+        }
+        socket.flush().await.map_err(AgentError::from)
     }
 
     /// True when every host the client claims to be talking to is loopback.
@@ -1467,6 +1605,96 @@ fn signature(data: &[u8]) -> Option<&'static str> {
 const CONTENT_HTML: &str = "text/html; charset=utf-8";
 const CONTENT_JSON: &str = "application/json; charset=utf-8";
 const CONTENT_TEXT: &str = "text/plain; charset=utf-8";
+/// A download: bytes of an unknown kind, offered as an attachment. Saying
+/// `text/plain` for a PDF would invite the browser to render it instead of
+/// saving it, and there is no media-type table here to be right about.
+const CONTENT_STREAM: &str = "application/octet-stream";
+
+/// Bytes of a file in flight at a time (see [`WebConsole::serve_download`]).
+/// Small enough not to be a spike in memory, large enough that a big download
+/// is not one `write` per kilobyte.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+/// The value of one query parameter of a request target, percent-decoded, or
+/// `None` when the target does not carry it. Only the one key the download
+/// route reads is looked for, so no general parser is needed (and none of the
+/// `&`-nesting rules a browser will never send here have to be honoured).
+pub fn query_param(target: &str, key: &str) -> Option<String> {
+    let (_, query) = target.split_once('?')?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(percent_decode(v));
+            }
+        }
+    }
+    None
+}
+
+/// `%XX` back to bytes, `+` to a space. A bad escape is passed through rather
+/// than refused: the path is checked against the filesystem afterwards, and a
+/// name that does not exist is answered by the open, not by a decoder.
+pub fn percent_decode(v: &str) -> String {
+    let bytes = v.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if hex_pair(&bytes[i + 1..]).is_some() => {
+                out.push(hex_pair(&bytes[i + 1..]).unwrap());
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // Percent-decoded bytes are not guaranteed to be UTF-8 (a path with a
+    // Latin-1 name would say so); lossy keeps the answer a string, and a
+    // mangled name simply fails to resolve.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_pair(b: &[u8]) -> Option<u8> {
+    let d = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    Some(d(*b.first()?)? << 4 | d(*b.get(1)?)?)
+}
+
+/// The `Content-Disposition` naming the file the browser is being handed.
+///
+/// The value is quoted and its own quotes and backslashes escaped, because the
+/// name comes from the filesystem and a file called `a";filename=x` must not be
+/// able to close the quoted string and add a header parameter of its own. A
+/// name with no printable ASCII left to build one out of still gets a safe
+/// fallback (`download`), since a missing parameter is what makes the browser
+/// *save* rather than navigate.
+pub fn disposition(rel: &str) -> String {
+    let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let mut clean = String::new();
+    for c in name.chars() {
+        if c == '"' || c == '\\' {
+            clean.push('\\');
+        }
+        if c == '\0' || (c as u32) < 0x20 || (c as u32) == 0x7f {
+            continue;
+        }
+        clean.push(c);
+    }
+    if clean.trim().is_empty() || clean == "." || clean == ".." {
+        clean = "download".to_string();
+    }
+    format!("Content-Disposition: attachment; filename=\"{clean}\"\r\n")
+}
 
 fn status(code: u16) -> String {
     let text = match code {
@@ -1480,20 +1708,33 @@ fn status(code: u16) -> String {
 }
 
 async fn respond(socket: &mut TcpStream, head: &str, content_type: &str, body: &str) -> R<()> {
+    let body = body.as_bytes();
+    write_head(socket, head, content_type, "", body.len()).await?;
+    socket.write_all(body).await.map_err(AgentError::from)?;
+    socket.flush().await.map_err(AgentError::from)
+}
+
+/// One response's headers: status line, type, length and the extra lines
+/// ([`disposition`] adds one for a download), then the blank line. Split out of
+/// [`respond`] because a download writes its body itself — streamed from the
+/// file, in chunks — and still has to say the same three things first.
+///
+/// `Cache-Control: no-store` holds for both: a page reloaded after an edit must
+/// show and offer the new bytes, not whatever the browser kept.
+async fn write_head(
+    socket: &mut TcpStream,
+    head: &str,
+    content_type: &str,
+    extra: &str,
+    len: usize,
+) -> R<()> {
     let msg = format!(
-        "{head}Content-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
+        "{head}Content-Type: {content_type}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\n{extra}Connection: close\r\n\r\n"
     );
     socket
         .write_all(msg.as_bytes())
         .await
-        .map_err(AgentError::from)?;
-    socket
-        .write_all(body.as_bytes())
-        .await
-        .map_err(AgentError::from)?;
-    socket.flush().await.map_err(AgentError::from)?;
-    Ok(())
+        .map_err(AgentError::from)
 }
 
 /// The host part of a `Host:` value or an `Origin:` URL.
@@ -2036,6 +2277,332 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         assert_eq!(reply["ok"], json!(false), "{reply}");
         assert_eq!(reply["kind"], json!("PDF document"));
         assert!(reply["error"].as_str().unwrap().contains("not a text file"));
+    }
+
+    // -- downloading a file (the file tab's Download button) ---------------
+
+    /// One plain HTTP request, answered whole: the download route is a response
+    /// with arbitrary bytes in it, so a test cannot read it as a string of text
+    /// and asks for the bytes instead.
+    fn http_get(port: u16, target: &str, host: &str) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let mut s = connect_to(port);
+        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut all = Vec::new();
+        s.read_to_end(&mut all).unwrap();
+        all
+    }
+
+    /// The same request, cut into headers and body at the blank line.
+    fn http_split(port: u16, target: &str, host: &str) -> (String, Vec<u8>) {
+        let all = http_get(port, target, host);
+        match ws::find(&all, b"\r\n\r\n") {
+            Some(i) => (
+                String::from_utf8_lossy(&all[..i]).into_owned(),
+                all[i + 4..].to_vec(),
+            ),
+            None => (String::from_utf8_lossy(&all).into_owned(), Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_query_parameter_is_found_and_decoded() {
+        assert_eq!(
+            query_param("/file?path=src/main.rs", "path").as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            query_param("/file?path=sub%2Fnote.txt&x=1", "path").as_deref(),
+            Some("sub/note.txt"),
+            "a slash in a name must survive the query"
+        );
+        assert_eq!(
+            query_param("/file?path=a%20b%23c.txt", "path").as_deref(),
+            Some("a b#c.txt"),
+            "a space and a hash are the bytes of the name, not delimiters"
+        );
+        assert_eq!(
+            query_param("/file?path=+%2B", "path").as_deref(),
+            Some(" +"),
+            "a plus is a space and %2B is a plus, as a form's encoding says"
+        );
+        assert_eq!(
+            query_param("/file?path=%e0%b8%a1", "path").as_deref(),
+            Some("ม"),
+            "a UTF-8 name arrives whole"
+        );
+        assert_eq!(query_param("/file?other=1", "path"), None);
+        assert_eq!(query_param("/file", "path"), None, "no query, no path");
+        assert_eq!(
+            query_param("/file?path", "path"),
+            None,
+            "a bare key is no value"
+        );
+        assert_eq!(
+            query_param("/file?path=%zz", "path").as_deref(),
+            Some("%zz"),
+            "a bad escape is passed through: the filesystem decides, not the decoder"
+        );
+    }
+
+    #[test]
+    fn a_download_name_cannot_write_its_own_header() {
+        // Ordinary names come out as the file's own name.
+        assert_eq!(
+            disposition("src/main.rs"),
+            "Content-Disposition: attachment; filename=\"main.rs\"\r\n"
+        );
+        assert_eq!(
+            disposition("README.Thai.md"),
+            "Content-Disposition: attachment; filename=\"README.Thai.md\"\r\n"
+        );
+
+        // And a name from the filesystem may not close the quoted string and
+        // add a parameter of its own. Read the header back the way a browser's
+        // quoted-string parser does — a `\` takes the next character — and what
+        // comes out must be the file's name, one parameter and no more.
+        let read = |h: String| -> String {
+            let (_, v) = h.split_once("filename=").unwrap();
+            let v = v.trim_end_matches("\r\n");
+            assert!(v.starts_with('"') && v.ends_with('"'), "not quoted: {v}");
+            let mut out = String::new();
+            let mut chars = v[1..v.len() - 1].chars();
+            while let Some(c) = chars.next() {
+                out.push(if c == '\\' { chars.next().unwrap() } else { c });
+            }
+            out
+        };
+        assert_eq!(read(disposition("dir/a.txt")), "a.txt");
+        assert_eq!(
+            read(disposition("dir/a\";filename=pwn.txt")),
+            "a\";filename=pwn.txt",
+            "the quote is escaped, so the parameter cannot be redefined"
+        );
+        assert_eq!(
+            read(disposition("very/deep/dir/a;b=c.txt")),
+            "a;b=c.txt",
+            "a semicolon in the name stays inside the quotes"
+        );
+        assert_eq!(
+            read(disposition("dir\\sub\\a.txt")),
+            "a.txt",
+            "and a backslash names a folder the way Windows spells it"
+        );
+
+        let ctrl = disposition("a\u{1b}b\u{0}.txt");
+        assert!(!ctrl.contains('\u{1b}') && !ctrl.contains('\0'), "{ctrl}");
+        assert_eq!(
+            disposition("..").trim_end(),
+            "Content-Disposition: attachment; filename=\"download\"",
+            "a name that is nothing to save gets a safe one"
+        );
+        // A name can never end the headers early: whatever it holds, the header
+        // is one line and the CRLF that closes it is the only terminator in it.
+        for name in ["a;x=y", "a\"b\"c", "a\r\nX-Evil: y"] {
+            let h = disposition(name);
+            assert_eq!(
+                h.trim_end_matches("\r\n").matches("\r\n").count(),
+                0,
+                "one header line only: {h:?}"
+            );
+            assert_eq!(
+                read(h.clone()),
+                name.replace(['\r', '\n'], ""),
+                "round trip: {h}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_is_the_file_itself_offered_as_an_attachment() {
+        let d = dir_with(&[
+            ("notes.txt", "hello\nworld\n"),
+            ("sub/inner.rs", "fn main() {}"),
+        ]);
+        write_raw(
+            &d,
+            "pic.png",
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3],
+        );
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+
+        // A text file: the view shows it, and the download is the same bytes.
+        let (head, body) = tokio::task::spawn_blocking(move || {
+            http_split(port, "/file?path=notes.txt", "127.0.0.1")
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "got {head:?}");
+        assert!(head.contains("Content-Length: 12"), "{head}");
+        assert!(
+            head.contains("Content-Disposition: attachment; filename=\"notes.txt\""),
+            "the browser must save it, and under its own name: {head}"
+        );
+        assert_eq!(body, b"hello\nworld\n".to_vec());
+
+        // A file the view refuses is exactly the file the button is for: the
+        // download does not go through the text check.
+        let (head, body) = tokio::task::spawn_blocking(move || {
+            http_split(port, "/file?path=pic.png", "127.0.0.1")
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "got {head:?}");
+        assert_eq!(
+            &body[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "a PNG arrives as a PNG"
+        );
+
+        // A name in a folder, percent-encoded like the page encodes it.
+        let (_, body) = tokio::task::spawn_blocking(move || {
+            http_split(port, "/file?path=sub%2Finner.rs", "localhost")
+        })
+        .await
+        .unwrap();
+        assert_eq!(body, b"fn main() {}".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_is_never_cut_short_like_the_view() {
+        /* Past MAX_FILE_BYTES the pane stops mid-file and says so. A download
+        that stopped there would be a corrupt archive or a truncated binary,
+        so the ceiling is the view's and not the download's. */
+        let big = "x".repeat(MAX_FILE_BYTES + 4096);
+        let d = dir_with(&[("big.txt", &big)]);
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+        let (head, body) = tokio::task::spawn_blocking(move || {
+            http_split(port, "/file?path=big.txt", "localhost")
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "got {head:?}");
+        assert_eq!(body.len(), MAX_FILE_BYTES + 4096, "every byte, however big");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_says_where_it_cannot_give_the_file() {
+        let d = dir_with(&[("notes.txt", "hi")]);
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+        let got = tokio::task::spawn_blocking(move || {
+            [
+                http_split(port, "/file", "localhost"),
+                http_split(port, "/file?path=../outside", "localhost"),
+                http_split(port, "/file?path=%2Fetc%2Fpasswd", "localhost"),
+                http_split(port, "/file?path=missing.txt", "localhost"),
+                http_split(port, "/file?path=%2E", "localhost"),
+            ]
+        })
+        .await
+        .unwrap();
+
+        // Nothing named: a bad request, not an empty file.
+        assert!(got[0].0.starts_with("HTTP/1.1 400"), "got {:?}", got[0].0);
+        // Outside the working directory: refused, whatever the answer to reading
+        // it as this user would be — this is the same rule the tree holds to.
+        assert!(got[1].0.starts_with("HTTP/1.1 403"), "got {:?}", got[1].0);
+        assert!(got[2].0.starts_with("HTTP/1.1 403"), "got {:?}", got[2].0);
+        // Not there at all, and a folder rather than a file.
+        assert!(got[3].0.starts_with("HTTP/1.1 404"), "got {:?}", got[3].0);
+        assert!(got[4].0.starts_with("HTTP/1.1 400"), "got {:?}", got[4].0);
+        for (head, body) in &got {
+            assert!(
+                !body.starts_with(b"%PDF") && !head.contains("Content-Disposition"),
+                "a refusal offers no file: {head}"
+            );
+        }
+    }
+
+    /// The loopback rule is a property of the listener, not of the websocket
+    /// route: a rebinding attempt must not be able to pull a file out of the
+    /// working directory either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_to_a_foreign_host_is_refused() {
+        let d = dir_with(&[("notes.txt", "hello")]);
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+        let body = tokio::task::spawn_blocking(move || {
+            String::from_utf8_lossy(&http_get(port, "/file?path=notes.txt", "evil.example.com"))
+                .into_owned()
+        })
+        .await
+        .unwrap();
+        assert!(body.starts_with("HTTP/1.1 403"), "got {body:?}");
+        assert!(!body.contains("hello"), "and no file either: {body}");
+    }
+
+    /// `Sec-Fetch-Site: cross-site` is what a page on the internet gets a
+    /// browser to send, so refusing it closes the drive-by save: a stranger's
+    /// page cannot drop a file of this working directory into the human's
+    /// Downloads folder. The page's own button is same-origin and passes, and a
+    /// client that sends the header at all is only refused when it says it is
+    /// cross-site.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_from_another_site_is_refused() {
+        let d = dir_with(&[("notes.txt", "hello")]);
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+        let ask = |site: &str| {
+            let site = site.to_string();
+            tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut s = connect_to(port);
+                s.write_all(
+                    format!(
+                        "GET /file?path=notes.txt HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+Sec-Fetch-Site: {site}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let mut all = Vec::new();
+                s.read_to_end(&mut all).unwrap();
+                String::from_utf8_lossy(&all).into_owned()
+            })
+        };
+        for site in ["cross-site", "cross-site "] {
+            let body = ask(site).await.unwrap();
+            assert!(body.starts_with("HTTP/1.1 403"), "got {body:?}");
+            assert!(!body.contains("hello"), "and no file: {body}");
+        }
+        for site in ["same-origin", "none"] {
+            let body = ask(site).await.unwrap();
+            assert!(body.starts_with("HTTP/1.1 200 OK"), "{site}: got {body:?}");
+        }
+    }
+
+    /// `HEAD` gets the headers a browser would ask before saving, and nothing
+    /// else: a body on a HEAD is not a thing the page's anchor ever needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_asks_the_size_without_the_file() {
+        let d = dir_with(&[("notes.txt", "hello\nworld\n")]);
+        let web = console(&d.str());
+        web.start().unwrap();
+        let port = web.port();
+        let all = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut s = connect_to(port);
+            s.write_all(b"HEAD /file?path=notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut all = Vec::new();
+            s.read_to_end(&mut all).unwrap();
+            String::from_utf8_lossy(&all).into_owned()
+        })
+        .await
+        .unwrap();
+        assert!(all.starts_with("HTTP/1.1 200 OK"), "got {all:?}");
+        assert!(all.contains("Content-Length: 12"), "{all}");
+        assert!(all.contains("attachment"), "{all}");
+        assert!(!all.contains("hello"), "and no body: {all}");
     }
 
     /// The console mirror is the feature: what the writer prints must arrive.
