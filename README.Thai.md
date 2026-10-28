@@ -6,7 +6,7 @@
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.0.0
+jonnyq v1.1.0
 qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -30,19 +30,21 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 7. [การตั้งค่า](#การตั้งค่า)
 8. [Slash commands](#slash-commands)
 9. [Tools](#tools)
-10. [การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`](#การทำงานอัตโนมัติ-plan--progress--coding)
-11. [Skills](#skills)
-12. [เวบคอนโซล](#เวบคอนโซล)
-13. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
-14. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
-15. [ความปลอดภัย](#ความปลอดภัย)
-16. [License](#license)
+10. [การแชร์ความรู้ระหว่าง agent](#การแชร์ความรู้ระหว่าง-agent)
+11. [การทำงานอัตโนมัติ: `/plan` → `.context/progress.md` → `/coding`](#การทำงานอัตโนมัติ-plan--contextprogressmd--coding)
+12. [Skills](#skills)
+13. [เวบคอนโซล](#เวบคอนโซล)
+14. [การแจ้งเตือน (ntfy)](#การแจ้งเตือน-ntfy)
+15. [ไฟล์ที่โปรแกรมสร้างระหว่างรัน](#ไฟล์ที่โปรแกรมสร้างระหว่างรัน)
+16. [ความปลอดภัย](#ความปลอดภัย)
+17. [License](#license)
 
 ---
 
 ## แอปนี้คืออะไร
 
 - Agent บน terminal แบบโต้ตอบ: พิมพ์คำสั่ง → model คิด → เรียก tool → ตอบ โดยวนซ้ำจนงานเสร็จ
+- **4 agent บน model เดียว** — JONNY (งานทั่วไป), JACKY (วางแผน), JOEY (เขียนโค้ด) และ JOY (ทดสอบ/ตรวจงาน) สลับได้ด้วย `/jonny`, `/jacky`, `/joey`, `/joy` แต่ละตัวเก็บบทสนทนาของตัวเองไว้ในไฟล์ history ของตัวเอง จึงให้ JOY ตรวจงานได้โดยไม่ให้กิน context ของ JOEY
 - รองรับ **Ollama** (native API) และ endpoint ที่เป็น **OpenAI-compatible** (OpenAI, LM Studio, llama.cpp server, vLLM, OpenRouter, …)
 - automate งานเขียนโค้ดด้วยคำสั่ง `/plan`, `/plan_for_human`, `/coding`, `/coding_phase`, `/autocoding`
 - บอกเวอร์ชันของตัวเองเสมอ: เลขเวอร์ชันจาก `Cargo.toml` จะถูกพิมพ์เหนือ prompt บรรทัดแรกทุกครั้งที่เปิด session, เป็นบรรทัดแรกของ `-h` และ `/help`, `/version` พิมพ์ซ้ำได้ทุกเมื่อ และมีบน title bar ของ web console กับ field `version` ใน JSON ของ `/health`
@@ -52,7 +54,13 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **agent loop** — ทุก turn จะส่งบทสนทนา + tool spec ไปให้ provider → stream thinking/answer ออกจอ → รัน tool ที่ model เรียก → ส่งผลลัพธ์กลับ → วนซ้ำจนได้คำตอบสุดท้าย
 
-**context compaction** — เมื่อ request โตเกิน ~60% ของ context window จะสรุปช่วงเก่าของบทสนทนาเป็น summary แล้วเก็บข้อความท้ายสุดไว้ทั้งดุ้น (default 6 ข้อความ) เพื่อให้ agent ยังเห็น file path / error / output ที่กำลังทำงานอยู่จริง การตรวจจะเกิดต้นทุก turn, หลังทุกรอบ tool call และท้าย turn summary ที่ใช้ไม่ได้ (ว่าง, มีแต่ thinking, ตัดห้วน) จะ**ไม่มีทาง**แทนที่ history — jonnyq จะคงของเดิมไว้พร้อมพิมพ์เหตุผลออกจอ
+**context compaction** — compact ทีละ agent และคิดจาก request ทั้งก้อน (system prompt + tool spec + ข้อความ) ไม่ใช่เฉพาะ history เมื่อเกิน 50% ของ context window จะสรุปช่วงเก่าของบทสนทนาของ agent นั้นเป็น summary แล้วเก็บข้อความท้ายสุดไว้ทั้งดุ้น (default 10 ข้อความ) เพื่อให้ agent ยังเห็น file path / error / output ที่กำลังทำงานอยู่จริง ส่วน summary เองมีเพดานที่เล็กกว่าพื้นที่ที่มันควรคืนมาก การตรวจจะเกิดต้นทุก turn, หลังทุกรอบ tool call และท้าย turn summary ที่ใช้ไม่ได้ (ว่าง, มีแต่ thinking, ตัดห้วน) จะ**ไม่มีทาง**แทนที่ history — jonnyq จะคงของเดิมไว้พร้อมพิมพ์เหตุผลออกจอ
+
+**ทีม agent** — model เดียว terminal เดียว แต่มี 4 ตัว JONNY รับ prompt ทั่วไป, JACKY เขียน plan, JOEY ทำงานตาม checklist, JOY ตรวจงาน เรียกได้ทั้งออกชื่อ (`/joey`) และให้คำสั่งที่เป็นของตัวนั้นเรียกให้ (`/coding` เป็นของ JOEY) ทุกตัวใช้ tool, model และ transcript ร่วมกัน แต่เก็บ history ของตัวเองไว้ที่ `.context/<ชื่อ>.md` และมีตัวที่ active อยู่ตัวเดียว คือตัวที่ prompt ธรรมดาจะส่งไปให้ การสลับ agent จึงไม่มีค่าใช้จ่าย: ไม่ต้องส่งอะไรใหม่และไม่กิน context ของตัวอื่น ทุกตัวรู้ว่าอีกสามตัวทำอะไร และอ่านไฟล์ context ของกันได้ — ดู [การแชร์ความรู้ระหว่าง agent](#การแชร์ความรู้ระหว่าง-agent) ทุกตัวยังมีคาแรกเตอร์ของตัวเอง (JONNY ร่าเริง, JACKY ละเอียดรอบคอบ, JOEY ไม่ยอมปล่อยให้งานตัวเองพลาด, JOY สวยแต่เข้มงวดมาก) ซึ่งถูกเขียนนำไว้บน system prompt ของแต่ละตัว — คาแรกเตอร์เปลี่ยนเพียง "วิธีทำงาน" ของ agent เท่านั้น ไม่ได้เปลี่ยนสิทธิ์ที่มันมี: กติกาหน้าที่ยังถูกบอกก่อนและคงบังคับเหมือนเดิม
+
+**verdict ของ JOY** — `/plan` และคำสั่งกลุ่ม coding จะจบด้วยการตรวจงานเสมอ และ verdict คือคำตอบ plain text ของเธอ: `APPROVE` หรือ `NEEDS FIX` ตามด้วยข้อผิดพลาดที่ไล่เลขไว้ ซึ่งจะย้อนกลับไปหา agent ที่ต้องแก้ (ไม่เกิน `/review_rounds` รอบ) การตรวจที่ไม่บอก verdict จะไม่ถูกถือผ่านเด็ดขาด — jonnyq จะบอกตรง ๆ ว่างานนั้นยังไม่ถูกตรวจ มีสองกติกาที่ทำให้เรื่องนี้อยู่กับ model ที่มี thinking channel ได้จริง: verdict ถูกอ่านจาก **คำตอบของ turn นั้นเท่านั้น** (ไม่กลับไปอ่าน turn เก่าใน history ของเธอ และไม่อ่านจาก thinking channel) และคำตอบที่ขึ้นต้นด้วยข้อความธรรมดาแล้วไม่มี verdict บรรทัดของตัวเอง จะได้ถามกลับอีก 1 ครั้งสั้น ๆ ขอเฉพาะบรรทัด verdict — งานตรวจของเธอยังอยู่ใน context จึงไม่ต้องตรวจใหม่
+
+> JACKY เคยชื่อ JACKSON — เปลี่ยนแค่ชื่อ ตัวเดิม lane เดิม และ `.context/jackson.md` ของ session เก่าจะถูก rename เป็น `.context/jacky.md` ตอนเปิด session ครั้งแรก ความจำเดิมจึงมาด้วย `/jackson` ยังใช้แทน `/jacky` ได้ แค่ไม่อยู่ในรายการคำสั่งแล้วเพราะหนึ่ง agent ควรมีชื่อเดียว
 
 **2 โหมด tool**
 
@@ -63,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
 
-**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `output.txt`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.0.0`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.1.0`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
 
 ## เวอร์ชัน
 
-jonnyq อยู่ที่ **v1.0.0** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
+jonnyq อยู่ที่ **v1.1.0** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
 
 | ที่ไหน | สิ่งที่เห็น |
 |---|---|
-| terminal, ตอนเปิด session | `jonnyq v1.0.0` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
+| terminal, ตอนเปิด session | `jonnyq v1.1.0` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
 | `jonnyq -h` / `-help` | เวอร์ชันเป็นบรรทัดแรกของ usage (พิมพ์ออกมาหลัง error ของ flag ผิดด้วย) |
 | `/version` | บรรทัดเดียวกัน เรียกใช้กลาง session ได้ตลอด |
 | `/help`, `/?` | เวอร์ชันอยู่เหนือรายการ slash command |
-| web console | ใน title ของ tab (`jonnyq console v1.0.0`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
-| `GET /health` | `"version": "1.0.0"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
+| web console | ใน title ของ tab (`jonnyq console v1.1.0`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
+| `GET /health` | `"version": "1.1.0"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
 
 `-h` ยัง exit ด้วย code 1 เหมือนโปรแกรมที่ใช้ Go `flag` เพราะถือเป็นการขอ usage ไม่ใช่คำสั่งปกติ และไม่มี flag `-version` — ใช้ `-h`, `/version` หรือ `curl 127.0.0.1:<port>/health` ของ session ที่เปิด `-web` แทน
 
@@ -174,7 +182,7 @@ jonnyq -provider openai:https://api.openai.com/v1 -key sk-... -model gpt-4o-mini
 ```bash
 $EDITOR requirements.md
 jonnyq -model qwen3:14b -ntfy-url https://ntfy.sh/my-secret-topic
-# > /plan_for_human     # สร้าง .progress พร้อมคู่มือตรวจทีละ phase สำหรับคน
+# > /plan_for_human     # สร้าง .context/progress.md พร้อมคู่มือตรวจทีละ phase
 # > /coding_phase       # ทำ 1 phase แล้วหยุด + ส่งวิธีตรวจ
 # > /coding_phase       # phase ถัดไป
 # > /autocoding         # หรือให้ทำรวดเดียวจบ
@@ -194,7 +202,8 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `-key` | `JONNYQ_KEY` | (ว่าง) | API key ส่งเป็น `Authorization: Bearer` |
 | `-model` | `JONNYQ_MODEL` | (ว่าง — **ต้องตั้ง**) | ชื่อ model |
 | `-context` | `JONNYQ_CONTEXT_SIZE` | `16348` | ขนาด context window (Ollama รับต่อเป็น `num_ctx`) |
-| `-output` | `JONNYQ_OUTPUT_FILE` | `output.txt` | ไฟล์ transcript log (append, ข้อความล้วน) |
+| `-context-dir` | `JONNYQ_CONTEXT_DIR` | `.context` | โฟลเดอร์ที่เก็บ history ของแต่ละ agent, checklist และ transcript log |
+| `-output` | `JONNYQ_OUTPUT_FILE` | `<context-dir>/transcript.md` | ไฟล์ transcript log (append, ข้อความล้วน) |
 | `-searxng-url` | `JONNYQ_SEARXNG_URL` | (ว่าง — ปิด `web_search`) | URL ของ searxng instance |
 | `-searxng-max-results` | `JONNYQ_SEARXNG_MAX_RESULTS` | `10` | จำนวนผลลัพธ์สูงสุด |
 | `-searxng-concurrency` | `JONNYQ_SEARXNG_CONCURRENCY` | `4` | จำนวนการค้นหาพร้อมกัน |
@@ -205,9 +214,9 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `-pdf-dpi` | `JONNYQ_PDF_DPI` | `150` | DPI ตอน render หน้า PDF เป็น PNG |
 | `-run-command-timeout-sec` | `JONNYQ_RUN_COMMAND_TIMEOUT_SEC` | `300` | timeout ของ `run_command` (วินาที) |
 | `-history-size` | `JONNYQ_HISTORY_SIZE` | `200` | จำนวน prompt ที่จำไว้ให้ ↑/↓ |
-| `-compact-headroom-percent` | `JONNYQ_COMPACT_HEADROOM_PERCENT` | `60` | % ของ window ที่จะ trigger compact |
-| `-compact-target-percent` | `JONNYQ_COMPACT_TARGET_PERCENT` | `25` | % ของ window ที่ summary ใช้ได้ (เพดาน 1,000 tokens) |
-| `-compact-keep-recent` | `JONNYQ_COMPACT_KEEP_RECENT` | `6` | จำนวนข้อความท้ายที่เก็บไว้ทั้งดุ้นหลัง compact |
+| `-compact-headroom-percent` | `JONNYQ_COMPACT_HEADROOM_PERCENT` | `50` | % ของ window ที่จะ trigger compact |
+| `-compact-target-percent` | `JONNYQ_COMPACT_TARGET_PERCENT` | `20` | % ของ window ที่ summary ใช้ได้ (เพดาน 1,000 tokens) |
+| `-compact-keep-recent` | `JONNYQ_COMPACT_KEEP_RECENT` | `10` | จำนวนข้อความท้ายที่เก็บไว้ทั้งดุ้นหลัง compact |
 | `-summary-transcript-cap` | `JONNYQ_SUMMARY_TRANSCRIPT_CAP` | `48000` | เพดาน transcript ที่ส่งไปขอสรุป |
 | `-max-tool-result-chars` | `JONNYQ_MAX_TOOL_RESULT_CHARS` | `64000` | เพดานขนาดผล tool หนึ่งตัวก่อนเข้า history |
 | `-max-tool-calls-per-turn` | `JONNYQ_MAX_TOOL_CALLS_PER_TURN` | `50` | budget tool call ต่อ turn |
@@ -219,6 +228,8 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `-tool-mode` | `JONNYQ_TOOL_MODE` | `native` | `native` หรือ `prompt` |
 | `-skill-path` | `JONNYQ_SKILL_PATH` | (ว่าง) | ไดเรกทอรีของ skill คั่นด้วย `;` |
 | `-web` | `JONNYQ_WEB_PORT` | `0` (ไม่มีเวบ interface) | port ของเวบคอนโซลบน `http://127.0.0.1:<port>` |
+| `-verify=true\|false` | `JONNYQ_VERIFY` | `true` | ให้ JOY ตรวจงานที่ `/plan` และกลุ่ม coding ทำแล้ว ส่ง findings กลับไปแก้ 1 รอบ |
+| `-review-rounds <n>` | `JONNYQ_REVIEW_ROUNDS` | `1` | จำนวนรอบ แก้/ตรวจ ซ้ำก่อนจะรายงาน findings ตรง ๆ |
 | `-thinking=true\|false` | `JONNYQ_THINKING` | `true` | เปิด/ปิด thinking (ส่งเฉพาะ Ollama) |
 | `-env-file` | `JONNYQ_ENV_FILE` | (ว่าง = `./.env`) | เลือกไฟล์ dotenv อื่น หรือ `off`/`none`/`no` เพื่อปิด — ตั้งผ่าน flag/env เท่านั้น ตั้งในไฟล์ไม่ได้ |
 
@@ -242,15 +253,15 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `/list_model` | แสดงรายชื่อ model ที่ provider มี |
 | `/context <size>` | ตั้ง context size |
 | `/think <true\|false>` | เปิด/ปิด thinking |
-| `/compact` | สรุป history ทันที ไม่ต้องรอให้ถึง trigger |
-| `/history` | ดู context usage รายข้อความและยอดรวม |
+| `/compact` | สรุป history ของ agent ที่ active อยู่ทันที ไม่ต้องรอให้ถึง trigger |
+| `/history` | ดู context usage รายข้อความและยอดรวม (ทุก agent) |
 | `/run_command_timeout <seconds>` | เปลี่ยน timeout ของ `run_command` ระหว่างรัน |
 | `/prompt <file>` | ส่งเนื้อหาไฟล์เป็น prompt |
-| `/plan` | สร้าง `.progress` จาก `requirements.md` หรือ reconcile เมื่อ requirement เปลี่ยน — ไม่เขียนโค้ด |
-| `/plan_for_human` | เหมือน `/plan` แต่เขียน `> How to run:` / `> Human check:` เพิ่ม เพื่อให้คนตรวจงานจริงได้ทีละ phase |
-| `/coding` | ทำ task ถัดไปที่ยังไม่เสร็จใน `.progress` 1 ข้อแล้วหยุด |
-| `/coding_phase [<เลข>]` | ทำทุก task ของ 1 phase (ล้าง history ก่อนทุก task) แล้วหยุด; เช่น `/coding_phase 3` |
-| `/autocoding` | เรียก `/plan` ถ้าจำเป็น แล้วทำทุก task ที่เหลือรวดเดียว |
+| `/plan` | JACKY: สร้าง `.context/progress.md` จาก `requirements.md` หรือ reconcile เมื่อ requirement เปลี่ยน — ไม่เขียนโค้ด |
+| `/plan_for_human` | JACKY: เหมือน `/plan` แต่เขียน `> How to run:` / `> Human check:` เพิ่ม เพื่อให้คนตรวจงานจริงได้ทีละ phase |
+| `/coding` | JOEY: ทำ task ถัดไปที่ยังไม่เสร็จใน `.context/progress.md` 1 ข้อแล้วหยุด |
+| `/coding_phase [<เลข>]` | JOEY: ทำทุก task ของ 1 phase (ล้าง history ก่อนทุก task) แล้วหยุด; เช่น `/coding_phase 3` |
+| `/autocoding` | JOEY: เรียก `/plan` ถ้าจำเป็น แล้วทำทุก task ที่เหลือรวดเดียว |
 | `/watchfile [<คำ>\|off]` | จับตาโฟลเดอร์หา magic word แล้วส่งบรรทัดนั้นเป็น prompt |
 | `/ntfy [<topic url>\|off]` | ดู/ตั้ง/ปิด ntfy topic |
 | `/proxy [<socks url>\|off\|auto]` | ดู/ตั้ง proxy ของ traffic ทั้งหมด มีผลตั้งแต่ request ถัดไป |
@@ -259,6 +270,15 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `/env [path\|off]` | ดูว่า `.env` ไฟล์ไหนถูกใช้ หรือเปลี่ยน/ปิดไฟล์ |
 | `/env list` | ตารางทุก setting: ค่าที่ใช้จริง + ที่มา (`flag`/`file`/`env`/`default`) |
 | `/env reload [path\|off]` | อ่านไฟล์ `.env` ใหม่แล้ว apply เข้า session ที่กำลังรัน |
+| `/agent <jonny\|jacky\|joey\|joy>` | สลับ agent ที่ active (เท่ากับสี่คำสั่งล่าง) |
+| `/jonny` | พูดกับ JONNY — agent หลัก งานทั่วไปทุกอย่างที่ไม่เข้าข่ายข้างล่าง |
+| `/jacky` | พูดกับ JACKY — นักวางแผน เจ้าของ `/plan` และ `/plan_for_human` |
+| `/joey` | พูดกับ JOEY — นักโค้ด เจ้าของ `/coding`, `/coding_phase`, `/autocoding` |
+| `/joy` | พูดกับ JOY — ทดสอบ/ตรวจงาน และ verdict ของ phase (ห้ามแก้ไฟล์เอง) |
+| `/team` | รายชื่อทุก agent, ตัวที่ active อยู่ และแต่ละตัวจำอะไรอยู่ (ctx เท่าไหร่) |
+| `/verify [on\|off]` | เปิด/ปิดให้ JOY ตรวจงานที่ `/plan` และ `/coding` ทำ (default เปิด) |
+| `/review_rounds [n]` | จำนวนรอบ แก้/ตรวจซ้ำต่อ 1 คำสั่ง (default 1) |
+| `/finish [notes]` | agent ที่ active เขียน hand-off summary ลง transcript แล้ว save history ทุกตัว |
 | `/version` | พิมพ์เวอร์ชัน (`jonnyq v…`) — เลขเดียวกับที่ `-h`, บรรทัดแรกของ session และ web console แสดง |
 
 `/env reload` apply model, context, thinking, tool mode, ไฟล์ output, provider/key, proxy, timeout ของ searxng/fetch/pdf, tool-call budget, skill path, ntfy topic และ watch settings โดยไม่ต้อง restart — flag ที่ใส่ตอน start ถูก replay จึงยังชนะเสมอ
@@ -281,18 +301,31 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 
 ทุก path tool ถูก confine ให้อยู่ใน working directory (กันทั้ง `../` traversal และ symlink escape)
 
-## การทำงานอัตโนมัติ: `/plan` → `.progress` → `/coding`
+## การแชร์ความรู้ระหว่าง agent
+
+system prompt ของทุก agent มีรายชื่อทีมติดไปด้วย — JONNY / JACKY / JOEY / JOY ทำอะไร คำสั่งไหนเป็นของใคร และไฟล์ context ของแต่ละตัวอยู่ตรงไหน — และทุก agent **อ่าน**ไฟล์ของตัวอื่นได้ทันที:
+
+```
+> read_file .context/joey.md      # coder เจออะไร แก้ไฟล์ไหนบ้าง
+> run_command grep -n 'REQ-012' .context/   # ค้นความจำทั้งทีม
+```
+
+เป็นวิธีข้ามผ่านข้อมูลที่ราคาถูก: planner ใช้สิ่งที่ coder ค้นพบได้โดยไม่ต้องเสีย context ของตัวเองไปหาใหม่ และ JOY เทียบ claim กับสิ่งที่ history ของคนเขียนระบุไว้จริง ๆ ได้แทนการเดา system prompt กำกับไว้ด้วยให้อ่านก่อน แทนที่จะสรุปเอง
+
+อ่านได้อย่างเดียว และ**บังคับระดับ tool** ไม่ใช่แค่ขอความร่วมมือ: ไฟล์ history คือความจำของ agent นั้นอย่างที่ jonnyq เขียนไว้ และถูกอ่านกลับมาเป็น memory ตอนเปิด session ใหม่ — แก้หรือลบคือการฝากความจำปลอมไว้ให้ session หน้า `write_file`, `edit_file`, `create_folder` จึงปฏิเสธไฟล์ history ของทุก agent (รวมถึงของตัวคนเรียกเอง) ส่วน `run_command` ปฏิเสธวิธีเขียนทับที่ model มักใช้ — `> .context/joey.md`, `rm .context/jacky.md`, `sed -i … .context/`, `tee`, `truncate`, `cp … .context/joey.md`, `git checkout .context/…` ข้อความปฏิเสธจะบอกเหตุผลและชี้ไป `read_file` agent จึงอ่านแทนการเดา ส่วน `cat`, `grep`, `head`, `wc`, `diff`, `ls` และการ copy ไฟล์ history *ออกไปที่อื่น* (`cp .context/joey.md /tmp/`) เป็นการอ่าน ใช้งานได้ปกติ — ถ้ากัน `grep` ไปด้วย agent จะเลิกอ่านไปเองซึ่งเสียจุดประสงค์ของไฟล์ร่วมกัน ส่วน `progress.md` และ sidecars ในโฟลเดอร์เดียวกันไม่ใช่ความจำ แต่เป็นไฟล์ task list ที่กลุ่มคำสั่ง coding แก้ต่อได้
+
+## การทำงานอัตโนมัติ: `/plan` → `.context/progress.md` → `/coding`
 
 เขียน `requirements.md` เอง แล้ว:
 
 | | `/plan` | `/coding` | `/coding_phase` | `/autocoding` |
 |---|---|---|---|---|
-| สร้าง `.progress` | ได้ | ไม่ได้ | ไม่ได้ | ได้ (เรียก `/plan`) |
+| สร้าง `.context/progress.md` | ได้ | ไม่ได้ | ไม่ได้ | ได้ (เรียก `/plan`) |
 | ขอบเขตที่ทำ | ไม่เขียนโค้ด | 1 task | 1 phase | ทุก task |
 | ล้าง history ต่อ task | – | ไม่ได้ | ได้ | ได้ |
 | หยุดเมื่อ | เขียน plan เสร็จ | จบ 1 task | จบ phase | ครบทุก task |
 
-`.progress` คือ checklist แบบ GitHub checkbox จัดกลุ่มเป็น phase และถูก sync กับ `requirements.md` ด้วย SHA-256 ใน `.progress.hash` — ถ้า requirement เปลี่ยน jonnyq จะ **reconcile** plan เดิมแทนการ generate ใหม่ทั้งหมด:
+`.context/progress.md` คือ checklist แบบ GitHub checkbox จัดกลุ่มเป็น phase และถูก sync กับ `requirements.md` ด้วย SHA-256 ใน `.context/progress.hash` — ถ้า requirement เปลี่ยน jonnyq จะ **reconcile** plan เดิมแทนการ generate ใหม่ทั้งหมด:
 
 ```markdown
 # Project Title
@@ -349,7 +382,7 @@ jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.
 
 | ส่วน | ทำงานอะไร |
 |---|---|
-| **แถบบน** | `model · ctx … · mode` ของ session ซึ่งอัปเดตตาม turn ที่กำลังรัน เลขเวอร์ชันของ build ที่เสิร์ฟ page นี้ถัดจากคำว่า **jonnyq** พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
+| **แถบบน** | `agent · model · ctx … · mode` ของ session — agent ที่ prompt กำลังถูกส่งไปให้จึงเปลี่ยนตาม `/jonny`-`/joey`, `/model`, `/context` และทุกครั้งที่ compact ค่าถูกอ่านซ้ำเป็นระยะ ไม่ freeze ตอน connect; เลขเวอร์ชันของ build ที่เสิร์ฟ page นี้ถัดจากคำว่า **jonnyq** พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ source ในแท็บถูก syntax highlight ด้วย palette gruvbox dark ชุดเดียวกับ console — คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ และหัวของทุกแท็บมีปุ่ม **Download** เพื่อบันทึกไฟล์นั้นลงเครื่อง |
 | **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
@@ -374,10 +407,12 @@ font ที่ดาวน์โหลดมา, font เดียวที่�
 นั้น — ซึ่งเป็น mono สำหรับ code ดังนั้นเครื่องที่ไม่เคยดึง stylesheet มาได้เลยก็ยังคง
 มี column และ cell ที่ตรงกัน
 
-**แถว status เป็นของสด** ตัวเลข `ctx` บนแถบบนคือ context ที่ session ใช้อยู่ตอนนี้
-ไม่ใช่ค่าที่ snapshot ตอน connect: มันถูกอ่านใหม่ทุก 2 วินาที, ตอน start และ end ของ
-ทุก turn, และทุกครั้งที่ slash command เปลี่ยน model หรือ window — และจะส่ง frame ก็ต่อ
-เมื่อข้อความเป็นค่าใหม่จริงเท่านั้น
+**แถว status เป็นของสด** แถบบนแสดง `agent · model · ctx … · mode` และทุกตัวเลขคือ
+state ตอนนี้ไม่ใช่ snapshot ตอน connect — ชื่อ agent เปลี่ยนตาม `/jonny`-`/joy`
+(หรือตาม `/plan` ที่ส่งงานให้ JACKY) และตัวเลข context เป็นของ agent ที่ active
+อยู่ prompt ที่ส่งให้ JOEY จึงกิน window ของ JOEY ไม่ใช่ของทีม ค่าถูกอ่านซ้ำทุกสอง
+วินาที ตอน start และ end ของทุก turn และทุกครั้งที่ slash command เปลี่ยน model,
+window หรือ agent — และจะส่ง frame ก็ต่อเมื่อข้อความเป็นค่าใหม่จริงเท่านั้น
 
 **tree อัปเดตตัวเองได้ ไม่มีปุ่ม refresh แล้ว** panel จะ list working directory ใหม่
 ทุก 2.5 วินาที พร้อม folder ที่คุณขยายไว้ทุกตัว (list เฉพาะ folder ที่แสดงอยู่บนจอ —
@@ -443,7 +478,8 @@ prompt ที่พิมพ์บนเวบจะถูกเข้าคิ�
 `/watchfile` ไม่รันซ้อนกัน textarea จะ freeze ระหว่าง turn และกลับมาพิมพ์ได้เมื่อจบ
 การเปิดหรือ reload แท็บจะ replay บทสนทนาที่ผ่านมา **พร้อมสีครบ** เพราะ replay อ่านจาก
 สิ่งที่ถูกส่งให้ terminal ไม่ใช่จากไฟล์ log ที่ถูก strip ANSI แล้ว จึงเห็นบทสนทนาเดิม
-ในสีเดียวกับที่ terminal แสดง
+ในสีเดียวกับที่ terminal แสดง และคงสีได้แม้ปิดแล้วเปิด jonnyq ใหม่ เพราะสำเนา transcript
+แบบที่มี code สีถูกเขียนไว้ข้างไฟล์ log (`.context/.transcript.ansi`)
 
 `jonnyq -web 8080 < /dev/null` (หรือ session ที่ stdin ถูกปิดด้วย Ctrl-D) จะรันต่อ
 แบบมีแต่เวบแทนที่จะ exit ด้วย EOF — prompt ที่ส่งมาจะถูก echo กลับเข้า console และ
@@ -495,24 +531,31 @@ keyboard เท่านั้น (ของบนหน้าเวบมีไ
 
 ## การแจ้งเตือน (ntfy)
 
-ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจากไฟล์ `.progress` โดยตรง (ไม่เรียก model เพิ่ม)
+ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจาก `.context/progress.md` โดยตรง (ไม่เรียก model เพิ่ม)
 
 topic เดียวกันใช้เป็นขากลับได้ด้วย: `ask_user` จะ push คำถามออกไปแล้ว subscribe รอคำตอบ จึงตอบจากมือถือได้ (`answer: <ข้อความ>` หรือ quick reply) — ใครตอบก่อนได้ก่อน ไม่ว่าจะเป็น keyboard, popup บนเวบ (`-web`) หรือมือถือ และ channel ที่ตอบแพ้จะถูกปิดให้ (popup ปิด, prompt ที่ terminal ไม่ค้างอยู่)
 
 ## ไฟล์ที่โปรแกรมสร้างระหว่างรัน
 
+ทุกอย่างที่ session นี้ผลิตขึ้นรอบตัวงาน (ไม่ใช่เนื้อหา project) อยู่ในโฟลเดอร์เดียว
+`.context/` (`-context-dir` / `JONNYQ_CONTEXT_DIR`):
+
 | ไฟล์ | เมื่อไร | หมายเหตุ |
 |---|---|---|
-| `output.txt` | เสมอ (`-output`) | transcript log แบบข้อความล้วน append — มีใน .gitignore แล้ว |
+| `.context/jonny.md`, `jacky.md`, `joey.md`, `joy.md` | ทุก turn | บทสนทนาของแต่ละ agent โหลดกลับตอน start จึงเปิด session ต่อจากที่ค้างไว้ได้ |
+| `.context/transcript.md` | เสมอ (`-output`) | transcript log แบบข้อความล้วน append — ทั้งโฟลเดอร์ถูก ignore |
+| `.context/.transcript.ansi` | เสมอ (อยู่ข้าง transcript) | transcript เดิมแต่ *คง code สีของ terminal ไว้* จำกัดขนาด ~1 MB — สิ่งที่ทำให้ web console ที่เปิดหลังปิด-เปิดโปรแกรมใหม่ replay บทสนทนาก่อนหน้ากลับมามีสีเหมือนเดิมแทนที่จะเป็นสีเทา เดินตาม `-output` (โฟลเดอร์เดียวกัน ชื่อหลักเดียวกัน นามสกุล `.ansi`) ลบได้เสมอแล้วถูกสร้างใหม่ ถูก ignore |
+| `.context/progress.md` | `/plan` | task checklist — ไฟล์เดียวในโฟลเดอร์ที่ *ควร commit* |
+| `.context/progress.hash`, `.context/progress.retry` | คำสั่งกลุ่ม coding | state local: hash ของ requirements.md และตัวนับ stall |
 | `.env` | เมื่อคุณสร้าง | settings ของ project — ถูก ignore ไว้ เริ่มจาก `.env.example` |
 | `$HOME/.jonnyq_history` | ทุกครั้งที่กด Enter ส่ง prompt | ใช้ร่วมกันข้าม session ได้ ย้ายที่ด้วยการเปลี่ยน `HOME` |
-| `.progress`, `.progress.hash`, `.progress.retry` | คำสั่งกลุ่ม coding | `.progress` ควร commit ส่วนอีกสองไฟล์เป็น state local — ถูก ignore |
 | `.jonnyq/pdf_pages/**.png` | `read_pdf` เจอ PDF ที่ไม่มี text | cache ลบได้เสมอ |
 
 ## ความปลอดภัย
 
 - **path confinement** — tool กลุ่มไฟล์ resolve ทีละ component พร้อม symlink ทุกขั้น จึงอ่าน/เขียนภายนอก working directory ไม่ได้เลย
 - **`run_command` รันด้วยสิทธิ์เต็มของคุณและไม่ถามก่อน** — มี denylist กันคำสั่งทำลายล้าง ~20 pattern (`rm -rf /`, fork bomb, `mkfs`, เขียนลง `/dev/sd*`, `curl … | sh`, …) ซึ่งเป็น best-effort **ไม่ใช่ sandbox**
+- **ความจำของ agent แชร์แบบ read-only** — ทุก agent อ่านไฟล์ history ของตัวอื่นได้ แต่ group tool ที่เขียนไฟล์กับ pattern การเขียนผ่าน shell ทั่วไปจะปฏิเสธการแก้ไฟล์เหล่านั้น เป็นการป้องกันแบบ best-effort เช่นเดียวกับ denylist (คำสั่ง shell ยังถูกเขียนให้เลี่ยงได้) สิ่งที่กันคือสัญชาตญาณdefault ของ agent ซึ่งเป็นจุดที่จะเกิดความเสียหายจริง — ดู [การแชร์ความรู้ระหว่าง agent](#การแชร์ความรู้ระหว่าง-agent)
 - **ntfy ไม่มีการยืนยันตัวตน** — ใครที่รู้ topic ก็ตอบ `ask_user` ได้ จึงควรใช้ชื่อ topic สุ่มยาว ๆ และไม่ใส่ secret ลงใน prompt
 - **resource caps** — อ่านไฟล์ 2 MB · `web_fetch` 3 MB · `read_pic` 10 MB · จำกัดจำนวนหน้า PDF และ tool call ต่อ turn
 - **API key** ถูกส่งเฉพาะ header `Authorization` และไม่เคยถูกพิมพ์ออกจอหรือลง log

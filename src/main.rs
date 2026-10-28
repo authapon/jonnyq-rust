@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use jonnyq::agent::Agent;
 use jonnyq::config;
 use jonnyq::llm;
 use jonnyq::repl::Repl;
@@ -14,19 +13,24 @@ use jonnyq::tools;
 use jonnyq::tools::run_command::RunCommandTool;
 use jonnyq::ui::Writer;
 
-/// The one-line session description the web console shows: model, context
-/// usage and window. Built from the agent rather than a snapshot, so the page
-/// shows what the session is using *now* - after `/model`, `/context` or a
-/// compaction - not what it started with.
-fn status_line(agent: Arc<Agent>) -> jonnyq::web::StatusFn {
+/// The one-line session description the web console shows: which agent is
+/// working, the model, and that agent's context usage. Read from the roster on
+/// every refresh, so the bar follows `/jonny`-`/joy` switches, `/model`,
+/// `/context` and compaction instead of freezing at startup.
+fn status_line(team: Arc<jonnyq::team::Team>) -> jonnyq::web::StatusFn {
     Arc::new(move || {
+        let agent = team.active();
         let cs = agent.ui.state.read().unwrap().context_status();
         let model = if agent.model().is_empty() {
             "(no model)".to_string()
         } else {
             agent.model()
         };
-        format!("{model} | {cs} | {}", agent.tool_call_mode().as_str())
+        format!(
+            "{} | {model} | {cs} | {}",
+            team.active_name().key(),
+            agent.tool_call_mode().as_str()
+        )
     })
 }
 
@@ -41,6 +45,18 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // The transcript defaults into .context/, which does not exist yet on a
+    // first run, so its directory has to be created before the file is opened.
+    let out_dir = std::path::Path::new(&cfg.output_file).parent();
+    if let Some(dir) = out_dir {
+        if !dir.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("cannot create output directory {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        }
+    }
 
     let w = match Writer::new(&cfg.output_file) {
         Ok(w) => Arc::new(w),
@@ -114,24 +130,23 @@ async fn main() {
     let ask_user = Arc::new(tools::ask_user::AskUserTool::new(w.clone(), &cfg.ntfy_url));
     reg.install_always(ask_user.clone());
 
-    let agent = Agent::new(
-        provider,
-        &cfg.model,
-        reg,
-        cfg.thinking,
-        cfg.context_size,
-        cfg.max_tool_calls_per_turn,
-        w.clone(),
-        cfg.skill_paths.clone(),
-    );
-    agent.set_tool_call_mode(jonnyq::agent::ToolCallMode::from_config(
-        &cfg.tool_call_mode,
-    ));
-    agent.set_output_file(&cfg.output_file);
-    agent.configure(&cfg);
-    let agent = Arc::new(agent);
+    // The roster: jonny (the main agent) plus the three specialists, all
+    // sharing this provider, tool registry and terminal, each with its own
+    // conversation and its own history file under the state dir - see
+    // crate::team.
+    let team = Arc::new(jonnyq::team::Team::build(&cfg, provider, &reg, w.clone()));
+    team.set_work_dir(&work_dir);
+    // Each specialist's own history from an earlier session, so /coding picks
+    // up where joey left off rather than re-reading the codebase from scratch.
+    let resumed = team.load_contexts(&work_dir);
+    if resumed > 0 {
+        w.plainln(&format!(
+            "[team] resumed the history of {resumed} agent(s) from {work_dir}/{}",
+            jonnyq::team::context_dir()
+        ));
+    }
 
-    let r = Repl::new(cfg, agent.clone(), w.clone(), run_command);
+    let r = Repl::new(cfg, team.clone(), w.clone(), run_command);
 
     // The web console (-web <port>): bind before the REPL starts so a port
     // already in use is reported now, not after a session has begun. It mirrors
@@ -139,7 +154,7 @@ async fn main() {
     // prompts typed there back through the REPL's own loop - see crate::web.
     if r.cfg.lock().await.web_port > 0 {
         let port = r.cfg.lock().await.web_port as u16;
-        let status = status_line(agent.clone());
+        let status = status_line(team.clone());
         match jonnyq::web::WebConsole::bind(port, &work_dir, w.clone(), status) {
             Ok(web) => {
                 if let Err(e) = web.start() {

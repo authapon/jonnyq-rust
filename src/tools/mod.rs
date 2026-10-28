@@ -5,6 +5,7 @@
 //! Port of Go `internal/tools`.
 
 pub mod ask_user;
+pub mod context_guard;
 pub mod denylist;
 pub mod file;
 pub mod guard;
@@ -309,7 +310,13 @@ pub fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// Holds the tools available to the model for one session.
-#[derive(Default)]
+///
+/// `Clone` hands the *same* registered tools to every agent of the roster
+/// ([`crate::team::Team::build`]): the tools are stateless per call and hold
+/// their tunables in atomics, so sharing them is what keeps `/env reload` and
+/// `/ntfy` a single `configure` away from all four - while each agent's
+/// conversation stays separate.
+#[derive(Clone, Default)]
 pub struct Registry {
     tools: std::collections::HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
@@ -490,8 +497,10 @@ mod tests {
         reg.register(b.clone());
         assert_eq!(reg.specs().len(), 2);
 
-        let mut cfg = Config::default();
-        cfg.pdf_max_pages = 42;
+        let cfg = Config {
+            pdf_max_pages: 42,
+            ..Default::default()
+        };
         reg.configure(&cfg);
         assert_eq!(a.1.load(Ordering::SeqCst), 42);
         assert_eq!(b.1.load(Ordering::SeqCst), 42);

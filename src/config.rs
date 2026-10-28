@@ -28,7 +28,69 @@ pub const ENV_PREFIX: &str = "JONNYQ_";
 
 pub const DEFAULT_PROVIDER: &str = "ollama:http://localhost:11434";
 pub const DEFAULT_CONTEXT_SIZE: i64 = 16348;
-pub const DEFAULT_OUTPUT_FILE: &str = "output.txt";
+/// The directory holding every piece of jonnyq's own state: the four agents'
+/// history-context Markdown files, the task checklist (`progress.md`) and its
+/// hash/retry sidecars, and the terminal transcript log that `output.txt`
+/// used to be. See [`context_dir`] and [`crate::team`].
+pub const DEFAULT_CONTEXT_DIR: &str = ".context";
+
+/// The default transcript log (the role `output.txt` had), now inside the
+/// state directory. Override with `-output` / `JONNYQ_OUTPUT_FILE`.
+pub const DEFAULT_TRANSCRIPT_FILE: &str = ".context/transcript.md";
+
+static CONTEXT_DIR_SETTING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The state directory in effect, e.g. `.context`. A process-wide setting
+/// rather than just a config field because the system prompts, the error
+/// explanations and the real file paths all name these files, and all of them
+/// must agree.
+pub fn context_dir() -> String {
+    CONTEXT_DIR_SETTING
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONTEXT_DIR.to_string())
+}
+
+/// Points jonnyq's state at another directory (empty resets it to
+/// [`DEFAULT_CONTEXT_DIR`]). Applied at startup and by `/env reload`.
+pub fn set_context_dir(dir: &str) {
+    let dir = dir.trim().trim_matches('/').to_string();
+    *CONTEXT_DIR_SETTING.lock().unwrap() = if dir.is_empty() { None } else { Some(dir) };
+}
+
+/// `<dir>/<name>.md` - one agent's persisted history context, relative to the
+/// working directory.
+pub fn agent_history_file(name: crate::team::AgentName) -> String {
+    format!("{}/{}.md", context_dir(), name.key())
+}
+
+/// The task checklist, `<dir>/progress.md`.
+pub fn progress_file() -> String {
+    format!("{}/progress.md", context_dir())
+}
+
+/// SHA-256 of requirements.md as of the last plan, `<dir>/progress.hash`.
+pub fn progress_hash_file() -> String {
+    format!("{}/progress.hash", context_dir())
+}
+
+/// `/coding`'s same-task retry counter, `<dir>/progress.retry`.
+pub fn progress_retry_file() -> String {
+    format!("{}/progress.retry", context_dir())
+}
+
+/// The transcript log path for a given state directory - what `-output`
+/// defaults to, so `-context-dir .state` moves the log along with the
+/// histories unless a path was named explicitly.
+pub fn transcript_file_in(dir: &str) -> String {
+    format!("{}/transcript.md", dir.trim_end_matches('/'))
+}
+
+/// The transcript log default, kept as a constant for the settings table and
+/// the help text.
+pub const DEFAULT_OUTPUT_FILE: &str = DEFAULT_TRANSCRIPT_FILE;
+
 pub const DEFAULT_SEARXNG_MAX_RESULTS: i64 = 10;
 pub const DEFAULT_SEARXNG_CONCURRENCY: i64 = 4;
 pub const DEFAULT_SEARXNG_TIMEOUT_SEC: i64 = 30;
@@ -60,10 +122,28 @@ pub const DEFAULT_NO_PROXY: &str = crate::net::DEFAULT_NO_PROXY;
 /// history gets summarized, the fraction the summary may occupy, how many
 /// recent messages survive a compaction verbatim, and the character ceiling
 /// on the transcript sent to be summarized.
-pub const DEFAULT_COMPACT_HEADROOM_PERCENT: i64 = 60;
-pub const DEFAULT_COMPACT_TARGET_PERCENT: i64 = 25;
-pub const DEFAULT_COMPACT_KEEP_RECENT: i64 = 6;
+///
+/// The trigger sits at 50% and the summary is asked to fit 20%, so a
+/// compaction actually frees a third of the window instead of nudging it a few
+/// percent (the old 60/25 pair could compact and still land within a round or
+/// two of the trigger again). `keep_recent` is 10 messages, which is roughly
+/// five tool rounds — enough that the agent still sees the paths, errors and
+/// command output it was working with right before the summarized part.
+pub const DEFAULT_COMPACT_HEADROOM_PERCENT: i64 = 50;
+pub const DEFAULT_COMPACT_TARGET_PERCENT: i64 = 20;
+pub const DEFAULT_COMPACT_KEEP_RECENT: i64 = 10;
 pub const DEFAULT_SUMMARY_TRANSCRIPT_CAP: i64 = 48_000;
+
+/// `/verify` / `JONNYQ_VERIFY`: whether joy reviews what jacky and joey
+/// produced at the end of each coding command, and her findings are handed
+/// back for another round.
+pub const DEFAULT_VERIFY: bool = true;
+
+/// `/review_rounds` / `JONNYQ_REVIEW_ROUNDS`: how many review/fix rounds a
+/// single command may run before jonnyq reports the findings without looping
+/// again. One round means: work, then review, then one fix, then a final
+/// review.
+pub const DEFAULT_REVIEW_ROUNDS: i64 = 1;
 
 /// Ceiling on how many characters one tool result may contribute to the
 /// conversation history (`JONNYQ_MAX_TOOL_RESULT_CHARS`) - see
@@ -88,7 +168,9 @@ Flags:
   -key <key>                    provider API key
   -model <name>                 model name to use
   -context <size>               context size (default 16348)
-  -output <file>                transcript log output file (default output.txt)
+  -context-dir <dir>            folder holding the agents' history files, the task
+                                checklist and the transcript log (default .context)
+  -output <file>                transcript log (default <context-dir>/transcript.md)
   -searxng-url <url>            searxng base URL for web_search
   -searxng-max-results <n>      max web_search results (default 10)
   -searxng-concurrency <n>      web_search concurrency (default 4)
@@ -102,11 +184,11 @@ Flags:
                                 (default 200)
   -max-tool-calls-per-turn <n>  max tool calls per turn (default 50)
   -compact-headroom-percent <n> percent of the context window that triggers
-                                compaction (default 60)
+                                compaction (default 50)
   -compact-target-percent <n>   percent of the window the summary may use
-                                (default 25)
+                                (default 20)
   -compact-keep-recent <n>      messages kept verbatim through a compaction
-                                (default 6)
+                                (default 10)
   -summary-transcript-cap <n>   max characters sent to be summarized
                                 (default 48000)
   -max-tool-result-chars <n>    per-tool-result character cap on history
@@ -124,6 +206,10 @@ Flags:
   -skill-path <paths>           semicolon-separated skill directories
   -web <port>                   serve the web console on http://127.0.0.1:<port>
                                 (0 = no web interface, the default)
+  -verify=true|false            joy reviews what /plan and /coding produced, and
+                                her findings go back for a fix round (default true)
+  -review-rounds <n>            fix/re-review cycles one command may run before
+                                the findings are just reported (default 1)
   -thinking=true|false          enable model thinking (default true)
   -env-file <path|off>          dotenv file to read settings from (default .env
                                 in the working directory; off/none/no disables it)
@@ -265,6 +351,10 @@ pub struct Config {
     pub key: String,
     pub model: String,
     pub context_size: i64,
+    /// Where jonnyq's own state lives: the agents' history-context files, the
+    /// task checklist and the transcript log. Also applied to the process-wide
+    /// [`set_context_dir`], because prompts and real paths must agree.
+    pub context_dir: String,
     pub output_file: String,
 
     pub searxng_url: String,
@@ -323,6 +413,15 @@ pub struct Config {
 
     pub thinking: bool,
 
+    /// Whether joy reviews what the planning and coding commands produced
+    /// (`-verify` / `JONNYQ_VERIFY`). On by default: the review is the reason
+    /// the roster has a verifier. See [`crate::team::review`].
+    pub verify: bool,
+    /// How many fix/re-review cycles one command may run before the findings
+    /// are reported instead of looped again (`-review-rounds` /
+    /// `JONNYQ_REVIEW_ROUNDS`).
+    pub review_rounds: i64,
+
     /// Where each setting's final value came from, keyed by the `JONNYQ_*`
     /// suffix (e.g. `CONTEXT_SIZE`). Settings set through a slash command
     /// instead (`/model`, `/context`, ...) are reported as `default` until the
@@ -354,6 +453,7 @@ impl Default for Config {
             key: String::new(),
             model: String::new(),
             context_size: DEFAULT_CONTEXT_SIZE,
+            context_dir: DEFAULT_CONTEXT_DIR.into(),
             output_file: DEFAULT_OUTPUT_FILE.into(),
             searxng_url: String::new(),
             searxng_max_results: DEFAULT_SEARXNG_MAX_RESULTS,
@@ -380,6 +480,8 @@ impl Default for Config {
             skill_paths: Vec::new(),
             web_port: DEFAULT_WEB_PORT,
             thinking: DEFAULT_THINKING,
+            verify: DEFAULT_VERIFY,
+            review_rounds: DEFAULT_REVIEW_ROUNDS,
             sources: std::collections::HashMap::new(),
             env_file: String::new(),
             dotenv: Dotenv::empty(),
@@ -526,10 +628,31 @@ impl Config {
                 false,
             ),
             (
+                "context-dir",
+                "CONTEXT_DIR",
+                self.context_dir.clone(),
+                self.src("CONTEXT_DIR"),
+                false,
+            ),
+            (
                 "output",
                 "OUTPUT_FILE",
                 self.output_file.clone(),
                 self.src("OUTPUT_FILE"),
+                false,
+            ),
+            (
+                "verify",
+                "VERIFY",
+                self.verify.to_string(),
+                self.src("VERIFY"),
+                false,
+            ),
+            (
+                "review-rounds",
+                "REVIEW_ROUNDS",
+                self.review_rounds.to_string(),
+                self.src("REVIEW_ROUNDS"),
                 false,
             ),
             (
@@ -763,6 +886,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "key",
     "model",
     "context",
+    "context-dir",
     "output",
     "searxng-url",
     "searxng-max-results",
@@ -789,6 +913,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "skill-path",
     "web",
     "thinking",
+    "verify",
+    "review-rounds",
     "env-file",
 ];
 
@@ -887,7 +1013,7 @@ impl<'a> FlagParser<'a> {
 /// surface - `load` prints them to stderr, the REPL's `/env` prints them to
 /// the terminal.
 fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> {
-    let bool_flags = ["thinking"];
+    let bool_flags = ["thinking", "verify"];
     let mut parser = FlagParser::new(args, &bool_flags);
     match parser.parse() {
         Ok(()) => {}
@@ -954,9 +1080,11 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
         }
     }
 
-    let mut c = Config::default();
-    c.env_file = selector;
-    c.startup_args = args.to_vec();
+    let mut c = Config {
+        env_file: selector,
+        startup_args: args.to_vec(),
+        ..Default::default()
+    };
 
     let r = Resolver {
         given: &given,
@@ -979,7 +1107,18 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     let (n, src) = r.int("context", "CONTEXT_SIZE", DEFAULT_CONTEXT_SIZE);
     sources.insert("CONTEXT_SIZE".to_string(), src);
     c.context_size = n;
-    let (v, src) = r.string("output", "OUTPUT_FILE", DEFAULT_OUTPUT_FILE);
+    let (v, src) = r.string("context-dir", "CONTEXT_DIR", DEFAULT_CONTEXT_DIR);
+    sources.insert("CONTEXT_DIR".to_string(), src);
+    let context_dir = v.trim().trim_matches('/').to_string();
+    let context_dir = if context_dir.is_empty() {
+        DEFAULT_CONTEXT_DIR.to_string()
+    } else {
+        context_dir
+    };
+    c.context_dir = context_dir.clone();
+    // The log defaults to inside the state folder, so -context-dir moves the
+    // whole of jonnyq's state in one setting; an explicit -output still wins.
+    let (v, src) = r.string("output", "OUTPUT_FILE", &transcript_file_in(&context_dir));
     sources.insert("OUTPUT_FILE".to_string(), src);
     c.output_file = v;
     let (v, src) = r.string("searxng-url", "SEARXNG_URL", "");
@@ -1112,6 +1251,12 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     let (b, src) = r.bool("thinking", "THINKING", DEFAULT_THINKING);
     sources.insert("THINKING".to_string(), src);
     c.thinking = b;
+    let (b, src) = r.bool("verify", "VERIFY", DEFAULT_VERIFY);
+    sources.insert("VERIFY".to_string(), src);
+    c.verify = b;
+    let (n, src) = r.int("review-rounds", "REVIEW_ROUNDS", DEFAULT_REVIEW_ROUNDS);
+    sources.insert("REVIEW_ROUNDS".to_string(), src);
+    c.review_rounds = n.clamp(0, 10);
 
     let (n, src) = r.int("web", "WEB_PORT", DEFAULT_WEB_PORT);
     sources.insert("WEB_PORT".to_string(), src);
@@ -1128,6 +1273,10 @@ fn build(args: &[String], forced_env: Option<&str>) -> R<(Config, Vec<String>)> 
     // Moved in last: the resolver above borrows it.
     c.dotenv = dotenv.unwrap_or_else(Dotenv::empty);
     c.sources = sources;
+    // Only once the whole config resolved: this one is process-wide (the
+    // system prompts and every state path read it), so a build that fails on a
+    // later bad flag must not leave the running session pointing elsewhere.
+    set_context_dir(&c.context_dir);
 
     Ok((c, warnings))
 }
@@ -1843,7 +1992,10 @@ mod tests {
             "key JONNYQ_KEY",
             "model JONNYQ_MODEL",
             "context JONNYQ_CONTEXT_SIZE",
+            "context-dir JONNYQ_CONTEXT_DIR",
             "output JONNYQ_OUTPUT_FILE",
+            "verify JONNYQ_VERIFY",
+            "review-rounds JONNYQ_REVIEW_ROUNDS",
             "thinking JONNYQ_THINKING",
             "searxng-url JONNYQ_SEARXNG_URL",
             "searxng-max-results JONNYQ_SEARXNG_MAX_RESULTS",

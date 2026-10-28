@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::human::{self, PhaseInfo, ProgressDoc};
 use super::{
-    completion_guide, first_unfinished, notify_or_warn, progress_summary_line, with_timing, Coding,
-    CodingModeGuard, PROGRESS_FILE, REQUIREMENTS_FILE,
+    completion_guide, first_unfinished, notify_or_warn, progress_file, progress_summary_line,
+    with_timing, Coding, CodingModeGuard, REQUIREMENTS_FILE,
 };
 use crate::error::{AgentError, R};
 use crate::llm::Usage;
@@ -51,9 +51,10 @@ fn describe_phases(d: &ProgressDoc) -> String {
 /// done). With a number N it is the phase headed "Phase N", or, when no
 /// heading carries that label, the Nth phase that has tasks.
 pub fn select_phase(d: &ProgressDoc, arg: &str) -> R<i64> {
+    let progress_file = super::progress_file();
     if !d.has_any_tasks() {
         return Err(AgentError::new(format!(
-            "{PROGRESS_FILE} has no tasks; run /plan or /plan_for_human first"
+            "{progress_file} has no tasks; run /plan or /plan_for_human first"
         )));
     }
     let arg = arg.trim();
@@ -96,7 +97,7 @@ pub fn select_phase(d: &ProgressDoc, arg: &str) -> R<i64> {
         }
     }
     Err(AgentError::new(format!(
-        "{PROGRESS_FILE} has no phase {}. Available phases:\n{}",
+        "{progress_file} has no phase {}. Available phases:\n{}",
         n,
         describe_phases(d)
     )))
@@ -136,10 +137,12 @@ impl<'a> Coding<'a> {
         arg: &str,
         start: Instant,
     ) -> R<()> {
-        let prog_path = self.path(PROGRESS_FILE);
+        // Read at call time: `JONNYQ_CONTEXT_DIR` moves the whole state folder.
+        let progress_file = progress_file();
+        let prog_path = self.path(&progress_file);
         let Ok(doc) = human::parse_progress_doc(&prog_path) else {
             return Err(AgentError::new(format!(
-                "{PROGRESS_FILE} not found; run /plan or /plan_for_human first to generate it from \
+                "{progress_file} not found; run /plan or /plan_for_human first to generate it from \
 {REQUIREMENTS_FILE}"
             )));
         };
@@ -148,7 +151,7 @@ impl<'a> Coding<'a> {
         if idx == -1 {
             // nothing left anywhere
             self.ui.plainln(&format!(
-                "[coding_phase] all tasks in {PROGRESS_FILE} are checked off"
+                "[coding_phase] all tasks in {progress_file} are checked off"
             ));
             let tasks = super::parse_progress(&prog_path).unwrap_or_default();
             let mut summary = format!(
@@ -187,7 +190,7 @@ impl<'a> Coding<'a> {
         }
         if target.name == "(no phase)" || doc.phases.len() == 1 {
             self.ui.plainln(&format!(
-                "[coding_phase] note: {PROGRESS_FILE} has a single section, so this covers every task \
+                "[coding_phase] note: {progress_file} has a single section, so this covers every task \
 (same as /autocoding)"
             ));
         }
@@ -200,16 +203,19 @@ impl<'a> Coding<'a> {
 
         let name = target.name.clone();
         let name_in_loop = name.clone();
+        // The loop re-reads the file after every task, so it needs its own
+        // copy of the path (the closure below is `move`).
+        let progress_file_in_loop = progress_file.clone();
         let _mode_guard = CodingModeGuard::on(&self.agent);
         let (ran_turn, ()) = self
             .run_task_loop(cancel, "coding_phase", &move |c: &Coding, _p: &Path| {
-                let d = human::parse_progress_doc(&c.path(PROGRESS_FILE))
-                    .map_err(|e| AgentError::new(format!("reading {PROGRESS_FILE}: {}", e.message)))?;
+                let d = human::parse_progress_doc(&c.path(&progress_file_in_loop))
+                    .map_err(|e| AgentError::new(format!("reading {progress_file_in_loop}: {}", e.message)))?;
                 let i = d.find_phase(&name_in_loop);
                 if i < 0 {
                     return Err(AgentError::new(format!(
-                        "phase {name_in_loop:?} is no longer in {PROGRESS_FILE} (it was renamed or removed \
-while working); check {PROGRESS_FILE} manually"
+                        "phase {name_in_loop:?} is no longer in {progress_file_in_loop} (it was renamed or removed \
+while working); check {progress_file_in_loop} manually"
                     )));
                 }
                 let tasks = d.phases[i as usize].tasks.clone();
@@ -253,7 +259,7 @@ while working); check {PROGRESS_FILE} manually"
             title = format!("jonnyq: /coding_phase {kind} complete");
         } else if !doc_after.has_guide() {
             sb.push_str(&format!(
-                "\n\nNo verification notes in {PROGRESS_FILE}; run /plan_for_human to have them written."
+                "\n\nNo verification notes in {progress_file}; run /plan_for_human to have them written."
             ));
         }
         // The reported usage is the last task's turn only; the duration

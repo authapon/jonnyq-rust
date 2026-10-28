@@ -1,5 +1,7 @@
 //! Renders colored terminal output while mirroring a plain-text
-//! (ANSI-stripped) transcript to the configured output file.
+//! (ANSI-stripped) transcript to the configured output file, and the *coloured*
+//! bytes the terminal was sent to a bounded sidecar next to it (see
+//! [`colour_log_path`]).
 //!
 //! Port of Go `internal/ui`. The Go version exposes `ContextFn`/`TurnStatsFn`
 //! callbacks that the agent installs; in Rust the agent instead keeps a shared
@@ -7,6 +9,7 @@
 //! headers read when they are printed.
 
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
@@ -30,6 +33,8 @@ pub const COLOR_BLUE: &str = "\x1b[34m"; // ask_user question text
 // is the "whiteสว่าง" half of an ask_user exchange: the question is blue,
 // what the user types back is bright white.
 pub const COLOR_BRIGHT_GREEN: &str = "\x1b[92m";
+pub const COLOR_BRIGHT_CYAN: &str = "\x1b[96m";
+pub const COLOR_BRIGHT_MAGENTA: &str = "\x1b[95m";
 pub const COLOR_BRIGHT_RED: &str = "\x1b[91m";
 pub const COLOR_BRIGHT_YELLOW: &str = "\x1b[93m";
 pub const COLOR_BRIGHT_BLUE: &str = "\x1b[94m";
@@ -50,6 +55,172 @@ pub trait ConsoleSink: Send + Sync {
 
 pub fn strip_ansi(s: &str) -> String {
     ANSI_RE.replace_all(s, "").into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// The colour sidecar
+// ---------------------------------------------------------------------------
+
+/// Ceiling on the colour sidecar (see [`colour_log_path`]). Once the file
+/// passes this the writer compacts it back to [`COLOUR_KEEP`], so a session
+/// that ran for a week cannot leave a gigabyte of escape codes next to the
+/// transcript — the same reason the web console's replay buffer is bounded.
+pub const COLOUR_TAIL: u64 = 1024 * 1024;
+
+/// What the sidecar is cut back to when it passes [`COLOUR_TAIL`]. Keeping half
+/// the ceiling rather than truncating to zero means the trim costs one rewrite
+/// per [`COLOUR_TAIL - COLOUR_KEEP`] bytes written instead of one per byte.
+const COLOUR_KEEP: u64 = 512 * 1024;
+
+/// The file holding the *coloured* copy of a transcript: the exact bytes the
+/// terminal was sent, escape sequences included.
+///
+/// The transcript itself is ANSI-stripped — that is what makes it a readable
+/// file — so it cannot tell a program what colour a line was printed in. That
+/// mattered once the web console existed: a tab opened after a restart is
+/// greeted with the transcript so far, and building that replay from the
+/// stripped log showed a whole session in grey even though the terminal had
+/// shown it in colour. The sidecar is the missing record.
+///
+/// It sits beside the log with the same stem and a leading dot
+/// (`.context/transcript.md` → `.context/.transcript.ansi`) so it follows
+/// `-output`/`JONNYQ_OUTPUT_FILE`, stays inside the git-ignored state folder,
+/// and is skipped by the `/watchfile` walker the way every other dotfile is.
+pub fn colour_log_path(transcript: &str) -> String {
+    let t = transcript.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let p = Path::new(t);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.is_empty() {
+        // No usable stem (".log", a trailing slash): append rather than clobber.
+        return format!("{t}.ansi");
+    }
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_string_lossy().into_owned(),
+        _ => String::new(),
+    };
+    // Hidden, the way the other runtime files in a working directory are: a
+    // leading dot keeps it out of the way of `ls`, of the file tree's eye and of
+    // the /watchfile walker (which skips dotfiles outright).
+    let name = if stem.starts_with('.') {
+        format!("{stem}.ansi")
+    } else {
+        format!(".{stem}.ansi")
+    };
+    match dir.as_str() {
+        "" => name,
+        d => format!("{}{}{}", d, std::path::MAIN_SEPARATOR, name),
+    }
+}
+
+/// The sidecar handle, with the byte count the trim decision needs.
+///
+/// The length is tracked rather than asked of the OS per write: every streamed
+/// token goes through [`Writer::out`], and a `stat` per token to decide
+/// something that changes once a megabyte is pure overhead.
+#[derive(Default)]
+struct ColourLog {
+    file: Option<std::fs::File>,
+    path: String,
+    len: u64,
+}
+
+impl ColourLog {
+    /// Opens (append, created) the sidecar for `transcript`. A failure is not
+    /// fatal and is not reported: the coloured copy is a convenience for a
+    /// reconnecting browser tab, and a session that cannot write it still
+    /// prints, still logs and still mirrors — it just starts its replay empty.
+    fn open(transcript: &str) -> ColourLog {
+        let path = colour_log_path(transcript);
+        if path.is_empty() {
+            return ColourLog::default();
+        }
+        match std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+        {
+            Ok(f) => {
+                let mut log = ColourLog {
+                    len: f.metadata().map(|m| m.len()).unwrap_or(0),
+                    file: Some(f),
+                    path,
+                };
+                // A sidecar left by an earlier run may already be over the
+                // ceiling; compact it now rather than on the first write.
+                if log.len > COLOUR_TAIL {
+                    log.trim();
+                }
+                log
+            }
+            Err(_) => ColourLog {
+                file: None,
+                path,
+                len: 0,
+            },
+        }
+    }
+
+    fn write(&mut self, text: &str) {
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        if f.write_all(text.as_bytes()).is_err() {
+            return;
+        }
+        let _ = f.flush();
+        self.len += text.len() as u64;
+        if self.len > COLOUR_TAIL {
+            self.trim();
+        }
+    }
+
+    /// Keeps the last [`COLOUR_KEEP`] bytes, cut forward to the next newline.
+    ///
+    /// The cut is what keeps the file *renderable*: a replay that starts
+    /// inside `\x1b[33m` would hand the browser a stray `[33m` to draw as
+    /// text. A line boundary is the finest granularity that is always safe —
+    /// a colour left open across it is fine, a half-written escape is not.
+    fn trim(&mut self) {
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        let data = match std::fs::read(&self.path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if data.is_empty() {
+            self.len = 0;
+            return;
+        }
+        let mut start = (data.len() as u64).saturating_sub(COLOUR_KEEP) as usize;
+        // Never start mid-character: Thai in a transcript is common.
+        while start < data.len() && (data[start] & 0xc0) == 0x80 {
+            start += 1;
+        }
+        // ...and never mid-escape sequence (see above).
+        if let Some(nl) = data[start..].iter().position(|b| *b == b'\n') {
+            start += nl + 1;
+        }
+        let tail = data[start.min(data.len())..].to_vec();
+        // The handle is append-mode, so a write always lands at end-of-file:
+        // cutting the file down first is what puts the tail back at the front.
+        // The sidecar is a convenience copy — nothing is lost if the rewrite
+        // fails part way, and the next write just appends to whatever is left.
+        let ok = f
+            .set_len(0)
+            .and_then(|_| f.write_all(&tail))
+            .and_then(|_| f.flush());
+        self.len = if ok.is_ok() {
+            tail.len() as u64
+        } else {
+            // The file is what it is; re-reading its length keeps the next
+            // trim honest rather than trusting a count that just drifted.
+            std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+        };
+    }
 }
 
 /// `text` wrapped in `color` (and [`COLOR_BOLD`] when `bold`) and reset
@@ -204,6 +375,11 @@ impl std::fmt::Display for RequestStats {
 pub struct UiState {
     /// True once an agent has wired itself in (Go: ContextFn set).
     pub ready: bool,
+    /// Which agent of the roster is working right now ([`crate::team::Team::activate`]).
+    /// Every section header is prefixed with it while it is set, so the
+    /// terminal and the transcript show who is talking; empty means "no
+    /// roster" (a bare `Agent`, as the tests build).
+    pub agent: String,
     // Context-usage inputs (see agent.ContextStatus). The *_tokens fields
     // are script-aware estimates of the text the agent is about to send
     // (agent::estimate_tokens), kept current by the agent, which owns the
@@ -367,11 +543,18 @@ struct WriterInner {
 /// appends the plain-text equivalent to a log file. Every chunk written to
 /// stdout is also handed to the registered [`ConsoleSink`]s, which is how the
 /// web console shows the same output the terminal does.
+///
+/// The bytes handed to stdout are additionally mirrored to a bounded sidecar
+/// (see [`colour_log_path`]) — the coloured copy of the transcript, which is
+/// what lets a browser tab opened after a restart replay the session in the
+/// colours the terminal showed rather than in grey.
 pub struct Writer {
     log: Mutex<std::fs::File>,
     /// The path `log` is currently open on, so `/env reload` can tell whether
     /// a changed JONNYQ_OUTPUT_FILE actually means moving the log.
     log_path: Mutex<String>,
+    /// The coloured mirror of what stdout was sent (see [`ColourLog`]).
+    colour: Mutex<ColourLog>,
     color_out: bool,
     inner: Mutex<WriterInner>,
     pub state: RwLock<UiState>,
@@ -388,6 +571,7 @@ impl Writer {
         Ok(Self {
             log: Mutex::new(f),
             log_path: Mutex::new(output_file.to_string()),
+            colour: Mutex::new(ColourLog::open(output_file)),
             color_out: std::io::stdout().is_terminal(),
             inner: Mutex::new(WriterInner {
                 current: Section::None,
@@ -423,15 +607,30 @@ impl Writer {
     }
 
     /// One chunk to stdout (and to the console sinks), without touching the
-    /// log. The terminal and the browser must see the same bytes, escapes
-    /// included, so everything printed goes through here.
-    fn out(&self, text: &str) {
+    /// plain log. The terminal and the browser must see the same bytes, escapes
+    /// included, so everything printed goes through here — and the sidecar
+    /// records those same bytes, which is the only place the colour of a line
+    /// outlives the run that printed it.
+    pub(crate) fn out(&self, text: &str) {
         if text.is_empty() {
             return;
         }
         print!("{}", text);
         let _ = std::io::stdout().flush();
         self.mirror(text);
+        self.write_colour(text);
+    }
+
+    /// Appends to the colour sidecar. Skipped once [`Writer::close`] has been
+    /// called, exactly as the plain log is, so nothing is written to a session
+    /// that has ended.
+    fn write_colour(&self, text: &str) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut c) = self.colour.lock() {
+            c.write(text);
+        }
     }
 
     pub fn close(&self) {
@@ -452,12 +651,23 @@ impl Writer {
             .open(path)?;
         *self.log.lock().unwrap() = f;
         *self.log_path.lock().unwrap() = path.to_string();
+        // The colour sidecar moves with the log it mirrors, so a `/env reload`
+        // that renames the transcript does not leave the coloured copy being
+        // appended to the old folder. A new sidecar that cannot be opened is
+        // not worth failing the reload over: the log itself did move.
+        *self.colour.lock().unwrap() = ColourLog::open(path);
         Ok(())
     }
 
     /// The transcript log path currently being written to.
     pub fn output_file(&self) -> String {
         self.log_path.lock().unwrap().clone()
+    }
+
+    /// The path of the coloured mirror (see [`colour_log_path`]), whatever log
+    /// is currently open. Empty when no sidecar path could be derived.
+    pub fn colour_file(&self) -> String {
+        self.colour.lock().unwrap().path.clone()
     }
 
     fn write_log(&self, text: &str) {
@@ -514,15 +724,16 @@ impl Writer {
         }
         self.plain("\n");
 
-        let stamped = format!(
-            "{} ({})",
-            label,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-
         let mut ctx_text = String::new();
         let mut ctx_color = COLOR_GRAY;
         let state = self.state.read().unwrap();
+        // The roster prefix: "[joey] Tool call (...)" so a scrolled-back
+        // terminal or transcript shows which agent produced the block. Empty
+        // when no roster owns this UI (a bare Agent, as tests build).
+        let who = match state.agent.trim() {
+            "" => String::new(),
+            name => format!("[{name}] "),
+        };
         if state.ready {
             let cs = state.context_status();
             ctx_text = format!(" | {}", cs);
@@ -536,6 +747,13 @@ impl Writer {
             }
         }
         drop(state);
+
+        let stamped = format!(
+            "{}{} ({})",
+            who,
+            label,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
 
         if self.color_out {
             let mut line = format!("{}{}{}{}", COLOR_BOLD, bright, stamped, COLOR_RESET);
@@ -551,10 +769,39 @@ impl Writer {
         self.inner.lock().unwrap().at_line_start = true;
     }
 
-    /// Resets section tracking so the next output starts a fresh header even
+    /// Resets section tracking so the next section starts a fresh header even
     /// if it's the same kind that ended the previous turn.
     pub fn new_turn(&self) {
         self.inner.lock().unwrap().current = Section::None;
+    }
+
+    /// Announces which agent of the roster is working now: the name every
+    /// section header is prefixed with, and the one the web console and the
+    /// banner show. Called by [`crate::team::Team::activate`].
+    pub fn set_agent(&self, name: &str) {
+        self.state.write().unwrap().agent = name.to_string();
+        // Force the next chunk to open a header, so the new name is visible
+        // even when the previous agent's turn ended in the same section kind.
+        self.new_turn();
+    }
+
+    /// The agent name currently shown in headers (empty when no roster owns
+    /// this writer).
+    pub fn current_agent(&self) -> String {
+        self.state.read().unwrap().agent.clone()
+    }
+
+    /// Prints the "who is working now" banner: the agent's name in its own
+    /// colour, its role, and why it was called (`note`, empty for an ordinary
+    /// turn). Also switches the header prefix to that agent.
+    pub fn banner(&self, name: &str, role: &str, color: &str, note: &str) {
+        self.set_agent(name);
+        let head = if note.trim().is_empty() {
+            format!("=== agent {name} | {role}")
+        } else {
+            format!("=== agent {name} | {role} | {}", note.trim())
+        };
+        self.coloredln(&head, color, true);
     }
 
     pub fn user_prompt(&self, text: &str) {
@@ -690,6 +937,151 @@ mod tests {
         fn log(&self) -> String {
             std::fs::read_to_string(&self.path).unwrap()
         }
+    }
+
+    // -- the colour sidecar -----------------------------------------------
+
+    #[test]
+    fn the_colour_sidecar_sits_beside_the_transcript() {
+        for (log, want) in [
+            (".context/transcript.md", ".context/.transcript.ansi"),
+            ("transcript.md", ".transcript.ansi"),
+            ("/abs/dir/session.log", "/abs/dir/.session.ansi"),
+            // No usable stem: append rather than clobber the log itself.
+            (".env.log/.log", ".env.log/.log.ansi"),
+            ("", ""),
+        ] {
+            assert_eq!(colour_log_path(log), want, "for {log:?}");
+        }
+    }
+
+    /// The sidecar records, byte for byte, what was handed to stdout — which is
+    /// the whole point of it: a colour the terminal was told to show is exactly
+    /// what a later replay has to be able to reproduce. The plain log beside it
+    /// holds the same text with the escapes stripped, because that file is meant
+    /// to be read.
+    ///
+    /// (`out` is the single funnel every printed chunk goes through. Under
+    /// `cargo test` stdout is not a terminal, so `print` emits no escapes — the
+    /// coloured path is exercised by handing `out` the bytes a terminal would
+    /// have been sent, which is what the sidecar is a record of.)
+    #[test]
+    fn the_colour_sidecar_keeps_the_escapes_the_log_drops() {
+        let t = TestWriter::new("sidecar");
+        let colour = t.w.colour_file();
+        assert_eq!(colour, colour_log_path(&t.path));
+        // The plain path: the log and the sidecar agree, because there was no
+        // colour to tell them apart.
+        t.w.print(COLOR_YELLOW, "คำตอบ\n");
+        assert_eq!(t.log(), "คำตอบ\n");
+        assert_eq!(std::fs::read_to_string(&colour).unwrap(), "คำตอบ\n");
+        // The coloured path: what a terminal was sent keeps its SGR codes, and
+        // strip_ansi is what turns that back into the readable line.
+        let on_screen = format!("{}\n", styled("คำตอบที่สอง", COLOR_YELLOW, false));
+        t.w.out(&on_screen);
+        t.w.write_log(&strip_ansi(&on_screen));
+        let side = std::fs::read_to_string(&colour).unwrap();
+        assert_eq!(side, format!("คำตอบ\n{on_screen}"), "{side:?}");
+        assert_eq!(t.log(), "คำตอบ\nคำตอบที่สอง\n");
+        assert_eq!(strip_ansi(&side), t.log());
+    }
+
+    /// A restart re-opens the same sidecar and appends to it, so the colours of
+    /// the session before the restart are still there to be replayed.
+    #[test]
+    fn the_colour_sidecar_survives_a_restart() {
+        let t = TestWriter::new("sidecar-restart");
+        t.w.out("\u{1b}[32mfirst session\u{1b}[0m\n");
+        drop(t);
+        // ...jonnyq exits, is started again against the same log...
+        let path = std::env::temp_dir()
+            .join("jonnyq-ui-test-sidecar-restart")
+            .join("output.txt")
+            .to_string_lossy()
+            .into_owned();
+        let w = Writer::new(&path).unwrap();
+        w.out("\u{1b}[31msecond session\u{1b}[0m\n");
+        let side = std::fs::read_to_string(w.colour_file()).unwrap();
+        assert!(side.contains("\u{1b}[32mfirst session"), "{side:?}");
+        assert!(side.contains("\u{1b}[31msecond session"), "{side:?}");
+    }
+
+    /// The file is bounded, or a long run leaves a megabyte-per-hour pile of
+    /// escape codes next to the transcript. The cut lands on a line break so a
+    /// replay never begins inside an escape sequence, and writing continues
+    /// after the trim.
+    #[test]
+    fn the_colour_sidecar_stays_bounded_and_renderable() {
+        let t = TestWriter::new("sidecar-trim");
+        for i in 0..400 {
+            // One coloured line per write, ~4 KB each: about 1.6 MB through a
+            // file whose ceiling is 1 MB, so the trim fires more than once.
+            t.w.out(&format!("\u{1b}[33m{i} {}\u{1b}[0m\n", "x".repeat(4000)));
+        }
+        let side = std::fs::read(t.w.colour_file()).unwrap();
+        // 1.6 MB went through a file whose ceiling is 1 MB, so the trim has run
+        // more than once: what is left is at most one ceiling's worth.
+        assert!(
+            (side.len() as u64) <= COLOUR_TAIL + 8192,
+            "sidecar grew to {} bytes",
+            side.len()
+        );
+        // Trimmed: the earliest lines are gone, the latest are not.
+        let text = String::from_utf8_lossy(&side).into_owned();
+        assert!(!text.contains("\u{1b}[33m0 x"), "the front was dropped");
+        assert!(text.contains("\u{1b}[33m399 "), "the tail survived");
+        // ...and every line is whole, so no replay starts mid-escape.
+        assert!(
+            !text.starts_with('[') && !text.contains("\n[3"),
+            "the file starts mid-escape sequence: {:?}",
+            &text[..40.min(text.len())]
+        );
+        // Still writable after the trim.
+        t.w.out("\u{1b}[35mafter the trim\u{1b}[0m\n");
+        assert!(std::fs::read_to_string(t.w.colour_file())
+            .unwrap()
+            .ends_with("\u{1b}[35mafter the trim\u{1b}[0m\n"));
+    }
+
+    /// `/env reload` moving the log moves the sidecar with it: the coloured copy
+    /// belongs beside the transcript it mirrors, not in the folder the session
+    /// started in.
+    #[test]
+    fn moving_the_log_moves_the_sidecar() {
+        let t = TestWriter::new("sidecar-move");
+        let dir = std::path::Path::new(&t.path).parent().unwrap();
+        let moved = dir.join("newlog.md").to_string_lossy().into_owned();
+        t.w.out("before the move\n");
+        t.w.set_output_file(&moved).unwrap();
+        t.w.out("\u{1b}[36mafter the move\u{1b}[0m\n");
+        assert_eq!(t.w.colour_file(), colour_log_path(&moved));
+        let side = std::fs::read_to_string(t.w.colour_file()).unwrap();
+        assert!(side.contains("\u{1b}[36mafter the move"), "{side:?}");
+        // The old sidecar keeps what it had; nothing wrote past the move.
+        let old = std::fs::read_to_string(colour_log_path(&t.path)).unwrap();
+        assert_eq!(old, "before the move\n");
+    }
+
+    /// A sidecar that cannot be opened is not a session-ending error, and it
+    /// must not stop the plain log from being written either: the transcript is
+    /// the guarantee, the coloured copy is a convenience.
+    #[test]
+    fn an_unwritable_sidecar_costs_only_the_colour() {
+        let dir = std::env::temp_dir().join("jonnyq-ui-test-sidecar-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("output.txt");
+        // A directory sitting where the sidecar would go: opening it fails, and
+        // the session must notice nothing beyond losing its coloured copy.
+        std::fs::create_dir(dir.join(".output.ansi")).unwrap();
+        let w = Writer::new(log.to_str().unwrap()).unwrap();
+        w.println(COLOR_YELLOW, "still printed");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("still printed"), "{text:?}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "the log never carries escapes: {text:?}"
+        );
     }
 
     // timestamp matches the "(YYYY-MM-DD HH:MM:SS)" suffix start_section

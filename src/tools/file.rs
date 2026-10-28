@@ -1,11 +1,16 @@
 //! read_file / write_file / edit_file / create_folder, all restricted to the
 //! working directory.
 //!
+//! Every write goes through [`crate::tools::context_guard`] first: another
+//! agent's history file is readable by the whole team and writable by none.
+//!
 //! Port of Go `internal/tools/file.go`.
 
 use serde_json::{json, Value};
 
-use super::{bool_arg, guard::resolve_path, string_arg, CallCtx, Tool};
+use super::{
+    bool_arg, context_guard::check_writable, guard::resolve_path, string_arg, CallCtx, Tool,
+};
 use crate::error::{AgentError, R};
 use crate::llm::ToolSpec;
 
@@ -83,6 +88,9 @@ impl Tool for WriteFileTool {
         };
         let content = string_arg(args, "content").unwrap_or("");
         let full = resolve_path(&self.work_dir, p)?;
+        // An agent's history file is jonnyq's to write - read it freely, never
+        // rewrite it (see [`crate::tools::context_guard`]).
+        check_writable(&self.work_dir, p)?;
         if let Some(dir) = full.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -125,6 +133,7 @@ impl Tool for EditFileTool {
         let replace_all = bool_arg(args, "replace_all", false);
 
         let full = resolve_path(&self.work_dir, p)?;
+        check_writable(&self.work_dir, p)?;
         let data = std::fs::read(&full)?;
         let content = String::from_utf8_lossy(&data).into_owned();
         let count = content.matches(old_str).count();
@@ -169,6 +178,8 @@ impl Tool for CreateFolderTool {
             return Err(AgentError::new("path is required"));
         };
         let full = resolve_path(&self.work_dir, p)?;
+        // A folder cannot be created on top of an agent's history file.
+        check_writable(&self.work_dir, p)?;
         std::fs::create_dir_all(&full)?;
         Ok(format!("created folder {}", p))
     }

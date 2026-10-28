@@ -24,6 +24,7 @@ use crate::error::{AgentError, R};
 use crate::input::{self, history, history::History, Draft, Wake};
 use crate::llm;
 use crate::notify::Notifier;
+use crate::team::{AgentName, Team};
 use crate::tools::run_command::RunCommandTool;
 use crate::ui::Writer;
 use crate::watch::{Trigger, Watcher};
@@ -43,11 +44,11 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /think <true|false>               enable or disable model thinking
   /run_command_timeout <seconds>    set the run_command timeout in seconds
   /prompt <file>                    read a prompt from file and send it, as if typed
-  /plan                             generate/reconcile .progress from requirements.md, checked against the codebase (no coding)
-  /plan_for_human                   like /plan, but designed so a person can verify each phase by using the app; sends the how-to-verify guide via ntfy
-  /coding                           work on the next unfinished task in .progress, then stop (Ctrl-C cancels)
-  /coding_phase [<phase number>]    work through the next unfinished phase of .progress (or the given phase) in one run, then stop and notify how to verify it (Ctrl-C cancels)
-  /autocoding                       plan if needed, then work through every task in .progress in one run (Ctrl-C cancels)
+  /plan                             JACKY: generate/reconcile .context/progress.md from requirements.md, checked against the codebase (no coding)
+  /plan_for_human                   JACKY: like /plan, but designed so a person can verify each phase by using the app; sends the how-to-verify guide via ntfy
+  /coding                           JOEY: work on the next unfinished task in .context/progress.md, then stop (Ctrl-C cancels)
+  /coding_phase [<phase number>]    JOEY: work through the next unfinished phase of .context/progress.md (or the given phase) in one run, then stop and notify how to verify it (Ctrl-C cancels)
+  /autocoding                       JOEY: plan if needed, then work through every task in .context/progress.md in one run (Ctrl-C cancels)
   /watchfile [<word>|off]           watch the working directory for a magic word (default "AI!") and act on it when found
   /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: /plan and /coding completion notifications (incl. the /plan_for_human verification guide), error alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
   /proxy [<socks url>|off|auto]     use a SOCKS proxy for every request (model, web_search, web_fetch, ntfy): /proxy socks5h://host:port or /proxy host:port; off = always direct, auto = follow ALL_PROXY/HTTPS_PROXY; no arg shows what is in effect
@@ -56,8 +57,23 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /env [path|off]                   show the dotenv file settings come from; a path (or off) also reloads it
   /env list                         every setting, its value in effect and which layer supplied it
   /env reload [path|off]            re-read the dotenv file and apply the new values to this session
+  /agent <jonny|jacky|joey|joy>     same as the four below, spelled out
+  /jonny                            talk to the main agent (general work, and anything not below)
+  /jacky                            talk to JACKY, the planner: /plan and /plan_for_human
+  /joey                             talk to JOEY, the coder: /coding, /coding_phase, /autocoding
+  /joy                              talk to JOY, the reviewer: tests, checks, and the verdict on a phase
+  /team                             who is on the roster, which one is active, and what each one remembers
+  /verify [on|off]                  whether joy reviews what /plan and /coding produced (default on)
+  /review_rounds [n]                fix/re-review cycles a command may run after joy's findings (default 1)
+  /finish [notes]                   the active agent writes a hand-off summary into the transcript log, then saves every history
   /version                          print the jonnyq version (same figure as -h and the web console)
-  /exit  /bye                       exit jonnyq
+  /exit  /bye                       exit jonnyq (every agent's history is saved)
+
+The agents share the tools, the model and this terminal, but each keeps its own
+conversation in its own history file, so asking JOY to review does not spend
+JOEY's context. A plain prompt goes to whoever was last activated - jonny until
+you say otherwise. Each of them can READ any of those history files (read_file)
+to build on what the others learned; none of them may write, edit or delete one.
 
 Multi-line prompts: end a line with a trailing backslash to continue it on
 the next line, or type """ alone on a line to start a block that runs
@@ -92,6 +108,15 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/proxy",
     "/toolmode",
     "/env",
+    "/agent",
+    "/jonny",
+    "/jacky",
+    "/joey",
+    "/joy",
+    "/team",
+    "/verify",
+    "/review_rounds",
+    "/finish",
     "/version",
     "/exit",
     "/bye",
@@ -104,6 +129,9 @@ pub const SLASH_COMMANDS: &[&str] = &[
 /// while the loop is between turns.
 pub struct Repl {
     pub cfg: Mutex<Config>,
+    /// The roster. `agent` below is `team.jonny`, kept as a field because most
+    /// of the settings commands and the tests address the main agent directly.
+    pub team: Arc<Team>,
     pub agent: Arc<Agent>,
     pub ui: Arc<Writer>,
     pub run_command: Arc<RunCommandTool>,
@@ -148,17 +176,22 @@ pub struct Repl {
 }
 
 impl Repl {
+    /// Takes the finished [`Team`] rather than a single agent: the REPL routes
+    /// each command to the agent that owns it, and `/model`, `/context` and
+    /// friends have to reach all four.
     pub fn new(
         cfg: Config,
-        agent: Arc<Agent>,
+        team: Arc<Team>,
         ui: Arc<Writer>,
         run_command: Arc<RunCommandTool>,
     ) -> Self {
         // Buffered 32, like Go's `make(chan watch.Trigger, 32)`.
         let (trigger_tx, trigger_rx) = mpsc::channel(32);
         let history_size = cfg.history_size;
+        let agent = team.jonny.clone();
         Self {
             cfg: Mutex::new(cfg),
+            team,
             agent,
             ui,
             run_command,
@@ -370,9 +403,10 @@ impl Repl {
                 continue;
             }
 
-            self.run_cancellable(move |ctx| async move {
-                (false, self.agent.run_turn(ctx, &line).await)
-            })
+            let agent = self.team.active();
+            self.run_cancellable(
+                move |ctx| async move { (false, agent.run_turn(ctx, &line).await) },
+            )
             .await;
         }
     }
@@ -455,10 +489,9 @@ so it doesn't fire again.",
             line = t.line,
             text = t.text,
         );
-        self.run_cancellable(
-            move |ctx| async move { (false, self.agent.run_turn(ctx, &prompt).await) },
-        )
-        .await;
+        let agent = self.team.active();
+        self.run_cancellable(move |ctx| async move { (false, agent.run_turn(ctx, &prompt).await) })
+            .await;
     }
 
     /// Runs one prompt typed in the browser console.
@@ -488,10 +521,9 @@ so it doesn't fire again.",
             self.ui.plainln("no model set; type /model <name> first");
             return false;
         }
-        self.run_cancellable(
-            move |ctx| async move { (false, self.agent.run_turn(ctx, &line).await) },
-        )
-        .await;
+        let agent = self.team.active();
+        self.run_cancellable(move |ctx| async move { (false, agent.run_turn(ctx, &line).await) })
+            .await;
         false
     }
 
@@ -564,10 +596,12 @@ so it doesn't fire again.",
         }
     }
 
-    /// Ends the session: stops the watcher and tells any browser console that
-    /// this session is over, so an open tab says so instead of spinning on a
-    /// socket nobody will answer again. Every exit path goes through here.
+    /// Ends the session: saves every agent's history, stops the watcher and
+    /// tells any browser console that this session is over, so an open tab says
+    /// so instead of spinning on a socket nobody will answer again. Every exit
+    /// path goes through here.
     async fn finish<T>(&self, result: R<T>) -> R<T> {
+        self.team.save_contexts(&self.run_command.work_dir);
         self.stop_watcher().await;
         if let Some(web) = self.web().await {
             web.begin_shutdown();
@@ -645,7 +679,7 @@ so it doesn't fire again.",
                     return (false, Ok(()));
                 }
                 self.cfg.lock().await.model = rest.clone();
-                self.agent.set_model(&rest);
+                self.team.set_model(&rest);
                 self.ui.plainln(&format!("model set to {rest}"));
             }
 
@@ -662,7 +696,7 @@ so it doesn't fire again.",
                     return (false, Ok(()));
                 };
                 self.cfg.lock().await.context_size = n;
-                self.agent.set_context_size(n);
+                self.team.set_context_size(n);
                 self.ui.plainln(&format!("context size set to {n}"));
             }
 
@@ -671,11 +705,11 @@ so it doesn't fire again.",
                 // reproduce/inspect compaction without waiting for a long
                 // session to fill up.
                 self.ui.plainln("[compact] summarizing history now...");
-                self.agent.force_compact(cancel.clone()).await;
+                self.team.active().force_compact(cancel.clone()).await;
             }
 
             "/history" => {
-                let report = self.agent.history_report();
+                let report = self.team.active().history_report();
                 self.ui.plainln(report.trim_end());
             }
 
@@ -685,7 +719,7 @@ so it doesn't fire again.",
                     return (false, Ok(()));
                 };
                 self.cfg.lock().await.thinking = b;
-                self.agent.set_thinking(b);
+                self.team.set_thinking(b);
                 self.ui.plainln(&format!("thinking set to {b}"));
             }
 
@@ -721,25 +755,45 @@ so it doesn't fire again.",
                 return (false, self.agent.run_turn(cancel, &text).await);
             }
 
+            // The planning lane is jacky's, the coding lane joey's: the
+            // command names the agent, so each one's context holds only the
+            // kind of work it does.
+            // The planning lane is jacky's, the coding lane joey's: the
+            // command names the agent, so each one's context holds only the
+            // kind of work it does. Each then hands its output to joy for a
+            // review, and her findings come back as another turn - see
+            // [`Team::review_after`].
             "/plan" => {
                 if !self.model_set().await {
                     return (false, Ok(()));
                 }
-                return (false, self.coding().await.plan(&cancel, true).await);
+                return (
+                    false,
+                    self.verified(AgentName::Jacky, "/plan", &cancel, &rest)
+                        .await,
+                );
             }
 
             "/plan_for_human" => {
                 if !self.model_set().await {
                     return (false, Ok(()));
                 }
-                return (false, self.coding().await.plan_for_human(&cancel).await);
+                return (
+                    false,
+                    self.verified(AgentName::Jacky, "/plan_for_human", &cancel, &rest)
+                        .await,
+                );
             }
 
             "/coding" => {
                 if !self.model_set().await {
                     return (false, Ok(()));
                 }
-                return (false, self.coding().await.run_one_task(&cancel).await);
+                return (
+                    false,
+                    self.verified(AgentName::Joey, "/coding", &cancel, &rest)
+                        .await,
+                );
             }
 
             "/coding_phase" => {
@@ -748,7 +802,8 @@ so it doesn't fire again.",
                 }
                 return (
                     false,
-                    self.coding().await.coding_phase(&cancel, &rest).await,
+                    self.verified(AgentName::Joey, "/coding_phase", &cancel, &rest)
+                        .await,
                 );
             }
 
@@ -756,7 +811,41 @@ so it doesn't fire again.",
                 if !self.model_set().await {
                     return (false, Ok(()));
                 }
-                return (false, self.coding().await.auto_run(&cancel).await);
+                return (
+                    false,
+                    self.verified(AgentName::Joey, "/autocoding", &cancel, &rest)
+                        .await,
+                );
+            }
+
+            // `/agent <name>` is the spelled-out form of the four below, and
+            // the only one that can name an agent that does not exist.
+            "/verify" => self.cmd_verify(&rest).await,
+            "/review_rounds" => self.cmd_review_rounds(&rest).await,
+
+            "/agent" => self.cmd_agent(&rest).await,
+            "/jonny" => self.cmd_agent("jonny").await,
+            "/jacky" => self.cmd_agent("jacky").await,
+            // The planner used to be called JACKSON. The old name still works -
+            // for the same agent, with the same history - so a session with the
+            // name in its shell history or its own notes is not broken by the
+            // rename. Deliberately left out of /help and Tab completion: one
+            // name per agent is the point.
+            "/jackson" => {
+                self.ui.meta(
+                    "the planner is JACKY now - same agent, same history (/jackson == /jacky)",
+                );
+                self.cmd_agent("jacky").await
+            }
+            "/joey" => self.cmd_agent("joey").await,
+            "/joy" => self.cmd_agent("joy").await,
+            "/team" => self.cmd_team().await,
+
+            "/finish" => {
+                if !self.model_set().await {
+                    return (false, Ok(()));
+                }
+                return (false, self.cmd_finish(cancel, &rest).await);
             }
 
             "/watchfile" => self.toggle_watch(&rest).await,
@@ -788,21 +877,209 @@ so it doesn't fire again.",
 
     fn rebuild_provider(&self, cfg: &Config) -> R<()> {
         let p = llm::new_provider(&cfg.provider_name, &cfg.provider_url, &cfg.key)?;
-        self.agent.set_provider(p);
+        // One provider per model endpoint: all four agents talk to the same
+        // server, so they all get the rebuilt one.
+        for (_, a) in self.team.all() {
+            a.set_provider(p.clone());
+        }
         Ok(())
     }
 
-    /// A Coding handle for the current config (working directory + ntfy
-    /// target), built fresh per command exactly like Go's
-    /// `coding.Plan(ctx, ..., notify.New(cfg.NtfyURL))`.
-    async fn coding(&self) -> Coding<'static> {
+    /// A Coding handle running on `name`'s conversation (working directory +
+    /// ntfy target are the current config's), built fresh per command exactly
+    /// like Go's `coding.Plan(ctx, ..., notify.New(cfg.NtfyURL))`.
+    ///
+    /// Activating first is what puts the banner on screen and labels the
+    /// headers, and it is why `/coding` no longer spends the planning agent's
+    /// context: jacky's history stays jacky's.
+    async fn coding_for(&self, name: AgentName, note: &str) -> Coding<'static> {
         let ntfy_url = self.cfg.lock().await.ntfy_url.clone();
         Coding::new(
-            self.agent.clone(),
+            self.team.start(name, note),
             self.ui.clone(),
             &self.run_command.work_dir,
             &ntfy_url,
         )
+    }
+
+    /// The command `/plan` and friends run under: their owning agent, announced.
+    async fn coding(&self, name: AgentName, note: &str) -> Coding<'static> {
+        self.coding_for(name, note).await
+    }
+
+    /// Runs the coding command `cmd` on its owning agent and then has joy
+    /// review what it produced, looping her findings back up to
+    /// [`Team::review_rounds`] times.
+    ///
+    /// The checklist file is how the review is named: both lanes write it, so
+    /// joy reads *that* rather than trusting either agent's reply text - which
+    /// is the whole value of her having her own conversation. `arg` is the
+    /// command's own argument (`/coding_phase 3`).
+    async fn verified(
+        &self,
+        name: AgentName,
+        cmd: &str,
+        cancel: &CancellationToken,
+        arg: &str,
+    ) -> R<()> {
+        let what = format!("{cmd} on {}", crate::team::progress_file());
+        let coding = self.coding(name, cmd).await;
+        let work = async move {
+            match (name, cmd) {
+                (_, "/plan") => coding.plan(cancel, true).await,
+                (_, "/plan_for_human") => coding.plan_for_human(cancel).await,
+                (_, "/coding") => coding.run_one_task(cancel).await,
+                (_, "/coding_phase") => coding.coding_phase(cancel, arg).await,
+                _ => coding.auto_run(cancel).await,
+            }
+        };
+        self.team
+            .review_after(cancel, name, &what, work)
+            .await
+            .map(|_| ())
+    }
+
+    /// `/jonny`, `/jacky`, `/joey`, `/joy`: hand the conversation to one
+    /// agent. Plain prompts then go to it until another is named - the roster
+    /// never runs two agents at once.
+    async fn cmd_agent(&self, arg: &str) {
+        let name = match AgentName::parse(arg) {
+            Some(n) => n,
+            None => {
+                self.ui.plainln(&format!(
+                    "unknown agent {arg:?}; try /jonny, /jacky, /joey or /joy (see /team)"
+                ));
+                return;
+            }
+        };
+        let agent = self.team.start(name, "asked for by name");
+        // A resumed agent says how much it remembers, so a fresh session does
+        // not look like a blank one.
+        let n = agent.history.lock().unwrap().len();
+        if n > 0 {
+            self.ui.plainln(&format!(
+                "[{name}] {n} message(s) of history in its context"
+            ));
+        }
+    }
+
+    /// `/verify`: whether joy reviews what the planning and coding commands
+    /// produced. Bare shows the setting; `on`/`off` (or true/false) changes it.
+    async fn cmd_verify(&self, arg: &str) {
+        let arg = arg.trim().to_lowercase();
+        if arg.is_empty() {
+            let on = self.team.verify();
+            self.ui.plainln(&format!(
+                "[verify] joy {} the work of /plan and /coding (usage: /verify on|off)",
+                if on { "reviews" } else { "does NOT review" }
+            ));
+            return;
+        }
+        let Some(on) = parse_go_bool(&arg) else {
+            self.ui.plainln("usage: /verify on|off");
+            return;
+        };
+        self.team.set_verify(on);
+        self.cfg.lock().await.verify = on;
+        self.ui.plainln(&format!(
+            "[verify] {}",
+            if on {
+                "joy reviews /plan and /coding work, and her findings go back for a fix round"
+            } else {
+                "no review - each agent's work stands as it left it"
+            }
+        ));
+    }
+
+    /// `/review_rounds <n>`: how many fix/re-review cycles a command may run.
+    async fn cmd_review_rounds(&self, arg: &str) {
+        if arg.trim().is_empty() {
+            self.ui.plainln(&format!(
+                "[review_rounds] {} round(s) (usage: /review_rounds <0-10>)",
+                self.team.review_rounds()
+            ));
+            return;
+        }
+        let Some(n) = arg
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| (0..=10).contains(n))
+        else {
+            self.ui.plainln("usage: /review_rounds <0-10>");
+            return;
+        };
+        self.team.set_review_rounds(n);
+        self.cfg.lock().await.review_rounds = n;
+        self.ui.plainln(&format!(
+            "[review_rounds] {n} - {} ",
+            if n == 0 {
+                "joy reports her findings without looping them back"
+            } else {
+                "findings go back to the agent, then joy reviews again"
+            }
+        ));
+    }
+
+    /// `/team`: the roster, who is active, and how much each one remembers.
+    async fn cmd_team(&self) {
+        let active = self.team.active_name();
+        self.ui
+            .plainln("Agents - one works at a time, each with its own history:");
+        for (name, agent) in self.team.all() {
+            let msgs = agent.history.lock().unwrap().len();
+            let ctx = agent.ui.state.read().unwrap().context_status();
+            let mark = if name == active { "*" } else { " " };
+            self.ui.plainln(&format!(
+                " {mark} {name:<8} {:<28} {msgs} msg(s), {ctx}",
+                name.role()
+            ));
+            self.ui
+                .plainln(&format!("         {}", agent.context_path()));
+        }
+        self.ui.plainln(&format!(
+            "\nWorking now: {active}. A plain prompt goes to whoever was last activated; \
+/plan is jacky's, /coding* is joey's, whatever is active."
+        ));
+        self.ui.plainln(
+            "Every agent may read any of the context files above (read_file) to use what the \
+others learned; none of them may write, edit or delete one, their own included.",
+        );
+        self.ui.plainln(&format!(
+            "State directory: {}/ (JONNYQ_CONTEXT_DIR, -context-dir)",
+            crate::team::context_dir()
+        ));
+    }
+
+    /// `/finish [notes]`: the active agent writes the session's work up for a
+    /// person to read - what changed, how to run it, what is left - into the
+    /// transcript log, then the roster's histories are saved.
+    async fn cmd_finish(&self, cancel: CancellationToken, notes: &str) -> R<()> {
+        let agent = self.team.active();
+        let name = agent.name();
+        let extra = if notes.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\nThe person adding: {notes}\n")
+        };
+        let prompt = format!(
+            r#"Wrap up. Write a concise hand-off summary of the work done in this session, for a person \
+who will read it instead of the transcript:{extra}
+Cover, in plain language and in the order that matters:
+1. What was asked for, and what is now actually done.
+2. Which files were created or changed, one line each on why.
+3. How to run or verify it (the exact commands), and what you checked yourself.
+4. What is not done, what is known-broken, and the next thing you would do.
+
+Write in the language the person has been writing in. Do not start new work."#
+        );
+        agent.run_turn(cancel, &prompt).await?;
+        self.team.save_contexts(&self.run_command.work_dir);
+        self.ui.plainln(&format!(
+            "[finish] {name} wrote the summary; every agent's history is saved under {}/",
+            crate::team::context_dir()
+        ));
+        Ok(())
     }
 
     /// `/watchfile`: bare (not watching) starts watching with the current
@@ -876,7 +1153,8 @@ so it doesn't fire again.",
             let mut cfg = self.cfg.lock().await;
             cfg.ntfy_url = String::new();
             // ask_user holds the topic (it publishes the question and
-            // subscribes for the answer), so push the change through it.
+            // subscribes for the answer), so push the change through it. The
+            // roster shares one tool registry, so this reaches all four.
             self.agent.tools.configure(&cfg);
             self.ui.plainln("[ntfy] notifications disabled");
             return;
@@ -1102,17 +1380,22 @@ so it doesn't fire again.",
 
         // Live objects first: if a step below fails we would rather have the
         // config disagree with the agent than the reverse.
-        self.agent.set_model(&new_cfg.model);
-        self.agent.set_context_size(new_cfg.context_size);
-        self.agent.set_thinking(new_cfg.thinking);
-        self.agent
+        self.team.set_model(&new_cfg.model);
+        self.team.set_context_size(new_cfg.context_size);
+        self.team.set_thinking(new_cfg.thinking);
+        self.team
             .set_tool_call_mode(ToolCallMode::from_config(&new_cfg.tool_call_mode));
-        self.agent
+        self.team
             .set_max_tool_calls_per_turn(new_cfg.max_tool_calls_per_turn);
-        self.agent.set_skill_paths(new_cfg.skill_paths.clone());
-        self.agent.set_output_file(&new_cfg.output_file);
+        self.team.set_skill_paths(new_cfg.skill_paths.clone());
+        // The state folder first: every progress/history path is derived from
+        // it, and `set_context_dir` is the process-wide copy of it.
+        crate::team::set_context_dir(&new_cfg.context_dir);
+        self.team.set_verify(new_cfg.verify);
+        self.team.set_review_rounds(new_cfg.review_rounds);
+        self.team.set_output_file(&new_cfg.output_file);
         self.agent.tools.configure(&new_cfg);
-        self.agent.configure(&new_cfg);
+        self.team.configure(&new_cfg);
 
         // The provider is rebuilt only when something about it changed, so a
         // reload that touched nothing else doesn't discard a working client.
@@ -1244,10 +1527,231 @@ mod tests {
             ..Default::default()
         };
         TestRepl {
-            repl: Repl::new(cfg, agent, ui, rc),
+            // A one-agent roster: these tests exercise the command layer, and
+            // the main agent is the only one they talk to.
+            repl: Repl::new(cfg, Arc::new(Team::solo(agent)), ui, rc),
             _log: log,
             _dir: dir,
             _env_file: None,
+        }
+    }
+
+    /// A REPL with the real four-agent roster, for the tests that are about
+    /// *which* agent a command runs under. `/coding` on a one-agent roster
+    /// would pass whatever it did.
+    async fn new_test_team() -> TestRepl {
+        let dir = crate::testsupport::TempDir::new("repl-team");
+        let log = crate::testsupport::TestLog::new("repl-team");
+        let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
+        let provider = crate::testsupport::SequenceProvider::new(vec![
+            crate::testsupport::content_step("done"),
+            crate::testsupport::content_step("planned"),
+            crate::testsupport::content_step("worked"),
+            crate::testsupport::content_step("checked"),
+        ]);
+        let mut reg = crate::tools::Registry::new();
+        reg.register(Arc::new(crate::testsupport::EchoTool::new()));
+        let cfg = Config {
+            model: "test-model".into(),
+            output_file: log.file.clone(),
+            ..Default::default()
+        };
+        let team = Arc::new(Team::build(&cfg, provider, &reg, ui.clone()));
+        team.set_work_dir(&dir.str());
+        let rc = Arc::new(RunCommandTool::new(&dir.str(), 5));
+        TestRepl {
+            repl: Repl::new(cfg, team, ui, rc),
+            _log: log,
+            _dir: dir,
+            _env_file: None,
+        }
+    }
+
+    /// `/plan` is jacky's and `/coding` is joey's: the command names the
+    /// agent, and the banner says so before the turn runs.
+    #[tokio::test]
+    async fn the_coding_commands_name_the_agent_that_owns_them() {
+        for (cmd, who) in [
+            ("/plan", "jacky"),
+            ("/plan_for_human", "jacky"),
+            ("/coding", "joey"),
+            ("/coding_phase", "joey"),
+            ("/autocoding", "joey"),
+        ] {
+            let t = new_test_team().await;
+            let (exit, res) = t.repl.handle_slash(CancellationToken::new(), cmd).await;
+            assert!(!exit);
+            // The command may fail for want of a requirements.md - the point
+            // here is who it handed the turn to, which happened first.
+            let _ = res;
+            let text = t.log_contents();
+            assert!(
+                text.contains(&format!("=== agent {who} |")),
+                "{cmd} did not announce {who}: {text}"
+            );
+            assert_eq!(
+                t.repl.team.active_name().key(),
+                who,
+                "{cmd} left a different agent active"
+            );
+        }
+    }
+
+    /// A plain prompt goes to whoever was last activated, and `/joy` switches
+    /// that - without running anybody else.
+    #[tokio::test]
+    async fn naming_an_agent_switches_who_takes_the_next_prompt() {
+        let t = new_test_team().await;
+        assert_eq!(t.repl.team.active_name(), AgentName::Jonny);
+        t.repl
+            .handle_slash(CancellationToken::new(), "/joy")
+            .await
+            .1
+            .unwrap();
+        assert_eq!(t.repl.team.active_name(), AgentName::Joy);
+        assert!(t.log_contents().contains("=== agent joy |"));
+
+        t.repl
+            .handle_slash(CancellationToken::new(), "/jonny")
+            .await
+            .1
+            .unwrap();
+        assert_eq!(t.repl.team.active_name(), AgentName::Jonny);
+    }
+
+    /// `/team` is how a person finds out what is loaded; it must show all four
+    /// and mark the active one.
+    #[tokio::test]
+    async fn team_lists_the_roster_and_marks_the_active_one() {
+        let t = new_test_team().await;
+        t.repl
+            .handle_slash(CancellationToken::new(), "/joey")
+            .await
+            .1
+            .unwrap();
+        t.repl
+            .handle_slash(CancellationToken::new(), "/team")
+            .await
+            .1
+            .unwrap();
+        let text = t.log_contents();
+        for who in ["jonny", "jacky", "joey", "joy"] {
+            assert!(text.contains(who), "{who} missing from /team: {text}");
+        }
+        assert!(text.contains("* joey"), "active agent not marked: {text}");
+        assert!(text.contains("Working now: joey"), "{text}");
+        assert!(text.contains(".context/"), "state dir not shown: {text}");
+        // The roster is shared read-only, and the person is told so.
+        assert!(
+            text.contains("may read any of the context files"),
+            "the sharing rule is missing from /team: {text}"
+        );
+    }
+
+    /// JACKY was JACKSON: the old command still reaches the same agent (and
+    /// says so once), so an old habit or an old note is not a dead end.
+    #[tokio::test]
+    async fn the_planners_old_name_still_works() {
+        let t = new_test_team().await;
+        t.repl
+            .handle_slash(CancellationToken::new(), "/jackson")
+            .await
+            .1
+            .unwrap();
+        assert_eq!(t.repl.team.active_name(), AgentName::Jacky);
+        let text = t.log_contents();
+        assert!(text.contains("=== agent jacky |"), "{text}");
+        assert!(
+            text.contains("JACKY now"),
+            "the rename is not explained: {text}"
+        );
+        // It is a synonym, not a roster entry: /help stays four agents.
+        t.repl.ui.plainln("--- cut ---");
+        let (_exit, res) = t.repl.handle_slash(CancellationToken::new(), "/help").await;
+        res.unwrap();
+        let help = t.log_contents();
+        let help = help.rsplit("--- cut ---").next().unwrap_or(&help);
+        assert!(
+            !help.contains("/jackson"),
+            "the old name is advertised: {help}"
+        );
+        assert!(help.contains("/jacky"), "{help}");
+    }
+
+    /// An unknown agent name is refused rather than silently switching.
+    #[tokio::test]
+    async fn naming_an_unknown_agent_changes_nothing() {
+        let t = new_test_team().await;
+        t.repl
+            .handle_slash(CancellationToken::new(), "/joey")
+            .await
+            .1
+            .unwrap();
+        t.repl.ui.plainln("--- cut ---");
+        t.repl
+            .handle_slash(CancellationToken::new(), "/agent someone-else")
+            .await
+            .1
+            .unwrap();
+        assert_eq!(t.repl.team.active_name(), AgentName::Joey);
+        assert!(
+            t.log_contents().contains("unknown agent \"someone-else\""),
+            "{}",
+            t.log_contents()
+        );
+    }
+
+    /// `/finish` hands the wrap-up to the active agent and then saves every
+    /// history, so the summary and the memory outlive the session.
+    #[tokio::test]
+    async fn finish_runs_on_the_active_agent_and_saves_every_history() {
+        let t = new_test_team().await;
+        t.repl
+            .handle_slash(CancellationToken::new(), "/joey")
+            .await
+            .1
+            .unwrap();
+        let (exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/finish the parser works")
+            .await;
+        assert!(!exit);
+        res.unwrap();
+        let text = t.log_contents();
+        assert!(text.contains("=== agent joey |"), "{text}");
+        assert!(text.contains("[finish] joey wrote the summary"), "{text}");
+        let dir = t.repl.run_command.work_dir.clone();
+        for name in AgentName::ALL {
+            assert!(
+                crate::team::agent_history_path(&dir, name).exists(),
+                "{}'s history was not saved",
+                name.key()
+            );
+        }
+    }
+
+    /// `/model` and `/context` are session settings, not per-agent ones: all
+    /// four must move together, or the next agent runs on a stale window.
+    #[tokio::test]
+    async fn settings_reach_the_whole_roster() {
+        let t = new_test_team().await;
+        t.repl
+            .handle_slash(CancellationToken::new(), "/model new-model")
+            .await
+            .1
+            .unwrap();
+        t.repl
+            .handle_slash(CancellationToken::new(), "/context 40000")
+            .await
+            .1
+            .unwrap();
+        for (name, a) in t.repl.team.all() {
+            assert_eq!(a.model(), "new-model", "{name}");
+            assert_eq!(
+                a.context_size.load(std::sync::atomic::Ordering::SeqCst),
+                40000,
+                "{name}"
+            );
         }
     }
 

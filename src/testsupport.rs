@@ -767,7 +767,7 @@ impl crate::tools::Tool for ScriptedTool {
         _args: &serde_json::Value,
     ) -> crate::error::R<String> {
         let dir = self.work_dir.lock().unwrap().clone();
-        let path = std::path::Path::new(&dir).join(crate::coding::PROGRESS_FILE);
+        let path = std::path::Path::new(&dir).join(crate::coding::progress_file());
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let updated = content.replacen("- [ ]", "- [x]", 1);
         let _ = std::fs::write(&path, &updated);
@@ -861,8 +861,8 @@ fn log_path_for(dir: &TempDir) -> String {
 
 /// Tool-call events for a simulated write_file that overwrites `.progress`.
 pub fn write_progress_step(content: &str) -> Vec<ChatEvent> {
-    let args =
-        serde_json::json!({ "path": crate::coding::PROGRESS_FILE, "content": content }).to_string();
+    let args = serde_json::json!({ "path": crate::coding::progress_file(), "content": content })
+        .to_string();
     vec![
         ChatEvent::ToolCalls {
             tool_calls: vec![crate::llm::ToolCall {
@@ -887,6 +887,21 @@ pub fn content_step_with_usage(text: &str, usage: crate::llm::Usage) -> Vec<Chat
 /// A one-shot text answer.
 pub fn content_step(text: &str) -> Vec<ChatEvent> {
     vec![ChatEvent::Content { delta: text.into() }, done_event()]
+}
+
+/// A one-shot answer from a reasoning model that wrote its conclusion into
+/// the **thinking** channel and left the answer as prose - the shape that made
+/// a review's verdict go missing (see `crate::team::review`).
+pub fn thinking_then_prose_step(thinking: &str, answer: &str) -> Vec<ChatEvent> {
+    vec![
+        ChatEvent::Thinking {
+            delta: thinking.into(),
+        },
+        ChatEvent::Content {
+            delta: answer.into(),
+        },
+        done_event(),
+    ]
 }
 
 pub fn done_event() -> ChatEvent {

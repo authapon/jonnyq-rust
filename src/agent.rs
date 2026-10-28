@@ -159,19 +159,28 @@ and take the extra step when accuracy requires it.\n";
 /// unattended across many turns with no human checking each step, so "looks
 /// right" is not an acceptable bar - the model must have just proven it with
 /// a real, passing command.
-const CODING_MODE_PROMPT: &str = "
+///
+/// A function rather than a constant because it names the task file
+/// (`.context/progress.md` by default, see
+/// [`crate::coding::progress_file()`]), and that path is a setting.
+fn coding_mode_prompt() -> String {
+    let pf = crate::coding::progress_file();
+    format!(
+        "
 === AUTONOMOUS CODING MODE ===
 You are working through a task checklist with no human reviewing each step before it's committed. Follow these rules exactly, without exception:
 
 1. A task is done only when it compiles/builds with no errors AND all relevant automated tests pass AND it actually satisfies the requirement. Writing the code is not enough.
-2. Before changing a task's checkbox from \"- [ ]\" to \"- [x]\" in .progress, you MUST have actually run the real build and test commands for this project via run_command in THIS SAME turn, and seen their real passing output. Never mark a task done based on an earlier turn's results, based on reasoning about what \"should\" work, or without running anything at all.
+2. Before changing a task's checkbox from \"- [ ]\" to \"- [x]\" in {pf}, you MUST have actually run the real build and test commands for this project via run_command in THIS SAME turn, and seen their real passing output. Never mark a task done based on an earlier turn's results, based on reasoning about what \"should\" work, or without running anything at all.
 3. If a verification command fails, fix the underlying problem and re-run it until it genuinely passes before marking the task done. Never mark a task done \"with known issues\" or \"should be fine.\"
 4. If you don't already know how to build or test this project, find out first (check for a Makefile, package.json, go.mod, Cargo.toml, README, CI config, etc.) rather than guessing or skipping verification.
 5. If a task genuinely has nothing to build or test (e.g. a documentation-only change), say so explicitly in your reply instead of silently marking it done with no verification.
 6. Never state or imply a task is verified, working, or tested unless you have real tool output from this turn proving it.
 7. If you notice yourself repeating the same plan or reasoning without taking a new concrete action, stop immediately and call a tool (e.g. run_command, read_file) to make real progress, instead of continuing to reason in text.
-8. ask_user BLOCKS this run until a human replies, which defeats the point of working unattended: decide the most reasonable option yourself, do the work, and record the decision and the assumption you made in your reply (and in .progress) so it can be reviewed afterwards. Ask only when continuing would be destructive or the work cannot proceed at all without the answer.
-";
+8. ask_user BLOCKS this run until a human replies, which defeats the point of working unattended: decide the most reasonable option yourself, do the work, and record the decision and the assumption you made in your reply (and in {pf}) so it can be reviewed afterwards. Ask only when continuing would be destructive or the work cannot proceed at all without the answer.
+"
+    )
+}
 
 /// Compaction tunables (see the `JONNYQ_COMPACT_*` settings). Every field
 /// has a sane default, so a zeroed/unset config still compacts correctly.
@@ -253,9 +262,20 @@ pub struct Agent {
     pub skill_paths: std::sync::RwLock<Vec<String>>,
     pub ui: Arc<Writer>,
 
-    /// The transcript log path (e.g. "output.txt") the terminal UI mirrors
-    /// its output to - purely a runtime log, never project content. When
-    /// set, build_system_message tells the model to disregard it entirely.
+    /// This agent's identity in the roster (see [`crate::team`]). It decides
+    /// the role paragraph of the system message, the name printed in front of
+    /// every section header, and which `.context/<name>.md` file its history
+    /// is persisted to. [`AgentName::Jonny`] is the default so a bare `Agent`
+    /// (a test's, a future subcommand's) behaves exactly as before.
+    pub name: std::sync::Mutex<crate::team::AgentName>,
+
+    /// Where this agent's history is persisted (`<work_dir>/.context/<name>.md`),
+    /// as a string so `/env reload` and a work-dir change can move it. Empty =
+    /// never write a history file (what a bare `Agent` does).
+    pub context_path: std::sync::Mutex<String>,
+
+    /// The transcript log path (e.g. ".context/transcript.md") the terminal UI
+    /// mirrors its output to - purely a runtime log, never project content.
     /// Behind a lock so `/env reload` can point it at another file (the log
     /// handle itself is opened once, at startup, and is not moved).
     pub output_file: std::sync::Mutex<String>,
@@ -299,6 +319,18 @@ pub struct Agent {
     /// running session (see [`Agent::configure`]).
     compact: std::sync::Mutex<CompactTunables>,
 
+    /// The **answer channel of the last `run_turn` only**, thinking excluded:
+    /// the turn's streamed answers joined in order (a turn with tool rounds has
+    /// more than one assistant message). Never read back through older history
+    /// the way the old "most recent non-empty assistant turn in history" lookup
+    /// did - that read *some* turn, not *this* one, which is how a verdict went
+    /// missing while an earlier reply stood in for it. A caller that must act on
+    /// what the model *just said* (joy's verdict, see [`crate::team::review`])
+    /// needs this: with a reasoning model the verdict can sit in the thinking
+    /// channel while the answer opens with prose. `None` = no turn has completed
+    /// since the last [`Agent::reset_history`].
+    pub last_answer: std::sync::Mutex<Option<String>>,
+
     /// The most recently completed run_turn call's aggregated LLM usage and
     /// wall-clock duration. Stale (left over from an earlier turn) if
     /// run_turn hasn't been called since the caller last checked - callers
@@ -338,11 +370,14 @@ impl Agent {
             max_tool_calls_per_turn: AtomicI64::new(max_tool_calls_per_turn),
             tools,
             skill_paths: std::sync::RwLock::new(skill_paths),
+            name: std::sync::Mutex::new(crate::team::AgentName::Jonny),
+            context_path: std::sync::Mutex::new(String::new()),
             output_file: std::sync::Mutex::new(String::new()),
             ui,
             tool_call_mode: std::sync::Mutex::new(ToolCallMode::Native),
             coding_mode: std::sync::atomic::AtomicBool::new(false),
             history: std::sync::Mutex::new(Vec::new()),
+            last_answer: std::sync::Mutex::new(None),
             last_usage: std::sync::Mutex::new(UsageTotals::default()),
             compact_failures: AtomicI64::new(0),
             compact_floor_tokens: AtomicI64::new(0),
@@ -426,6 +461,128 @@ impl Agent {
 
     pub fn set_output_file(&self, path: &str) {
         *self.output_file.lock().unwrap() = path.to_string();
+    }
+
+    /// This agent's identity in the roster.
+    pub fn name(&self) -> crate::team::AgentName {
+        *self.name.lock().unwrap()
+    }
+
+    pub fn set_name(&self, name: crate::team::AgentName) {
+        *self.name.lock().unwrap() = name;
+    }
+
+    /// Where this agent's history is persisted (empty = not persisted).
+    pub fn context_path(&self) -> String {
+        self.context_path.lock().unwrap().clone()
+    }
+
+    pub fn set_context_path(&self, path: &str) {
+        *self.context_path.lock().unwrap() = path.to_string();
+    }
+
+    /// Marks this agent as the one working now: its name goes in front of
+    /// every section header and the shared context readout is re-seeded from
+    /// *this* agent, so the figures describe the conversation about to run
+    /// rather than the one that ran last.
+    ///
+    /// The roster calls this before each turn ([`crate::team::Team::activate`]);
+    /// [`Agent::run_turn`] also does, which keeps a bare `Agent` (no roster,
+    /// as tests build) behaving as it always did.
+    pub fn activate(&self) {
+        let name = self.name();
+        self.ui.set_agent(name.key());
+        // Re-measure this agent's own fixed costs: system message, tool specs
+        // and history differ per agent, and the header readout is shared.
+        let sys = estimate_tokens(&self.build_system_message().content);
+        let specs = if self.tool_call_mode() != ToolCallMode::Prompt {
+            estimate_tokens(&specs_for_estimate(&self.tools.specs()))
+        } else {
+            0
+        };
+        let history = self.history_tokens();
+        let mut s = self.ui.state.write().unwrap();
+        s.ready = true;
+        s.context_total = Self::context_total_for(self.context_size.load(Ordering::SeqCst));
+        s.sys_tokens = sys;
+        s.spec_tokens = specs;
+        s.history_tokens = history;
+        // The provider-reported figure belongs to the agent that produced it;
+        // run_turn refreshes it on the first reply.
+        s.real_prompt_tokens = 0;
+        s.real_base_tokens = 0;
+    }
+
+    /// Prints the "which agent is working now" banner, with `note` as the
+    /// reason it was called (the slash command, or the review handoff).
+    pub fn announce(&self, note: &str) {
+        let name = self.name();
+        self.ui.banner(name.key(), name.role(), name.color(), note);
+    }
+
+    /// Writes this agent's history to `path` as Markdown (see
+    /// [`crate::team::render_history`]). Best-effort: a failed write must
+    /// never fail the turn that just succeeded.
+    pub fn save_context(&self, path: &std::path::Path) -> R<()> {
+        let text = crate::team::render_history(self.name(), &self.history.lock().unwrap());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+
+    /// Sets the compaction tunables directly. Production goes through
+    /// [`Agent::configure`] with a [`Config`]; a test that depends on a
+    /// specific `keep_recent`/`headroom` pins them here so it keeps testing
+    /// what it means even after the shipped defaults move.
+    #[cfg(test)]
+    pub fn set_compact_tunables_for_test(&self, tun: CompactTunables) {
+        *self.compact.lock().unwrap() = tun.normalized();
+    }
+
+    /// Same, to the configured `.context/<name>.md`; no-op when none is set.
+    /// Errors are reported through the UI rather than the turn's result, for
+    /// the same reason: losing the persisted memory is not worth aborting a
+    /// session that is otherwise fine.
+    pub fn save_context_default(&self) {
+        let path = self.context_path();
+        if path.is_empty() {
+            return;
+        }
+        if let Err(e) = self.save_context(std::path::Path::new(&path)) {
+            self.ui
+                .meta(&format!("warning: cannot write {path}: {}", e.message));
+        }
+    }
+
+    /// Reads `path` back into history. Returns false when there is nothing to
+    /// restore (no file, or an unrecognised format) - history is then left
+    /// exactly as it was.
+    ///
+    /// Only user/assistant/system turns come back (see
+    /// [`crate::team::parse_history_file`]), so a restored session continues
+    /// with its conversation but without the tool-call rounds of its last
+    /// turn, which no provider would accept out of context anyway.
+    pub fn load_context(&self, path: &std::path::Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let msgs = crate::team::parse_history_file(&text);
+        if msgs.is_empty() {
+            return false;
+        }
+        let n = msgs.len();
+        *self.history.lock().unwrap() = msgs;
+        self.history_tokens();
+        self.compact_failures.store(0, Ordering::SeqCst);
+        self.compact_floor_tokens.store(0, Ordering::SeqCst);
+        self.ui.meta(&format!(
+            "[{}] restored {n} message(s) of history from {}",
+            self.name().key(),
+            path.display()
+        ));
+        true
     }
 
     pub fn set_tool_call_mode(&self, m: ToolCallMode) {
@@ -528,6 +685,35 @@ impl Agent {
         crate::tools::elide_data_uris(&content).unwrap_or(content)
     }
 
+    /// The answer channel of the most recent completed `run_turn` (`None`
+    /// before the first, and after [`Agent::reset_history`]). See
+    /// [`Agent::last_answer`].
+    pub fn turn_answer(&self) -> Option<String> {
+        self.last_answer.lock().unwrap().clone()
+    }
+
+    /// Records the answer channel of the turn that is ending. Only the *answer*
+    /// is kept: a reasoning model that put its verdict in the thinking channel
+    /// must not have that read back as what it said (see
+    /// [`Agent::last_answer`]), and `answer` here is exactly the text streamed
+    /// to the Answer section.
+    ///
+    /// Called once per assistant message of the turn, so a review that stated
+    /// its verdict in an earlier round - then kept verifying with tools and
+    /// closed with a plain "confirmed" - still reports what it said *this* turn.
+    fn append_turn_answer(&self, answer: &str) {
+        let mut held = self.last_answer.lock().unwrap();
+        match &mut *held {
+            Some(buf) => {
+                if !buf.is_empty() && !answer.is_empty() {
+                    buf.push_str("\n\n");
+                }
+                buf.push_str(answer);
+            }
+            None => *held = Some(answer.to_string()),
+        }
+    }
+
     /// Discards all conversation history, so the next run_turn starts from a
     /// clean slate (just the system message and its own prompt). Used by
     /// /autocoding to keep each task's prompt minimal - the model
@@ -535,6 +721,7 @@ impl Agent {
     /// relying on memory of past turns.
     pub fn reset_history(&self) {
         self.history.lock().unwrap().clear();
+        *self.last_answer.lock().unwrap() = None;
         let mut s = self.ui.state.write().unwrap();
         s.real_prompt_tokens = 0;
         s.real_base_tokens = 0;
@@ -544,23 +731,33 @@ impl Agent {
         self.compact_floor_tokens.store(0, Ordering::SeqCst);
     }
 
-    fn build_system_message(&self) -> Message {
+    pub(crate) fn build_system_message(&self) -> Message {
         let now = chrono::Local::now()
             .format("%Y-%m-%d %H:%M:%S %Z")
             .to_string();
         let mut sb = String::new();
-        sb.push_str("You are jonnyq, a coding agent with tool access. Current date and time: ");
-        sb.push_str(&now);
-        sb.push('\n');
+        let name = self.name();
+        sb.push_str(&format!(
+            "You are {}, one of the four agents of jonnyq, an interactive coding agent with tool \
+access. Current date and time: {}\n",
+            name.key().to_uppercase(),
+            now
+        ));
+        sb.push_str(name.system_prompt());
+        sb.push_str(&format!("{}\n", name.persona()));
+        sb.push_str(&crate::team::roster_note(name));
         sb.push_str(DECISIVE_THINKING_PROMPT);
-        let output_file = self.output_file();
-        if !output_file.is_empty() {
+        sb.push_str(&jonnyq_state_note());
+        let log = self.output_file();
+        if !log.is_empty() && !log.contains(&crate::config::context_dir()) {
             sb.push_str(&format!(
-                "Ignore {} if you come across it in the working directory - it is this program's own runtime \
-transcript log (a mirror of what's printed to the terminal), not part of the project. You never need to read \
-it, inspect it, or take its contents into account for any task.\n",
-                output_file
+                "Ignore {log} if you come across it in the working directory - it is this program's own \
+runtime transcript log (a mirror of what's printed to the terminal), not part of the project. You never \
+need to read, inspect, or take its contents into account for any task.\n"
             ));
+        }
+        if let Some(own) = history_file_note(&self.context_path()) {
+            sb.push_str(&own);
         }
         if self.tool_call_mode() == ToolCallMode::Prompt {
             sb.push_str(&build_prompt_tool_call_section(&self.tools.specs()));
@@ -575,7 +772,7 @@ it, inspect it, or take its contents into account for any task.\n",
             }
         }
         if self.coding_mode() {
-            sb.push_str(CODING_MODE_PROMPT);
+            sb.push_str(&coding_mode_prompt());
         }
         Message {
             role: Role::System,
@@ -643,6 +840,11 @@ it, inspect it, or take its contents into account for any task.\n",
         }
         let start = Instant::now();
         self.ui.new_turn();
+        // The name in front of every header of this turn, and the banner the
+        // user sees which agent is answering. run_turn is the one place that
+        // knows a turn is starting, so a bare Agent (no roster) still labels
+        // its output.
+        self.ui.set_agent(self.name().key());
         let system_msg = self.build_system_message();
         // In prompt mode, deliberately omit tools: sending a native tool spec
         // while also prompting the model to emit text-based calls tends to
@@ -673,6 +875,10 @@ it, inspect it, or take its contents into account for any task.\n",
         if self.should_compact() {
             self.compact(cancel.clone()).await;
         }
+        // A turn that has not ended yet has no answer: clearing here is what
+        // lets a caller tell "this turn said nothing" apart from "some earlier
+        // turn said something" (see [`Agent::last_answer`]).
+        *self.last_answer.lock().unwrap() = None;
         self.push_history(Message {
             role: Role::User,
             content: user_input.to_string(),
@@ -827,10 +1033,11 @@ contains about {} tokens of text - the server is likely dropping the front of th
             if loop_detected {
                 self.ui
                     .meta("[repetitive output detected; response cut short]");
+                let cut = "[cut short: this response started repeating the same reasoning without making progress]";
+                self.append_turn_answer(&assistant_content);
                 self.push_history(Message {
                     role: Role::Assistant,
-                    content: "[cut short: this response started repeating the same reasoning without making progress]"
-                        .into(),
+                    content: cut.into(),
                     ..Default::default()
                 });
                 total_usage = sum_usage(total_usage, round_usage);
@@ -854,6 +1061,7 @@ contains about {} tokens of text - the server is likely dropping the front of th
 
             if pending_calls.is_empty() {
                 self.ui.plainln("");
+                self.append_turn_answer(&assistant_content);
                 self.push_history(Message {
                     role: Role::Assistant,
                     content: assistant_content,
@@ -875,6 +1083,10 @@ contains about {} tokens of text - the server is likely dropping the front of th
                 content: assistant_content,
                 ..Default::default()
             };
+            // This round's answer belongs to the turn's answer too: a review
+            // that stated its verdict here and then kept checking with tools
+            // said it in *this* turn (see [`Agent::last_answer`]).
+            self.append_turn_answer(&assistant_msg.content);
             if self.tool_call_mode() != ToolCallMode::Prompt {
                 // Only attach native tool_calls when we actually asked for
                 // native tool-calling - in prompt mode the raw ```tool block
@@ -989,6 +1201,10 @@ contains about {} tokens of text - the server is likely dropping the front of th
                 lu.usage = sum_usage(lu.usage, extra);
             }
         }
+        // Persist this agent's history to its own .context/<name>.md - after
+        // the final compaction, so the file holds what the next session would
+        // really need rather than a window's worth of already-summarized text.
+        self.save_context_default();
         Ok(())
     }
 
@@ -1634,6 +1850,45 @@ summary ~{} tokens, {} recent messages kept)]",
         self.compact_floor_tokens.store(0, Ordering::SeqCst);
         self.compact(cancel).await;
     }
+}
+
+/// Explains jonnyq's own state directory once, so an agent does not mistake
+/// its bookkeeping for project files. The history files *are* the agents'
+/// memory (a model that "tidies up" the state directory gives itself amnesia),
+/// and `progress.md` is the task list the coding commands maintain - so the
+/// whole directory is off-limits.
+///
+/// The one thing an agent *may* do there is read: the other agents' history
+/// files are shared evidence (see [`crate::team::roster_note`]), which is why
+/// this note says "read-only" rather than "never open" - the tools enforce the
+/// same line, so the prompt and the guard cannot disagree.
+fn jonnyq_state_note() -> String {
+    let dir = crate::config::context_dir();
+    format!(
+        "The {dir}/ folder in the working directory is jonnyq's own state: the four agents' history \
+context (readable, as above), the task checklist ({pf}) with its sidecars, and the terminal \
+transcript log. Read anything in it freely; the only file inside you are expected to write is the \
+checklist, and only when your command says so. Nothing in this folder is a place for project \
+files.\n",
+        pf = crate::coding::progress_file(),
+    )
+}
+
+/// Which history file belongs to *this* agent, phrased for the system message.
+/// Reading it is allowed like any other agent's, but re-reading your own costs
+/// context to say what the conversation already holds; what matters here is
+/// that no agent may write it, its own included.
+fn history_file_note(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Your own conversation history is mirrored to {} by jonnyq. Never write, edit or delete \
+that file: jonnyq owns it, and a hand-edited history file comes back as a false memory (or none) \
+at the next start. Reading it is allowed but pointless for you - it only repeats what this \
+conversation already holds, and it spends your context doing it.\n",
+        path
+    ))
 }
 
 /// Cuts `s` to at most `max_chars` characters, keeping the beginning (70%)
@@ -2510,6 +2765,12 @@ mod tests {
         let responses: Vec<Vec<ChatEvent>> = Vec::new();
         let (agent, _e, _log, provider) = new_test_agent_with_provider(responses);
         agent.set_context_size(512);
+        // Pruning has to have something to drop: the shipped keep_recent
+        // would keep the whole ten-message history verbatim.
+        agent.set_compact_tunables_for_test(CompactTunables {
+            keep_recent: 4,
+            ..CompactTunables::default()
+        });
         for i in 0..10 {
             agent.push_history(Message {
                 role: Role::User,
@@ -2555,6 +2816,10 @@ mod tests {
         ]];
         let (agent, _e, _log) = new_test_agent(responses);
         agent.set_context_size(320);
+        agent.set_compact_tunables_for_test(CompactTunables {
+            keep_recent: 4,
+            ..CompactTunables::default()
+        });
         for i in 0..10 {
             agent.push_history(Message {
                 role: if i % 2 == 0 { Role::User } else { Role::Tool },
@@ -3042,6 +3307,10 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     async fn a_window_too_small_to_summarize_prunes_instead_of_sending() {
         let (agent, _e, log, provider) = new_test_agent_with_provider(Vec::new());
         agent.set_context_size(96); // less than the instruction costs
+        agent.set_compact_tunables_for_test(CompactTunables {
+            keep_recent: 4,
+            ..CompactTunables::default()
+        });
         let original: Vec<Message> = (0..10)
             .map(|i| Message {
                 role: Role::User,
@@ -3118,7 +3387,11 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
     #[tokio::test]
     async fn trigger_counts_the_system_message_and_tool_specs() {
         let (agent, _e, _log) = new_test_agent(Vec::new());
-        agent.set_context_size(1000); // trigger at 600 tokens
+        agent.set_context_size(1000);
+        agent.set_compact_tunables_for_test(CompactTunables {
+            headroom_percent: 60, // trigger at 600 tokens
+            ..CompactTunables::default()
+        });
         agent.ui.state.write().unwrap().sys_tokens = 400;
         agent.ui.state.write().unwrap().spec_tokens = 150;
         agent.push_history(Message {
@@ -3501,7 +3774,13 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             .unwrap();
 
         let text = std::fs::read_to_string(&log.file).unwrap();
-        let re = crate::testsupport::re(r"Answer \([^)]*\) \| ctx ~\d+/1,000 \(~\d+%\) left ~\d+");
+        // [\d,] not \d: the readout groups thousands, and the system prompt -
+        // which carries the roster of all four agents - is free to grow past
+        // the 1,000-token window this test sets. An estimate of "1,067" is
+        // still the estimated readout this asserts on.
+        let re = crate::testsupport::re(
+            r"Answer \([^)]*\) \| ctx ~[\d,]+/1,000 \(~[\d,]+%\) left ~[\d,]+",
+        );
         assert!(
             re.is_match(&text),
             "expected an estimated ctx readout, got: {text}"
@@ -3587,6 +3866,113 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
             s.turn_start.is_none(),
             "turn stats must be unavailable once the turn ends"
         );
+    }
+
+    /// A caller that acts on what the model *just said* (joy's verdict) needs
+    /// the answer of **this** turn and nothing else: a reasoning model that
+    /// wrote its verdict into the thinking channel must not have the previous
+    /// turn's answer read back as its reply.
+    #[tokio::test]
+    async fn turn_answer_is_this_turn_s_answer_and_never_the_previous_one() {
+        let responses = vec![
+            vec![content("APPROVE"), done(5, 1)],
+            // Thinking carries the verdict; the answer is prose without it.
+            vec![
+                ChatEvent::Thinking {
+                    delta: "the build fails, so: NEEDS FIX".into(),
+                },
+                content("I read the files and ran the build."),
+                done(5, 1),
+            ],
+            vec![done(5, 1)], // an answer of nothing at all
+        ];
+        let (agent, _e, _log) = new_test_agent(responses);
+        assert_eq!(agent.turn_answer(), None, "no turn has run yet");
+        agent
+            .run_turn(CancellationToken::new(), "review one")
+            .await
+            .unwrap();
+        assert_eq!(agent.turn_answer().as_deref(), Some("APPROVE"));
+        agent
+            .run_turn(CancellationToken::new(), "review two")
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.turn_answer().as_deref(),
+            Some("I read the files and ran the build."),
+            "the answer, never the thinking"
+        );
+        agent
+            .run_turn(CancellationToken::new(), "review three")
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.turn_answer().as_deref(),
+            Some(""),
+            "a turn that said nothing must report that, not borrow the last one"
+        );
+        agent.reset_history();
+        assert_eq!(agent.turn_answer(), None);
+    }
+
+    /// A review that states its verdict in an early round of the turn, then
+    /// keeps checking with tools and closes with a plain sentence, still said
+    /// the verdict *this* turn - all of the turn's answers count, none of the
+    /// previous turn's.
+    #[tokio::test]
+    async fn turn_answer_collects_every_round_of_its_turn() {
+        let responses = vec![
+            vec![
+                content("NEEDS FIX\n1. the audit pattern misses %e."),
+                ChatEvent::ToolCalls {
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        arguments: r#"{"text":"grep"}"#.into(),
+                    }],
+                },
+                done(5, 1),
+            ],
+            vec![content("Confirmed by the grep above."), done(5, 1)],
+        ];
+        let (agent, _e, _log) = new_test_agent(responses);
+        agent
+            .run_turn(CancellationToken::new(), "review")
+            .await
+            .unwrap();
+        let answer = agent.turn_answer().unwrap();
+        assert!(answer.starts_with("NEEDS FIX"), "{answer}");
+        assert!(answer.contains("Confirmed by the grep"), "{answer}");
+        assert_eq!(
+            crate::team::review::parse_verdict(&answer),
+            crate::team::review::Verdict::NeedsFix(
+                "1. the audit pattern misses %e.\n\nConfirmed by the grep above.".into()
+            )
+        );
+    }
+
+    /// The answer recorded for a turn is the text the Answer section showed,
+    /// so what jonnyq acts on is what the person read.
+    #[tokio::test]
+    async fn turn_answer_is_what_the_answer_section_showed() {
+        let responses = vec![vec![
+            ChatEvent::Content {
+                delta: "NEEDS FIX\n".into(),
+            },
+            ChatEvent::Content {
+                delta: "1. the tests do not run".into(),
+            },
+            done(5, 2),
+        ]];
+        let (agent, _e, log) = new_test_agent(responses);
+        agent
+            .run_turn(CancellationToken::new(), "review")
+            .await
+            .unwrap();
+        let answer = agent.turn_answer().unwrap();
+        assert_eq!(answer, "NEEDS FIX\n1. the tests do not run");
+        let text = std::fs::read_to_string(&log.file).unwrap();
+        assert!(text.contains(&answer), "log: {text}");
     }
 
     /// The provider-side usage of the most recent request must survive into

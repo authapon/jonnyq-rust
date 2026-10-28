@@ -22,24 +22,38 @@
 
 # --- 2) runtime files ที่ jonnyq สร้างเอง -----------------------------------
 
-# transcript log (flag -output / JONNYQ_OUTPUT_FILE, default "output.txt") —
-# ไฟล์ append ข้อความล้วนที่ mirror ทุกอย่างที่พิมพ์ออกจอ ไม่ใช่เนื้อหา project
-# (system prompt กำชับ model ไว้แล้วให้ข้ามไฟล์นี้, /watchfile ก็ข้ามเช่นกัน)
+# state directory ของ jonnyq (flag -context-dir / JONNYQ_CONTEXT_DIR, default
+# ".context") — ทุกอย่างที่ session นี้ผลิตขึ้นรอบตัวงาน ไม่ใช่เนื้อหา project:
+#   <agent>.md        = history ของแต่ละ agent (jonny/jacky/joey/joy) ที่
+#                       ใช้ resume ได้ — เป็นบทสนทนา ไม่ใช่โค้ด
+#   transcript.md     = transcript log (flag -output) append ข้อความล้วนที่ mirror
+#                       ทุกอย่างที่พิมพ์ออกจอ (system prompt กำชับ model ไว้แล้วให้
+#                       ข้ามไฟล์นี้, /watchfile ก็ข้ามเช่นกัน)
+#   progress.hash     = SHA-256 ของ requirements.md ณ ครั้งล่าสุดที่ generate/
+#                       reconcile — machine-local cache
+#   progress.retry    = ตัวนับ retry ของ /coding ข้าม invocation — machine-local
+# ignore *Contents* ของโฟลเดอร์ (/*.context/* ไม่ใช่ /.context/) เพราะ git ไม่
+#ยอม re-include ไฟล์ใต้ไดเรกทอรีที่ถูก ignore ทั้งก้อน — ไม่งั้น !/…/progress.md
+# จะไม่มีผล และ checklist ที่ควร commit จะหลุดจาก git ไปพร้อมกับ history
+# ถ้าโปรเจกต์ไหนต้องการ ignore ทั้งโฟลเดอร์จริง ๆ ให้เปลี่ยนกลับเป็น /.context/
+# แล้วลบบรรทัด !/… ข้างล่างออก
+/.context/*
+# progress.md คือ task checklist ซึ่ง *ควร commit* (เป็นเอกสารของงานและอ่านรู้
+# เรื่องโดยไม่ต้องอ่านโค้ด)
+!/.context/progress.md
+
+# transcript log ที่ตกอยู่=root จากเวอร์ชันก่อน (default เดิมคือ output.txt) หรือ
+# จากการตั้ง -output output.txt — ไฟล์ log ที่ root ยัง ignore เหมือนเดิม
 /output.txt
+# colour sidecar ของ transcript (src/ui.rs → colour_log_path): ไฟล์ที่บันทึกไบต์
+# เดียวกับที่ส่งออก terminal พร้อม escape สี เพื่อให้ reopen/restart แล้ว web
+# console replay กลับมามีสีเหมือนเดิม — อยู่ข้าง transcript เสมอ (ใน .context/
+# ก็ถูก ignore ไปแล้วจาก rule ข้างบน, นี่คือกรณี log ตกอยู่ที่ root)
+/.output.ansi
+/.transcript.ansi
 # ถ้าเปลี่ยนชื่อ log ผ่าน -output (เช่น -output session.log) ให้เพิ่มเอง หรือ
 # uncomment บรรทัดล่างเพื่อ ignore ไฟล์ log ทุกไฟล์ที่ root
 # /*.log
-
-# state ของชุดคำสั่ง /plan /plan_for_human /coding /coding_phase /autocoding
-# (ค่าคงที่ใน src/coding/mod.rs)
-#   .progress.hash  = SHA-256 ของ requirements.md ณ ครั้งล่าสุดที่ generate/
-#                     reconcile — machine-local cache
-#   .progress.retry = ตัวนับ retry ของ /coding ข้าม invocation — machine-local
-/.progress.hash
-/.progress.retry
-# .progress คือ task checklist ซึ่ง *ควร commit* (เป็นเอกสารของงานและอ่านรู้เรื่อง
-# โดยไม่ต้องอ่านโค้ด) — ถ้าโปรเจกต์ไหนต้องการ ignore ด้วย ให้ถอด # หน้าออก
-# /.progress
 
 # cache ของ read_pdf: หน้า PDF ที่ถูก render เป็น PNG ด้วย pdftoppm เมื่อ PDF ไม่มี
 # text ให้ extract (src/tools/pdf.rs → .jonnyq/pdf_pages/<stem>/page-*.png)

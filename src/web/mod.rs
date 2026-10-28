@@ -102,11 +102,12 @@ pub const PROMPT_QUEUE_LIMIT: usize = 32;
 /// is ANSI-stripped on purpose and cannot give a reconnecting tab its colours.
 pub const REPLAY_TAIL: usize = 256 * 1024;
 
-/// What part of that window the log seeding (see [`log_tail`]) may take. The
-/// log is colourless, so it gets the smaller half: letting a 256 KB transcript
-/// fill the buffer would mean the first chunk of real output after startup
-/// evicts all of it, and the older half of the session would vanish from a
-/// reloaded tab precisely when there is new, coloured output to show.
+/// What part of that window the startup seeding (see [`seed_tail`]) may take.
+/// The seeded text is dropped from the buffer in one piece — the trim works on
+/// whole chunks and the seed is a single chunk — so giving it the whole window
+/// would mean the first chunk of output of the new session evicts all of the
+/// old one. Half of it keeps a session's worth of earlier transcript on screen
+/// *and* leaves room for the one now running.
 pub const SEED_TAIL: usize = REPLAY_TAIL / 2;
 
 /// How often the session line (`model | ctx … | mode`) is re-asked of the agent
@@ -133,24 +134,43 @@ pub type StatusFn = Arc<dyn Fn() -> String + Send + Sync>;
 /// group killed, `ask_user` withdrawn, `[cancelled]` printed, session alive).
 pub type StopFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// The tail of the transcript log, for seeding the console's replay buffer (see
+/// The tail of a file, for seeding the console's replay buffer (see
 /// [`WebConsole::bind`]).
 ///
-/// The log is ANSI-stripped — that is what makes it a readable file — so this
-/// can only ever be the *opening* of a replay: the colour of anything printed
-/// while jonnyq is running comes from [`Replay`], which records what the
-/// terminal was actually sent. That is also why it is capped at [`SEED_TAIL`]
-/// rather than the whole window: it is the oldest and the colourless part, so it
-/// is the first thing the buffer gives up as new, coloured output arrives.
-fn log_tail(path: &str) -> Option<String> {
+/// Two files can seed it and they are not equal:
+///
+/// * the **colour sidecar** (see [`crate::ui::colour_log_path`]) holds the bytes
+///   the terminal was sent, escapes included, so it is what a restarted jonnyq
+///   must seed from — that is the only way an earlier session comes back in the
+///   colours it was shown in rather than in grey;
+/// * the **transcript log** is ANSI-stripped, which is what makes it a readable
+///   file and what makes it useless for colour. It is the fallback for a session
+///   whose sidecar does not exist yet (an older jonnyq wrote the transcript, or
+///   the sidecar could not be opened): text without colour still beats a blank
+///   console.
+///
+/// The cut moves forward to the next line break, so the seed never begins
+/// inside an escape sequence (a stray `[33m` would be drawn as text) or inside a
+/// multi-byte character (Thai in a transcript is common).
+fn seed_tail(path: &str) -> Option<String> {
     let data = std::fs::read(path).ok()?;
     if data.is_empty() {
         return None;
     }
     let mut start = data.len().saturating_sub(SEED_TAIL);
-    // Never start mid-character: Thai in a transcript is common.
-    while start < data.len() && (data[start] & 0xc0) == 0x80 {
-        start += 1;
+    // A file that fits in the window is replayed whole — cutting forward to a
+    // line break would throw away its opening lines for no reason.
+    if start > 0 {
+        // Never start mid-character: Thai in a transcript is common.
+        while start < data.len() && (data[start] & 0xc0) == 0x80 {
+            start += 1;
+        }
+        // ...and prefer a line break, so the seed cannot begin inside an escape
+        // sequence (a stray "[33m" would be drawn as text). A window with no
+        // line break at all is not worth an empty console: keep it.
+        if let Some(nl) = data[start..].iter().position(|b| *b == b'\n') {
+            start += nl + 1;
+        }
     }
     let mut s = String::from_utf8_lossy(&data[start..]).into_owned();
     if start > 0 {
@@ -159,7 +179,22 @@ fn log_tail(path: &str) -> Option<String> {
             "[... the transcript before this point is in the log file ...]\n",
         );
     }
+    if s.is_empty() {
+        return None;
+    }
     Some(s)
+}
+
+/// The seed a console starts with: the coloured mirror if this folder has one,
+/// otherwise the plain transcript. See [`seed_tail`].
+fn replay_seed(ui: &Writer) -> Option<String> {
+    let colour = ui.colour_file();
+    if !colour.is_empty() {
+        if let Some(seed) = seed_tail(&colour) {
+            return Some(seed);
+        }
+    }
+    seed_tail(&ui.output_file())
 }
 
 /// What a reconnecting tab is replayed.
@@ -339,13 +374,15 @@ impl WebConsole {
             AgentError::new(format!("cannot listen on {}:{}: {}", BIND_HOST, port, e))
         })?;
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(PROMPT_QUEUE_LIMIT);
-        // Seed the replay from the log so a tab opened on a session that has
+        // Seed the replay from the previous session's coloured mirror (falling
+        // back to the plain transcript) so a tab opened on a session that has
         // been running since before the browser existed — or on a jonnyq that
-        // was restarted — still opens onto the conversation rather than onto a
-        // blank console. Everything printed from here on is recorded as the
-        // terminal received it, escapes included, so it is the coloured copy.
+        // was restarted — opens onto the conversation *in the colours the
+        // terminal showed it in*, rather than onto a blank console or a grey
+        // one. Everything printed from here on is recorded as the terminal
+        // received it, escapes included.
         let mut replay = Replay::default();
-        if let Some(tail) = log_tail(&ui.output_file()) {
+        if let Some(tail) = replay_seed(&ui) {
             replay.push(&tail);
         }
         let terms = match shell {
@@ -3255,6 +3292,67 @@ Sec-Fetch-Site: {site}\r\n\r\n"
             tail.contains("answered before the browser existed"),
             "{tail:?}"
         );
+        assert!(tail.contains("\u{1b}[32m"), "{tail:?}");
+    }
+
+    /// The reported bug, across a *restart*: quit jonnyq, start it again, open
+    /// the page — and the earlier conversation came back grey, because the only
+    /// thing the new process had to read was the ANSI-stripped transcript.
+    ///
+    /// The coloured sidecar (`crate::ui::colour_log_path`) is what closes it. It
+    /// is written by the previous run, so this test is two `Writer`s over the
+    /// same log path, exactly as two jonnyq processes would be.
+    #[test]
+    fn a_restarted_jonnyq_replays_the_earlier_session_in_colour() {
+        use crate::ui::{styled, COLOR_BOLD, COLOR_YELLOW};
+        let log = crate::testsupport::TestLog::new("web-restart-seed");
+        // --- session one: prints, in colour, then exits ---
+        {
+            let ui = Arc::new(Writer::new(&log.file).unwrap());
+            ui.out(&format!(
+                "{}\n",
+                styled("Answer (2026-10-28 16:00:00)", COLOR_BOLD, true)
+            ));
+            ui.out(&format!("{}\n", styled("สวัสดีครับ", COLOR_YELLOW, false)));
+        }
+        // --- session two: a fresh Writer, a fresh console, nothing printed yet ---
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let web = WebConsole::bind(free_port(), ".", ui, Arc::new(String::new)).unwrap();
+        let tail = web
+            .replay_tail()
+            .expect("the earlier session must be replayed");
+        assert!(tail.contains("สวัสดีครับ"), "the text: {tail:?}");
+        assert!(
+            tail.contains("\u{1b}[33m") && tail.contains("\u{1b}[1m"),
+            "and the escapes the page turns into gruvbox colours: {tail:?}"
+        );
+        // Once, not twice: the seed comes from the sidecar *or* the log, never
+        // both, or a reloaded tab shows the conversation doubled.
+        assert_eq!(tail.matches("สวัสดีครับ").count(), 1, "{tail:?}");
+    }
+
+    /// A session started by an older jonnyq has a transcript and no sidecar.
+    /// Text without colour still beats a blank console, so the plain log is the
+    /// fallback — and the new session's own output is coloured from here on.
+    #[test]
+    fn a_session_without_a_sidecar_falls_back_to_the_plain_transcript() {
+        let log = crate::testsupport::TestLog::new("web-seed-no-sidecar");
+        std::fs::write(&log.file, "answered by an older jonnyq\n").unwrap();
+        let ui = Arc::new(Writer::new(&log.file).unwrap());
+        let web = WebConsole::bind(free_port(), ".", ui.clone(), Arc::new(String::new)).unwrap();
+        let tail = web.replay_tail().expect("the fallback seed");
+        assert!(tail.contains("answered by an older jonnyq"), "{tail:?}");
+        // No colour in the seeded text — only the closing reset the replay
+        // always appends, so the live line after it inherits nothing.
+        assert!(!tail.contains("\u{1b}[3"), "nothing coloured yet: {tail:?}");
+        // The sidecar this session *does* write starts from now, and the replay
+        // keeps both halves. Printed through the Writer, as a real turn does:
+        // that is the path that both mirrors to the tabs and records the bytes.
+        ui.out("\u{1b}[32mthe new output\u{1b}[0m\n");
+        let side = std::fs::read_to_string(ui.colour_file()).unwrap();
+        assert_eq!(side, "\u{1b}[32mthe new output\u{1b}[0m\n");
+        let tail = web.replay_tail().unwrap();
+        assert!(tail.contains("answered by an older jonnyq"), "{tail:?}");
         assert!(tail.contains("\u{1b}[32m"), "{tail:?}");
     }
 

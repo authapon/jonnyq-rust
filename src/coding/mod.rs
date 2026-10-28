@@ -26,15 +26,25 @@ use crate::notify::Notifier;
 use crate::ui::Writer;
 
 pub const REQUIREMENTS_FILE: &str = "requirements.md";
-pub const PROGRESS_FILE: &str = ".progress";
-/// Records the requirements.md content hash as of the last time .progress
+/// The task checklist: `<state dir>/progress.md` (`.context/progress.md` by
+/// default). A function, not a constant, because the state directory is a
+/// setting (`-context-dir` / `JONNYQ_CONTEXT_DIR`) - and every prompt quotes
+/// the path, so prompts and real paths must be derived from the same source.
+pub fn progress_file() -> String {
+    crate::config::progress_file()
+}
+/// Records the requirements.md content hash as of the last time the checklist
 /// was generated or reconciled, so a later /plan can tell whether
 /// requirements.md changed since and needs reconciling.
-pub const HASH_FILE: &str = ".progress.hash";
+pub fn hash_file() -> String {
+    crate::config::progress_hash_file()
+}
 /// Persists how many consecutive /coding invocations have picked the same
 /// still-unfinished task, since (unlike /autocoding) /coding runs one task
 /// per invocation with no in-memory loop to track it across calls.
-pub const RETRY_FILE: &str = ".progress.retry";
+pub fn retry_file() -> String {
+    crate::config::progress_retry_file()
+}
 /// Aborts once the same task stays unchecked after this many consecutive
 /// attempts, so a genuinely stuck task surfaces to the user instead of being
 /// retried forever unnoticed.
@@ -62,7 +72,7 @@ pub fn progress_language_rule() -> String {
     format!(
         "Write task descriptions in {} in English, even if {} is written in another language. \
 Only keep names, labels, or short quoted terms from {} in their original language where useful for reference.",
-        PROGRESS_FILE, REQUIREMENTS_FILE, REQUIREMENTS_FILE
+        progress_file(), REQUIREMENTS_FILE, REQUIREMENTS_FILE
     )
 }
 
@@ -312,7 +322,7 @@ thing (REQ-012)\" - only when such IDs actually appear in {}, never invent them.
 covering any missing project scaffolding/toolchain setup, and a final phase with a task that verifies the \
 whole thing end-to-end. {} \
 Do not implement anything yet - only produce the task list.",
-        REQUIREMENTS_FILE, PROGRESS_FILE, PROGRESS_FILE, REQUIREMENTS_FILE, REQUIREMENTS_FILE,
+        REQUIREMENTS_FILE, progress_file(), progress_file(), REQUIREMENTS_FILE, REQUIREMENTS_FILE,
         progress_language_rule()
     )
 }
@@ -330,7 +340,7 @@ fit, adding a new phase heading only if genuinely new work doesn't fit any exist
 blockquote notes (lines starting with \"> \", e.g. \"> How to run:\" or \"> Human check:\") - they are \
 notes for a human reviewer, not tasks. {} \
 Do not implement anything yet - only update the task list.",
-        REQUIREMENTS_FILE, PROGRESS_FILE, PROGRESS_FILE, REQUIREMENTS_FILE, PROGRESS_FILE,
+        REQUIREMENTS_FILE, progress_file(), progress_file(), REQUIREMENTS_FILE, progress_file(),
         progress_language_rule()
     )
 }
@@ -348,7 +358,7 @@ write_file on {} at all - describing the change in your reply, or printing succe
 run_command (e.g. echo), does not change the file and does not count as finishing the task. This time, \
 after you've genuinely verified it, you MUST make a real edit_file (preferred) or write_file tool call \
 that changes this task's checkbox in {} from \"- [ ]\" to \"- [x]\".\n\n",
-            stall, PROGRESS_FILE, PROGRESS_FILE
+            stall, progress_file(), progress_file()
         )
     } else if stall > 0 {
         // The same task came back unchecked after a previous attempt that
@@ -363,7 +373,7 @@ now. Do not assume you already finished it, even if it looks familiar - re-check
 and your implementation files to see their real current state, figure out concretely why the checkbox didn't \
 end up set (a common cause: edit_file's old_string must match the line in {} exactly, or a prior write_file \
 rewrote {} from a stale in-memory copy and clobbered the change), and fix it for real this time.\n\n",
-            stall, PROGRESS_FILE, PROGRESS_FILE, PROGRESS_FILE, PROGRESS_FILE
+            stall, progress_file(), progress_file(), progress_file(), progress_file()
         )
     } else {
         String::new()
@@ -380,7 +390,7 @@ pass in this turn, actually call edit_file or write_file to change this task's c
 task unfinished. If the task has nothing to build or test (e.g. documentation only), say so explicitly instead \
 of marking it done without verification. If you discover the task needs to be split into smaller steps, edit {} \
 to reflect that instead of marking it done.",
-        retry_note, REQUIREMENTS_FILE, task_text, PROGRESS_FILE, PROGRESS_FILE, PROGRESS_FILE
+        retry_note, REQUIREMENTS_FILE, task_text, progress_file(), progress_file(), progress_file()
     )
 }
 
@@ -447,8 +457,8 @@ impl<'a> Coding<'a> {
             )));
         };
         let current_hash = file_hash(&req_data);
-        let prog_path = self.path(PROGRESS_FILE);
-        let hash_path = self.path(HASH_FILE);
+        let prog_path = self.path(&progress_file());
+        let hash_path = self.path(&hash_file());
 
         let _mode_guard = CodingModeGuard::on(&self.agent);
         // Whether any model turn happened, so a notification reports real
@@ -464,7 +474,8 @@ impl<'a> Coding<'a> {
         let outcome: R<String> = if !prog_path.exists() {
             self.ui.plainln(&format!(
                 "[plan] no {} found, generating task list from {}",
-                PROGRESS_FILE, REQUIREMENTS_FILE
+                progress_file(),
+                REQUIREMENTS_FILE
             ));
             let prompt = if human {
                 human::build_generate_for_human_prompt()
@@ -474,13 +485,14 @@ impl<'a> Coding<'a> {
             if let Err(e) = run_turn!(prompt) {
                 return Err(AgentError::new(format!(
                     "generating {}: {}",
-                    PROGRESS_FILE, e.message
+                    progress_file(),
+                    e.message
                 )));
             }
             let Ok(_tasks) = parse_progress(&prog_path) else {
                 return Err(AgentError::new(format!(
                     "model did not create {}",
-                    PROGRESS_FILE
+                    progress_file()
                 )));
             };
             write_stored_hash(&hash_path, &current_hash)
@@ -489,12 +501,13 @@ impl<'a> Coding<'a> {
             if human && !human_guide_present(&prog_path) {
                 self.ui.plainln(&format!(
                     "[plan_for_human] adding human verification notes to {}",
-                    PROGRESS_FILE
+                    progress_file()
                 ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
-                        PROGRESS_FILE, e.message
+                        progress_file(),
+                        e.message
                     )));
                 }
                 if !human_guide_present(&prog_path) {
@@ -504,7 +517,7 @@ impl<'a> Coding<'a> {
             let tasks = parse_progress(&prog_path).unwrap_or_default();
             Ok(format!(
                 "Generated {} from {}: {}.{}",
-                PROGRESS_FILE,
+                progress_file(),
                 REQUIREMENTS_FILE,
                 progress_summary_line_local(&tasks),
                 warn
@@ -513,25 +526,28 @@ impl<'a> Coding<'a> {
             if !human {
                 self.ui.plainln(&format!(
                     "[plan] {} is already up to date with {}",
-                    PROGRESS_FILE, REQUIREMENTS_FILE
+                    progress_file(),
+                    REQUIREMENTS_FILE
                 ));
                 return Ok(()); // no notification
             }
             self.ui.plainln(&format!(
                 "[plan_for_human] {} is already up to date with {}",
-                PROGRESS_FILE, REQUIREMENTS_FILE
+                progress_file(),
+                REQUIREMENTS_FILE
             ));
             let had_guide = human_guide_present(&prog_path);
             let mut warn = String::new();
             if !had_guide {
                 self.ui.plainln(&format!(
                     "[plan_for_human] adding human verification notes to {}",
-                    PROGRESS_FILE
+                    progress_file()
                 ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
-                        PROGRESS_FILE, e.message
+                        progress_file(),
+                        e.message
                     )));
                 }
                 if !human_guide_present(&prog_path) {
@@ -547,7 +563,7 @@ impl<'a> Coding<'a> {
             Ok(format!(
                 "{} {}: {}.{}",
                 what,
-                PROGRESS_FILE,
+                progress_file(),
                 progress_summary_line_local(&tasks),
                 warn
             ))
@@ -555,7 +571,8 @@ impl<'a> Coding<'a> {
             let tasks_before = parse_progress(&prog_path).unwrap_or_default();
             self.ui.plainln(&format!(
                 "[plan] {} changed since {} was last updated; reconciling",
-                REQUIREMENTS_FILE, PROGRESS_FILE
+                REQUIREMENTS_FILE,
+                progress_file()
             ));
             let prompt = if human {
                 human::build_reconcile_for_human_prompt()
@@ -565,7 +582,8 @@ impl<'a> Coding<'a> {
             if let Err(e) = run_turn!(prompt) {
                 return Err(AgentError::new(format!(
                     "reconciling {}: {}",
-                    PROGRESS_FILE, e.message
+                    progress_file(),
+                    e.message
                 )));
             }
             write_stored_hash(&hash_path, &current_hash)
@@ -574,12 +592,13 @@ impl<'a> Coding<'a> {
             if human && !human_guide_present(&prog_path) {
                 self.ui.plainln(&format!(
                     "[plan_for_human] adding human verification notes to {}",
-                    PROGRESS_FILE
+                    progress_file()
                 ));
                 if let Err(e) = run_turn!(human::build_add_checks_prompt()) {
                     return Err(AgentError::new(format!(
                         "adding human verification notes to {}: {}",
-                        PROGRESS_FILE, e.message
+                        progress_file(),
+                        e.message
                     )));
                 }
                 if !human_guide_present(&prog_path) {
@@ -589,7 +608,7 @@ impl<'a> Coding<'a> {
             let tasks_after = parse_progress(&prog_path).unwrap_or_default();
             Ok(format!(
                 "Reconciled {} against {}: {} tasks total (was {}), {}.{}",
-                PROGRESS_FILE,
+                progress_file(),
                 REQUIREMENTS_FILE,
                 tasks_after.len(),
                 tasks_before.len(),
@@ -666,20 +685,21 @@ impl<'a> Coding<'a> {
         n: &Notifier,
         start: Instant,
     ) -> R<()> {
-        let prog_path = self.path(PROGRESS_FILE);
+        let prog_path = self.path(&progress_file());
         if !prog_path.exists() {
             return Err(AgentError::new(format!(
                 "{} not found; run /plan first to generate it from {}",
-                PROGRESS_FILE, REQUIREMENTS_FILE
+                progress_file(),
+                REQUIREMENTS_FILE
             )));
         }
 
         let tasks = parse_progress(&prog_path)
-            .map_err(|e| AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message)))?;
+            .map_err(|e| AgentError::new(format!("reading {}: {}", progress_file(), e.message)))?;
         let Some(next) = first_unfinished(&tasks) else {
             self.ui.plainln(&format!(
                 "[coding] all tasks in {} are checked off",
-                PROGRESS_FILE
+                progress_file()
             ));
             let mut summary = format!(
                 "All tasks already complete: {}",
@@ -705,7 +725,7 @@ impl<'a> Coding<'a> {
             return Ok(());
         };
 
-        let retry_path = self.path(RETRY_FILE);
+        let retry_path = self.path(&retry_file());
         let prev = load_retry_state(&retry_path);
         let mut stall = 0;
         let mut prev_untouched = false;
@@ -731,7 +751,7 @@ impl<'a> Coding<'a> {
         turn.map_err(|e| AgentError::new(format!("working on {:?}: {}", next.text, e.message)))?;
 
         let tasks_after = parse_progress(&prog_path)
-            .map_err(|e| AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message)))?;
+            .map_err(|e| AgentError::new(format!("reading {}: {}", progress_file(), e.message)))?;
         if let Some(next_after) = first_unfinished(&tasks_after) {
             if next_after.text == next.text {
                 let new_count = stall + 1;
@@ -741,12 +761,12 @@ impl<'a> Coding<'a> {
                         "Task {:?} made no progress after {} attempts; check {} and requirements.md manually. {}",
                         next.text,
                         MAX_STALL_ROUNDS,
-                        PROGRESS_FILE,
+                        progress_file(),
                         progress_summary_line_local(&tasks_after)
                     );
                     let stall_err = AgentError::new(format!(
                         "task {:?} made no progress after {} attempts via /coding; check {} and requirements.md manually",
-                        next.text, MAX_STALL_ROUNDS, PROGRESS_FILE
+                        next.text, MAX_STALL_ROUNDS, progress_file()
                     ));
                     if n.enabled() {
                         let msg = format!(
@@ -864,13 +884,13 @@ impl<'a> Coding<'a> {
     ) -> R<()> {
         self.plan(cancel, false).await?;
 
-        let prog_path = self.path(PROGRESS_FILE);
+        let prog_path = self.path(&progress_file());
 
         let _mode_guard = CodingModeGuard::on(&self.agent);
         let loop_res = self
             .run_task_loop(cancel, "autocoding", &|c: &Coding, _p: &Path| {
-                let tasks = parse_progress(&c.path(PROGRESS_FILE)).map_err(|e| {
-                    AgentError::new(format!("reading {}: {}", PROGRESS_FILE, e.message))
+                let tasks = parse_progress(&c.path(&progress_file())).map_err(|e| {
+                    AgentError::new(format!("reading {}: {}", progress_file(), e.message))
                 })?;
                 let next = first_unfinished(&tasks);
                 Ok((tasks, next))
@@ -881,7 +901,7 @@ impl<'a> Coding<'a> {
         let tasks = parse_progress(&prog_path).unwrap_or_default();
         self.ui.plainln(&format!(
             "[autocoding] all tasks in {} are checked off",
-            PROGRESS_FILE
+            progress_file()
         ));
         let mut summary = format!(
             "All tasks complete: {}",
@@ -921,7 +941,7 @@ impl<'a> Coding<'a> {
         label: &str,
         pick: &(dyn Fn(&Coding, &Path) -> R<(Vec<Task>, Option<Task>)> + Send + Sync),
     ) -> R<(bool, ())> {
-        let prog_path = self.path(PROGRESS_FILE);
+        let prog_path = self.path(&progress_file());
 
         let mut ran_turn = false;
         let mut last_text = String::new();
@@ -955,7 +975,7 @@ impl<'a> Coding<'a> {
                 if no_progress_rounds >= MAX_NO_PROGRESS_ROUNDS {
                     return Err(AgentError::new(format!(
                         "no task in {} has been completed in the last {} rounds (currently on {:?}); aborting - check {} and requirements.md manually",
-                        PROGRESS_FILE, MAX_NO_PROGRESS_ROUNDS, next.text, PROGRESS_FILE
+                        progress_file(), MAX_NO_PROGRESS_ROUNDS, next.text, progress_file()
                     )));
                 }
             }
@@ -965,7 +985,7 @@ impl<'a> Coding<'a> {
                 if stall >= MAX_STALL_ROUNDS {
                     return Err(AgentError::new(format!(
                         "task {:?} made no progress after {} attempts; check {} and requirements.md manually",
-                        next.text, MAX_STALL_ROUNDS, PROGRESS_FILE
+                        next.text, MAX_STALL_ROUNDS, progress_file()
                     )));
                 }
             } else {

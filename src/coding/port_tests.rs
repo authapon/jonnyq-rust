@@ -44,9 +44,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(provider.call_count(), 2, "expected toolcall + final answer");
-        assert_eq!(e.dir.read(PROGRESS_FILE), ONE_TASK);
+        assert_eq!(e.dir.read(&progress_file()), ONE_TASK);
         assert_eq!(
-            e.dir.read(HASH_FILE).len(),
+            e.dir.read(&hash_file()).len(),
             64,
             "sha256 hex of requirements"
         );
@@ -80,9 +80,9 @@ mod tests {
     async fn plan_skips_when_requirements_unchanged() {
         let (e, provider) = env("plan-skip", Vec::new());
         e.dir.write(REQUIREMENTS_FILE, "build a thing");
-        e.dir.write(PROGRESS_FILE, DONE_TASK);
+        e.dir.write(&progress_file(), DONE_TASK);
         let hash = file_hash(e.dir.read(REQUIREMENTS_FILE).as_bytes());
-        e.dir.write(HASH_FILE, &hash);
+        e.dir.write(&hash_file(), &hash);
         e.coding("")
             .plan(&CancellationToken::new(), false)
             .await
@@ -110,18 +110,18 @@ mod tests {
         e.dir
             .write(REQUIREMENTS_FILE, "build a thing, and also a new feature");
         e.dir.write(
-            PROGRESS_FILE,
+            &progress_file(),
             "- [x] old task
 ",
         );
-        e.dir.write(HASH_FILE, "stale-hash");
+        e.dir.write(&hash_file(), "stale-hash");
         e.coding("")
             .plan(&CancellationToken::new(), false)
             .await
             .unwrap();
         assert_eq!(provider.call_count(), 2);
         assert_eq!(
-            e.dir.read(PROGRESS_FILE),
+            e.dir.read(&progress_file()),
             "- [x] old task
 - [ ] new task
 "
@@ -132,7 +132,7 @@ mod tests {
         }
         let want = file_hash(e.dir.read(REQUIREMENTS_FILE).as_bytes());
         assert_eq!(
-            e.dir.read(HASH_FILE),
+            e.dir.read(&hash_file()),
             want,
             "hash must track the new requirements"
         );
@@ -181,14 +181,14 @@ mod tests {
             "one-one",
             vec![write_progress_step(one_done), content_step("done")],
         );
-        e.dir.write(PROGRESS_FILE, two);
+        e.dir.write(&progress_file(), two);
         e.coding("")
             .run_one_task(&CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(provider.call_count(), 2, "one task = toolcall + final");
         assert_eq!(
-            e.dir.read(PROGRESS_FILE),
+            e.dir.read(&progress_file()),
             one_done,
             "only the first task touched"
         );
@@ -212,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn run_one_task_all_done_makes_no_model_call() {
         let (e, provider) = env("one-alldone", Vec::new());
-        e.dir.write(PROGRESS_FILE, DONE_TASK);
+        e.dir.write(&progress_file(), DONE_TASK);
         e.coding("")
             .run_one_task(&CancellationToken::new())
             .await
@@ -226,8 +226,8 @@ mod tests {
             "one-clear",
             vec![write_progress_step(DONE_TASK), content_step("done")],
         );
-        e.dir.write(PROGRESS_FILE, ONE_TASK);
-        e.dir.write(RETRY_FILE, "2\t0\ttask one");
+        e.dir.write(&progress_file(), ONE_TASK);
+        e.dir.write(&retry_file(), "2\t0\ttask one");
         e.coding("")
             .run_one_task(&CancellationToken::new())
             .await
@@ -238,7 +238,7 @@ mod tests {
             "prior count reused: {prompt}"
         );
         assert!(
-            !e.dir.path().join(RETRY_FILE).exists(),
+            !e.dir.path().join(retry_file()).exists(),
             "retry state must clear on success"
         );
     }
@@ -246,12 +246,12 @@ mod tests {
     #[tokio::test]
     async fn run_one_task_persists_retry_state_when_stuck() {
         let (e, _p) = env("one-stuck", vec![content_step("I already did this")]);
-        e.dir.write(PROGRESS_FILE, ONE_TASK);
+        e.dir.write(&progress_file(), ONE_TASK);
         e.coding("")
             .run_one_task(&CancellationToken::new())
             .await
             .unwrap();
-        let state = e.dir.read(RETRY_FILE);
+        let state = e.dir.read(&retry_file());
         assert!(state.starts_with("1\t"), "expected count 1, got {state:?}");
         assert!(state.contains("task one"));
     }
@@ -259,8 +259,8 @@ mod tests {
     #[tokio::test]
     async fn run_one_task_stalls_after_max_attempts() {
         let (e, _p) = env("one-stall", vec![content_step("still done, trust me")]);
-        e.dir.write(PROGRESS_FILE, ONE_TASK);
-        e.dir.write(RETRY_FILE, "4\t0\ttask one");
+        e.dir.write(&progress_file(), ONE_TASK);
+        e.dir.write(&retry_file(), "4\t0\ttask one");
         let err = e
             .coding("")
             .run_one_task(&CancellationToken::new())
@@ -292,7 +292,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(provider.call_count(), 4, "generate(2) + one task(2)");
-        assert_eq!(e.dir.read(PROGRESS_FILE), DONE_TASK);
+        assert_eq!(e.dir.read(&progress_file()), DONE_TASK);
     }
 
     #[tokio::test]
@@ -401,7 +401,7 @@ mod tests {
     async fn all_done_notification_reports_na_not_stale_usage() {
         let srv = ntfy().await;
         let (e, _p) = env("plan-stale", Vec::new());
-        e.dir.write(PROGRESS_FILE, DONE_TASK);
+        e.dir.write(&progress_file(), DONE_TASK);
         // Leftover figures from an unrelated earlier turn must not leak in.
         *e.agent.last_usage.lock().unwrap() = crate::agent::UsageTotals {
             usage: usage(),
@@ -423,9 +423,9 @@ mod tests {
         let srv = ntfy().await;
         let (e, _p) = env("plan-nonotify", Vec::new());
         e.dir.write(REQUIREMENTS_FILE, "build a thing");
-        e.dir.write(PROGRESS_FILE, DONE_TASK);
+        e.dir.write(&progress_file(), DONE_TASK);
         let hash = file_hash(e.dir.read(REQUIREMENTS_FILE).as_bytes());
-        e.dir.write(HASH_FILE, &hash);
+        e.dir.write(&hash_file(), &hash);
         e.coding(&srv.url)
             .plan(&CancellationToken::new(), true)
             .await

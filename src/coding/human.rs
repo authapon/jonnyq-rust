@@ -28,7 +28,7 @@ use std::path::Path;
 
 use regex::Regex;
 
-use super::{checklist_re, count_done, Task, PROGRESS_FILE, REQUIREMENTS_FILE};
+use super::{checklist_re, count_done, Task, REQUIREMENTS_FILE};
 
 const HOW_TO_RUN_PREFIX: &str = "how to run:";
 const HUMAN_CHECK_PREFIX: &str = "human check:";
@@ -251,10 +251,11 @@ fn flush_block(doc: &mut ProgressDoc, cur: i64, block: &mut Vec<String>) {
 /// Cuts `s` to at most `max` bytes on a character boundary, appending a
 /// pointer to `.progress` when it had to cut.
 pub fn truncate_bytes(s: &str, max: usize) -> String {
+    let progress_file = super::progress_file();
     if s.len() <= max {
         return s.to_string();
     }
-    let note = format!("\n... (truncated; see {PROGRESS_FILE} for the full guide)");
+    let note = format!("\n... (truncated; see {progress_file} for the full guide)");
     let mut cut = max.saturating_sub(note.len());
     // Walk back to a character boundary (Go's utf8.RuneStart equivalent).
     while cut > 0 && !s.is_char_boundary(cut) {
@@ -308,26 +309,28 @@ checkbox state because of this.",
 /// Asks the model to add the verification notes to an existing .progress
 /// without touching its tasks.
 pub fn build_add_checks_prompt() -> String {
+    let progress_file = super::progress_file();
     format!(
-        "Read {PROGRESS_FILE}, {REQUIREMENTS_FILE} and the existing code in the working directory, then edit \
-{PROGRESS_FILE} to add notes that let a HUMAN verify the work by actually using the application (preferably \
+        "Read {progress_file}, {REQUIREMENTS_FILE} and the existing code in the working directory, then edit \
+{progress_file} to add notes that let a HUMAN verify the work by actually using the application (preferably \
 through its frontend, without reading code). Do not change, remove, reorder, check or uncheck any existing task \
 line - every \"- [ ]\" / \"- [x]\" line must stay exactly as it is. Only add the following: (1) {HOW_TO_RUN_RULE} \
 (2) {HUMAN_CHECK_RULE} (3) {REVIEW_TASK_RULE} (add that one new unchecked task at the end of the last phase if \
-it is not already there). {BLOCKQUOTE_RULE} Do not implement anything - only edit {PROGRESS_FILE}.",
+it is not already there). {BLOCKQUOTE_RULE} Do not implement anything - only edit {progress_file}.",
     )
 }
 
 /// Appended to a task prompt when .progress carries a verification guide, so
 /// the guide stays accurate as the code changes.
 pub fn human_guide_note(d: &ProgressDoc) -> String {
+    let progress_file = super::progress_file();
     if !d.has_guide() {
         return String::new();
     }
     format!(
-        "\n\nNote: {PROGRESS_FILE} contains notes for a human reviewer (\"> How to run:\" and \"> Human check:\" \
+        "\n\nNote: {progress_file} contains notes for a human reviewer (\"> How to run:\" and \"> Human check:\" \
 lines). If your work changes how a person would run or verify anything (URL, port, command, UI labels, \
-credentials, expected results), update the affected note lines in {PROGRESS_FILE} too. Never turn those notes \
+credentials, expected results), update the affected note lines in {progress_file} too. Never turn those notes \
 into checkboxes.",
     )
 }
@@ -409,11 +412,12 @@ mod tests {
 
     #[test]
     fn truncate_cuts_on_char_boundary_and_notes_the_file() {
+        let progress_file = crate::coding::progress_file();
         let s = "กขค".repeat(2000); // 3 bytes per char in UTF-8
         let t = truncate_bytes(&s, NOTIFY_GUIDE_LIMIT);
         assert!(t.len() <= NOTIFY_GUIDE_LIMIT);
         assert!(t.ends_with(&format!(
-            "(truncated; see {PROGRESS_FILE} for the full guide)"
+            "(truncated; see {progress_file} for the full guide)"
         )));
         // Cutting mid-character would panic; getting here means it didn't.
         assert!(truncate_bytes("short", NOTIFY_GUIDE_LIMIT) == "short".to_string());
@@ -430,7 +434,7 @@ mod tests {
         assert!(r.contains("When reconciling, keep the existing"));
 
         let a = build_add_checks_prompt();
-        assert!(a.contains(PROGRESS_FILE) && a.contains(REQUIREMENTS_FILE));
+        assert!(a.contains(&crate::coding::progress_file()) && a.contains(REQUIREMENTS_FILE));
         assert!(a.contains("Do not change, remove, reorder, check or uncheck any existing task"));
 
         let mut doc = ProgressDoc::default();

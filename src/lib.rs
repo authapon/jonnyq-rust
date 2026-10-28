@@ -31,6 +31,7 @@ pub mod notify;
 pub mod repl;
 pub mod skill;
 
+pub mod team;
 #[cfg(test)]
 mod testsupport;
 pub mod tools;

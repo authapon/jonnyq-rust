@@ -103,6 +103,10 @@ impl Tool for RunCommandTool {
                 reason
             )));
         }
+        // ...and a command that would overwrite or remove an agent's own
+        // history is refused too: those files are everyone's to read and
+        // nobody's to write (see [`super::context_guard`]).
+        super::context_guard::check_command_ok(&self.work_dir, command)?;
 
         let timeout_sec = *self.timeout_sec.lock().unwrap();
         let timeout_sec = if timeout_sec <= 0 {
