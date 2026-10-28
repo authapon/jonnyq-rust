@@ -160,6 +160,15 @@ and take the extra step when accuracy requires it.\n";
 /// right" is not an acceptable bar - the model must have just proven it with
 /// a real, passing command.
 ///
+/// The rules are deliberately task-scoped. They used to speak only of "the real
+/// build and test commands for this project", and one of them even forbade
+/// ticking a box that had "nothing to build or test": a scaffolding task with no
+/// behaviour yet reads that as a licence to write the behaviour so there will be
+/// something to verify - which is how a real session ended up with the whole
+/// calculator implemented inside its very first task, "create index.html", and
+/// then spent the turn testing it. Verification must be demanded and sized to
+/// the task at the same time, or demanding it causes over-implementation.
+///
 /// A function rather than a constant because it names the task file
 /// (`.context/progress.md` by default, see
 /// [`crate::coding::progress_file()`]), and that path is a setting.
@@ -170,14 +179,15 @@ fn coding_mode_prompt() -> String {
 === AUTONOMOUS CODING MODE ===
 You are working through a task checklist with no human reviewing each step before it's committed. Follow these rules exactly, without exception:
 
-1. A task is done only when it compiles/builds with no errors AND all relevant automated tests pass AND it actually satisfies the requirement. Writing the code is not enough.
-2. Before changing a task's checkbox from \"- [ ]\" to \"- [x]\" in {pf}, you MUST have actually run the real build and test commands for this project via run_command in THIS SAME turn, and seen their real passing output. Never mark a task done based on an earlier turn's results, based on reasoning about what \"should\" work, or without running anything at all.
-3. If a verification command fails, fix the underlying problem and re-run it until it genuinely passes before marking the task done. Never mark a task done \"with known issues\" or \"should be fine.\"
-4. If you don't already know how to build or test this project, find out first (check for a Makefile, package.json, go.mod, Cargo.toml, README, CI config, etc.) rather than guessing or skipping verification.
-5. If a task genuinely has nothing to build or test (e.g. a documentation-only change), say so explicitly in your reply instead of silently marking it done with no verification.
-6. Never state or imply a task is verified, working, or tested unless you have real tool output from this turn proving it.
-7. If you notice yourself repeating the same plan or reasoning without taking a new concrete action, stop immediately and call a tool (e.g. run_command, read_file) to make real progress, instead of continuing to reason in text.
-8. ask_user BLOCKS this run until a human replies, which defeats the point of working unattended: decide the most reasonable option yourself, do the work, and record the decision and the assumption you made in your reply (and in {pf}) so it can be reviewed afterwards. Ask only when continuing would be destructive or the work cannot proceed at all without the answer.
+1. The current task line is the whole of your assignment: implement exactly what it says and nothing beyond it. Later tasks are not yours to start now, even when doing them first looks easier or more natural. No extra files, features, refactors, renames or tidy-ups the task did not ask for, and no tests for behaviour no task has written yet.
+2. A task is done only when what it added compiles/builds with no errors AND the tests relevant to it pass AND it actually satisfies that task. Writing the code is not enough.
+3. Before changing a task's checkbox from \"- [ ]\" to \"- [x]\" in {pf}, you MUST have actually run the real check for what THIS task delivers via run_command in THIS SAME turn, and seen its real passing output - its build and tests when it adds behaviour, or the direct check of what it created when it does not (the file exists, it parses, it holds exactly what the task named). Never mark a task done based on an earlier turn's results, based on reasoning about what \"should\" work, or without running anything at all.
+4. Keep verification proportionate to the task. \"The file exists with exactly the content this task named\" IS a real verification for a task that only creates that file: prove it, tick it, and stop. Never write functionality, or build a test harness, just so there would be something to test.
+5. If a verification command fails, fix the underlying problem and re-run it until it genuinely passes before marking the task done. Never mark a task done \"with known issues\" or \"should be fine.\" Fixing a failure is never a reason to write the next task's code: if the only way past it is functionality this task did not ask for, the task is mis-specified - say so in your reply instead of implementing it.
+6. If you don't already know how to build or test this project, find out first (check for a Makefile, package.json, go.mod, Cargo.toml, README, CI config, etc.) rather than guessing or skipping verification.
+7. Never state or imply a task is verified, working, or tested unless you have real tool output from this turn proving it.
+8. If you notice yourself repeating the same plan or reasoning without taking a new concrete action, stop immediately and call a tool (e.g. run_command, read_file) to make real progress, instead of continuing to reason in text.
+9. ask_user BLOCKS this run until a human replies, which defeats the point of working unattended: decide the most reasonable option yourself, do the work, and record the decision and the assumption you made in your reply (and in {pf}) so it can be reviewed afterwards. Ask only when continuing would be destructive or the work cannot proceed at all without the answer.
 "
     )
 }
@@ -3581,6 +3591,30 @@ updated config, dotenv and the repl; tests pass; open task is the README wording
         assert!(
             strict.content.contains("run_command in THIS SAME turn"),
             "verify-before-done rule missing: {}",
+            strict.content
+        );
+        // The task is the boundary, and the check is sized to it: without these
+        // two the same rules pushed a scaffolding task into implementing the
+        // whole app so there would be something to verify.
+        assert!(
+            strict
+                .content
+                .contains("The current task line is the whole of your assignment"),
+            "scope rule missing: {}",
+            strict.content
+        );
+        assert!(
+            strict
+                .content
+                .contains("Keep verification proportionate to the task"),
+            "proportionality rule missing: {}",
+            strict.content
+        );
+        // The old escape hatch that caused it: a task with nothing to test was
+        // told to explain itself rather than tick the box.
+        assert!(
+            !strict.content.contains("nothing to build or test"),
+            "the no-verification clause is back: {}",
             strict.content
         );
     }

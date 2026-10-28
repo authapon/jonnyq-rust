@@ -320,7 +320,10 @@ headings and any other text are ignored. If {} labels requirements with IDs (e.g
 relevant ID(s) in parentheses at the end of each task description for traceability, e.g. \"- [ ] Do the \
 thing (REQ-012)\" - only when such IDs actually appear in {}, never invent them. Include an initial phase \
 covering any missing project scaffolding/toolchain setup, and a final phase with a task that verifies the \
-whole thing end-to-end. {} \
+whole thing end-to-end. Write each task so its boundary is unambiguous - what file(s) it touches and what \
+must be true when it is done - and never let one task describe work that a later task also delivers: a \
+coder works one task at a time and implements exactly what the line says, so a task whose wording reaches \
+into later work produces the whole application in the first task. {} \
 Do not implement anything yet - only produce the task list.",
         REQUIREMENTS_FILE, progress_file(), progress_file(), REQUIREMENTS_FILE, REQUIREMENTS_FILE,
         progress_language_rule()
@@ -344,6 +347,31 @@ Do not implement anything yet - only update the task list.",
         progress_language_rule()
     )
 }
+
+/// The scope rule every task prompt carries. Added after a real session where
+/// the task was "create the project root file `index.html`" and the coder
+/// wrote the whole application into it, then spent the rest of the turn trying
+/// to test it: the old prompt named no boundary and asked for "the real build
+/// and test commands for this project", so a task with no behaviour yet read as
+/// an instruction to build behaviour in order to have something to verify.
+/// Both halves are needed - the boundary, and a verification that is sized to
+/// the task instead of to the project.
+pub const TASK_SCOPE_RULE: &str = "SCOPE - the task line is the whole of your assignment:\n\
+- Implement exactly what this task says, and nothing beyond it. Later tasks are not yours to start now, \
+even when doing them now looks easier or more natural; the checklist says what comes next, not you.\n\
+- Read the tasks that follow this one in the checklist so you know what belongs to them, and leave it \
+alone. If this task is scaffolding (create a file, add a heading, set up a skeleton), deliver exactly \
+that: a file that exists with the named structure - not the finished feature.\n\
+- No extra files, features, refactors, renames, tidy-ups, comments or tests the task did not ask for. \
+Going beyond the task is a defect even when it works: it enlarges the diff so the reviewer cannot tell \
+task from surplus, and it does later tasks' work without their verification.\n\
+- Verify only what THIS task delivers, with real commands in this same turn - do not skip this or \
+assume it would pass. For a file/skeleton task that means the cheap direct check: it exists, it parses, \
+it holds exactly what this task named. When that is all the task asks for, that check IS the \
+verification - say so and stop. Do not write functionality just so there is something to test, and do \
+not build a test harness for behaviour a later task has not written yet.\n\
+- If the task does carry behaviour, run the project's real build and test commands for it and fix any \
+failures until they genuinely pass.";
 
 pub fn build_task_prompt(task_text: &str, stall: i64, prev_untouched: bool) -> String {
     let retry_note = if stall > 0 && prev_untouched {
@@ -379,18 +407,18 @@ rewrote {} from a stale in-memory copy and clobbered the change), and fix it for
         String::new()
     };
     format!(
-        "{}Work on this task from {}: {:?}\n\n\
-Implement it, then actually run the real build and test commands for this project via run_command in this same \
-turn, and fix any failures until they genuinely pass - do not skip this or assume it would pass. Before changing \
-{}, always read_file it first to see its exact current content - never edit it from memory, since your view of it \
-may be stale. Prefer edit_file for a single checkbox change over rewriting the whole file with write_file, which \
-risks clobbering other tasks' state if your copy of it is out of date. Only once you have seen the build/test \
-pass in this turn, actually call edit_file or write_file to change this task's checkbox in {} from \"- [ ]\" to \
-\"- [x]\" - stating in your reply that it's done, without making that tool call, does not count and leaves the \
-task unfinished. If the task has nothing to build or test (e.g. documentation only), say so explicitly instead \
-of marking it done without verification. If you discover the task needs to be split into smaller steps, edit {} \
-to reflect that instead of marking it done.",
-        retry_note, REQUIREMENTS_FILE, task_text, progress_file(), progress_file(), progress_file()
+        "{retry_note}\
+Work on this task from {REQUIREMENTS_FILE}: {task_text:?}\n\n\
+{TASK_SCOPE_RULE}\n\n\
+Before changing {pf}, always read_file it first to see its exact current content - never edit it from \
+memory, since your view of it may be stale. Prefer edit_file for a single checkbox change over \
+rewriting the whole file with write_file, which risks clobbering other tasks' state if your copy of it \
+is out of date. Only once you have seen this task's own verification pass in this turn, actually call \
+edit_file or write_file to change this task's checkbox in {pf} from \"- [ ]\" to \"- [x]\" - stating in \
+your reply that it's done, without making that tool call, does not count and leaves the task unfinished. \
+If you discover the task needs to be split into smaller steps, edit {pf} to reflect that instead of \
+marking it done.",
+        pf = progress_file()
     )
 }
 

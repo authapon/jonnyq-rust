@@ -968,6 +968,129 @@ async fn verify_off_runs_the_work_alone() {
     );
 }
 
+/// A plan review and a code review are different jobs: the same code-shaped
+/// brief used to send joy off to re-run "the real build and test commands" over
+/// a checklist that has no build, and never asked her whether the plan covers
+/// every requirement - which is the one thing a plan can fail at.
+#[tokio::test]
+async fn a_plan_is_reviewed_for_coverage_and_a_change_for_scope() {
+    let _env = crate::testsupport::clean_env();
+    let (t, provider, _dir, _log) = roster(
+        "review-brief",
+        vec![
+            "I wrote the plan".into(),
+            "NEEDS FIX\n1. no task delivers the currency conversion in requirements.md".into(),
+            "I fixed the plan".into(),
+            "APPROVE".into(),
+        ],
+    )
+    .await;
+    let cancel = CancellationToken::new();
+    let jacky = t.start(AgentName::Jacky, "/plan");
+    let work = jacky.run_turn(cancel.clone(), "plan it");
+    let v = t
+        .review_after(
+            &cancel,
+            AgentName::Jacky,
+            "/plan on .context/progress.md",
+            work,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(v, Verdict::Approve), "{v:?}");
+    let plan_brief = provider.last_user_content(1);
+    for want in [
+        "reviewing a PLAN, not code",
+        "COVERAGE",
+        "COMPLETENESS",
+        "GRANULARITY AND SCOPE",
+        "VERIFIABILITY",
+        "FALSE WORK",
+        "requirements.md",
+        ".context/progress.md",
+    ] {
+        assert!(
+            plan_brief.contains(want),
+            "the plan brief is missing {want}: {plan_brief}"
+        );
+    }
+    // She must not be sent looking for a build that a plan does not have.
+    assert!(
+        !plan_brief.contains("re-run the real build and test commands"),
+        "the plan brief still asks for a build: {plan_brief}"
+    );
+
+    // The same reviewer, reviewing an implementation, gets the code brief
+    // instead - and it names scope as a reviewable defect.
+    let (t, provider, _dir, _log) = roster(
+        "review-brief-code",
+        vec!["I implemented it".into(), "APPROVE".into()],
+    )
+    .await;
+    let joey = t.start(AgentName::Joey, "/coding");
+    let work = joey.run_turn(cancel.clone(), "implement it");
+    let v = t
+        .review_after(
+            &cancel,
+            AgentName::Joey,
+            "/coding on .context/progress.md",
+            work,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(v, Verdict::Approve), "{v:?}");
+    let code_brief = provider.last_user_content(1);
+    for want in [
+        "re-run the real build and test commands",
+        "the SCOPE of the change",
+        "belongs to a later",
+        "ticked without real",
+    ] {
+        assert!(
+            code_brief.contains(want),
+            "the code brief is missing {want}: {code_brief}"
+        );
+    }
+    assert!(!code_brief.contains("reviewing a PLAN"));
+}
+
+/// A finding of "you went beyond the task" must not be answered with more code:
+/// the fix turn tells the coder to remove the surplus.
+#[tokio::test]
+async fn a_scope_finding_is_fixed_by_removing_not_adding() {
+    let (t, provider, _dir, _log) = roster(
+        "review-scope-fix",
+        vec![
+            "I implemented it".into(),
+            "NEEDS FIX\n1. index.html already implements the whole evaluator, which is task 6's \
+scope"
+                .into(),
+            "I removed it".into(),
+            "APPROVE".into(),
+        ],
+    )
+    .await;
+    let cancel = CancellationToken::new();
+    let joey = t.start(AgentName::Joey, "/coding");
+    let work = joey.run_turn(cancel.clone(), "implement it");
+    let v = t
+        .review_after(
+            &cancel,
+            AgentName::Joey,
+            "/coding on .context/progress.md",
+            work,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(v, Verdict::Approve), "{v:?}");
+    let fix = provider.last_user_content(2);
+    assert!(
+        fix.contains("remove the surplus"),
+        "the coder was not told to shrink: {fix}"
+    );
+    assert!(fix.contains("stay inside the task's own scope"), "{fix}");
+}
+
 /// The review is the roster's own doing, so the person can see which of the
 /// four is responsible for the state of the code - including when verification
 /// is switched off.

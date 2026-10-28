@@ -71,6 +71,7 @@ mod tests {
             "## Phase 1: <Phase Name>",
             "# <Project Title>",
             "REQ-012",
+            "boundary is unambiguous",
         ] {
             assert!(prompt.contains(want), "prompt missing {want}: {prompt}");
         }
@@ -241,6 +242,39 @@ mod tests {
             !e.dir.path().join(retry_file()).exists(),
             "retry state must clear on success"
         );
+    }
+
+    /// The over-implementation this guards: the task was "create `index.html`"
+    /// and the coder wrote the whole app into it, then spent the turn testing it.
+    /// The task prompt must name the boundary AND size the verification to the
+    /// task - naming the boundary alone still left the old "run the project's
+    /// build and test commands" demand pushing the coder to create behaviour
+    /// that would be worth testing.
+    #[test]
+    fn task_prompt_bounds_the_task_and_its_verification() {
+        let p = build_task_prompt("Create the file `index.html`.", 0, false);
+        for want in [
+            "SCOPE",
+            "nothing beyond it",
+            "Later tasks are not yours to start now",
+            "Verify only what THIS task delivers",
+            "not build a test harness",
+            "Do not write functionality just so there is something to test",
+        ] {
+            assert!(p.contains(want), "task prompt missing {want}: {p}");
+        }
+        // The old whole-project demand, which read as "build the app to test it".
+        assert!(
+            !p.contains("the real build and test commands for this project"),
+            "task prompt still asks for the project's whole build: {p}"
+        );
+        // Ticking the box on proof is still required - the scope rule must not
+        // have loosened the verification half.
+        assert!(
+            p.contains("this task's own verification pass in this turn"),
+            "{p}"
+        );
+        assert!(p.contains("Create the file `index.html`."));
     }
 
     #[tokio::test]

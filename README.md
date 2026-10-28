@@ -6,7 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.1.0
+jonnyq v1.1.1
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -58,7 +58,7 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **The team.** One model, one terminal, four agents. JONNY answers plain prompts, JACKY writes the plan, JOEY works the checklist and JOY checks the result; each is activated by name (`/joey`) or implicitly by the command that belongs to it (`/coding` is JOEY's). They share the tools, the model and the transcript, but each keeps its own history in `.context/<name>.md`, and only one of them is "active" — the one a plain prompt goes to. Switching agents is free: nothing is re-sent, and no context is spent on the others. Every agent knows what the other three are for; see [Sharing what the agents know](#sharing-what-the-agents-know). Each one also has a character of its own — JONNY cheerful, JACKY meticulous, JOEY hard on his own work, JOY beautiful and very strict — which is written into the top of its system message. It changes how an agent approaches its work, never what it is allowed to touch: the lane rules are stated first and stay binding.
 
-**Joy's verdict.** `/plan` and the coding commands end with a review, and the verdict is her plain-text answer: `APPROVE`, or `NEEDS FIX` followed by numbered findings that go straight back to the agent that has to act on them (up to `/review_rounds` times). A review that states no verdict is never read as a pass — jonnyq says so and leaves the work unverified. Two rules keep that honest with reasoning models: the verdict is read from **that turn's answer** (never from an older turn in her history, and never from her thinking channel), and an answer that opens with prose but states no verdict on its own line earns one short follow-up asking for the verdict alone — her review is still in her context, so nothing is re-run.
+**Joy's verdict.** `/plan` and the coding commands end with a review, and the verdict is her plain-text answer: `APPROVE`, or `NEEDS FIX` followed by numbered findings that go straight back to the agent that has to act on them (up to `/review_rounds` times). Her brief depends on the author: a plan is audited for coverage of the requirements, an implementation for correctness and for staying inside its task's scope (see [Automated coding](#automated-coding-plan--contextprogressmd--coding)). A review that states no verdict is never read as a pass — jonnyq says so and leaves the work unverified. Two rules keep that honest with reasoning models: the verdict is read from **that turn's answer** (never from an older turn in her history, and never from her thinking channel), and an answer that opens with prose but states no verdict on its own line earns one short follow-up asking for the verdict alone — her review is still in her context, so nothing is re-run.
 
 > JACKY used to be called JACKSON. Nothing else changed — same agent, same lane, and a `.context/jackson.md` left by an older session is renamed to `.context/jacky.md` on the first start, so its memory comes along. `/jackson` still works as a synonym for `/jacky`; it is simply not listed any more, since one name per agent is the point.
 
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.1.0`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.1.1`) above the first prompt, so a transcript and a screenshot carry the build they came from.
 
 ## Version
 
-jonnyq is at **v1.1.0**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+jonnyq is at **v1.1.1**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
 
 | Where | What you see |
 |---|---|
-| Terminal, at startup | `jonnyq v1.1.0` above the first prompt, and in the transcript log |
+| Terminal, at startup | `jonnyq v1.1.1` above the first prompt, and in the transcript log |
 | `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
 | `/version` | The same line, any time during a session |
 | `/help`, `/?` | The version above the slash command list |
-| Web console | In the browser tab's title (`jonnyq console v1.1.0`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
-| `GET /health` | `"version": "1.1.0"` in the JSON, so a script can identify a running session |
+| Web console | In the browser tab's title (`jonnyq console v1.1.1`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.1.1"` in the JSON, so a script can identify a running session |
 
 `-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
@@ -341,7 +341,11 @@ Write `requirements.md` yourself, then:
 - [x] Implement the tool registry
 ```
 
-While coding, the system prompt switches to an autonomous mode that forbids marking a task done without actually running the build/tests in that round. Task completion is verified against the real file content, so false "done" claims stall the loop and surface an error.
+While coding, the system prompt switches to an autonomous mode that forbids marking a task done without actually running the checks for that task in that round. Task completion is verified against the real file content, so false "done" claims stall the loop and surface an error.
+
+Both coding commands carry an explicit scope rule, and it is worth knowing why: an early session was told *"create the project root file `index.html`"* and wrote the entire calculator into it, then spent the rest of the turn inventing a DOM shim to test logic no task had asked for yet. Two things in the old prompt caused that — it named no boundary, and it demanded "the real build and test commands **for this project**", which a task with no behaviour yet can only satisfy by first writing behaviour. So a task line is now the whole of JOEY's assignment: implement exactly what it says, leave later tasks alone, and verify only what this task delivers — for a file/skeleton task, "the file exists with exactly the required content" *is* the verification. Going beyond the task is treated as a defect even when it works, because the reviewer can no longer tell task from surplus and later tasks lose their verification. JOY checks for exactly that, and a finding of "this is task 6's work" is fixed by removing the surplus, not by adding more.
+
+Joy's review briefs differ by author, for the same reason: a plan has no build to re-run. Reviewing **JACKY's plan** is a coverage audit — she walks `requirements.md` requirement by requirement and reports any requirement, edge case or constraint no task delivers, anything a coder would have to guess, any task too broad to verify in one sitting, any task that could be ticked without proving anything. A plan that can be followed to the letter and still yields an incomplete app is a failed plan, and that is what she is there to catch before `/coding` spends an hour on it. Reviewing **JOEY's change** is a correctness-and-scope check: re-run the build and tests, then confirm the change delivers exactly the task line it was ticked against.
 
 `/watchfile` is pair programming without leaving the editor: start it with `/watchfile`, then drop a magic word into the code —
 

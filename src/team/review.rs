@@ -41,8 +41,9 @@ use std::future::Future;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentName, Team};
+use super::{progress_file, AgentName, Team};
 use crate::agent::Agent;
+use crate::coding::REQUIREMENTS_FILE;
 use crate::error::R;
 
 /// The outcome of one review, as read from joy's reply.
@@ -211,10 +212,57 @@ pub fn parse_verdict(reply: &str) -> Verdict {
 }
 
 impl Team {
+    /// What joy is told to check, per author: reviewing a plan and reviewing an
+    /// implementation are different jobs, and the one code-shaped brief she
+    /// used to get sent her off to re-run build and test commands over a
+    /// document that has neither - while saying nothing about what actually
+    /// matters in a plan, namely whether it covers every requirement well
+    /// enough that the app can be built correctly from it.
+    ///
+    /// Both briefs share the evidence rule and the verdict format, which
+    /// [`Team::review`] adds around them; only the checking differs.
+    fn review_brief(author: AgentName, progress_file: &str) -> String {
+        match author {
+            AgentName::Jacky => format!(
+                "You are reviewing a PLAN, not code: there is nothing to build or run yet, so do not \
+look for a build. Read {REQUIREMENTS_FILE} in full, then read the plan in {progress_file} task by \
+task, and judge whether a coder following it literally would end up with an application that meets \
+every requirement. Check specifically:\n\
+- COVERAGE: walk {REQUIREMENTS_FILE} requirement by requirement (and its REQ- IDs, if it has any) \
+and name every requirement, behaviour, edge case, error case, constraint or piece of UI that NO task \
+delivers. A requirement no task maps to is a defect, however good the rest of the plan is.\n\
+- COMPLETENESS: is anything a coder would have to guess left unspecified - which file(s) a task \
+touches, its inputs and outputs, the exact expected result? Guesswork here becomes a different app.\n\
+- GRANULARITY AND SCOPE: is each task small enough to implement and verify in one sitting, and is its \
+deliverable stated so a reviewer can tell afterwards whether the coder stayed inside it? A task that \
+describes a whole feature is a defect.\n\
+- ORDER AND DEPENDENCIES: does each phase depend only on work that earlier tasks in the plan build?\n\
+- VERIFIABILITY: can each task's completion be checked by a real command or an observable result? \
+Name any task that could be ticked without proving anything, and any \"> How to run:\" / \"> Human \
+check:\" note that cannot be carried out as written.\n\
+- FALSE WORK: tasks for what the working directory already implements, or for something no \
+requirement asks for. Read the existing code to tell.",
+            ),
+            _ => format!(
+                "Read the files that were changed, re-run the real build and test commands with \
+run_command, and check the result against {REQUIREMENTS_FILE} and against the task as written in \
+{progress_file}. Then check the SCOPE of the change, which is a defect even when it works: does it \
+deliver exactly what that task line asks and nothing more? Anything it added that belongs to a later \
+task - functionality, extra files, refactors, tests for behaviour no task has built - is a finding, \
+because it makes this task unverifiable and later tasks meaningless. A checkbox ticked without real \
+command output proving it is a finding too.",
+            ),
+        }
+    }
+
     /// JOY reviews what `author` just produced. `what` names the work in the
     /// terms the person used (`"/coding: task 3 of the checklist"`), because
     /// her conversation holds none of it - she has to go and look, which is
     /// exactly what makes the review worth having.
+    ///
+    /// What she checks depends on the author ([`Team::review_brief`]): a plan
+    /// gets audited for coverage of the requirements, an implementation for
+    /// correctness and for staying inside its task's scope.
     ///
     /// The verdict is read from **this turn's answer** ([`Agent::turn_answer`],
     /// never an older turn's reply), and if that answer states none the review
@@ -231,15 +279,16 @@ impl Team {
         let joy = self.start(AgentName::Joy, &note);
         let prompt = format!(
             "Review the work {author} just finished: {what}\n\
-Read the files that were changed, re-run the real build and test commands with run_command, and \
-check the result against the requirements and against the task as written. Read {author}'s own \
-history at {} for the decisions and findings behind it - it says what {author} believed it was \
-doing, which is what your evidence has to contradict or confirm. Do not take the reply \
-text on trust - tool output is the evidence - and do not fix, edit or implement anything yourself.\n\
+{}\n\
+Read {author}'s own history at {} for the decisions and findings behind it - it says what {author} \
+believed it was doing, which is what your evidence has to contradict or confirm. Do not take the \
+reply text on trust - tool output is the evidence - and do not fix, edit or implement anything \
+yourself.\n\
 Your final answer - not your reasoning - must open with the verdict on its own first line: \
 APPROVE, or NEEDS FIX followed by numbered findings, each naming the file or task and what \
 {author} must change. Everything you work out along the way counts for nothing until it is in \
 that answer.",
+            Self::review_brief(author, &progress_file()),
             author.context_file()
         );
         joy.run_turn(cancel.clone(), &prompt).await?;
@@ -318,6 +367,11 @@ must change, that is `NEEDS FIX` - put it on that first line, then the numbered 
         let agent = self.start(author, &note);
         let lane = match author {
             AgentName::Jacky => "correct the plan in the task file - do not implement it",
+            AgentName::Joey => {
+                "implement, or re-verify, the work she is questioning - and stay \
+inside the task's own scope: if the finding is that you went beyond it, remove the surplus rather \
+than adding more"
+            }
             _ => "implement, or re-verify, the work she is questioning",
         };
         let prompt = format!(
