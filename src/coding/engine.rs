@@ -32,7 +32,8 @@ use super::human::{self, ProgressDoc};
 use super::{
     count_done, first_unsettled, load_retry_state, load_task_reviews, next_work, parse_progress,
     progress_file, progress_summary_line_gate, review_file, same_task, write_retry_state, Coding,
-    Gate, RunFiles, Task, Work, MAX_NO_PROGRESS_ROUNDS, MAX_STALL_ROUNDS, REQUIREMENTS_FILE,
+    Gate, PlanChange, RunFiles, Task, Work, MAX_NO_PROGRESS_ROUNDS, MAX_STALL_ROUNDS,
+    REQUIREMENTS_FILE,
 };
 use crate::agent::Agent;
 use crate::error::{AgentError, R};
@@ -862,11 +863,27 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
         err
     }
 
-    /// `/autocoding`: plans (as /plan does) if needed, then works through every
-    /// task in the checklist in one run — each one coded by JOEY and verified by
-    /// JOY before the next starts. It stops at a task that will not clear the
-    /// review instead of building on top of it, and reports once at the end (or
-    /// at the stop) rather than per task.
+    /// `/autocoding`: the whole pipeline in one run, in the order the work has to
+    /// happen in:
+    ///
+    /// 1. **JACKY plans** — `.context/progress.md` is generated from
+    ///    `requirements.md` when there is none, and reconciled when the
+    ///    requirements changed since the last pass. When the requirements are
+    ///    unchanged the plan is already settled and nothing is re-planned.
+    /// 2. **JOY verifies the plan** (`/verify on`, and only when it was just
+    ///    written or changed): her findings go back to JACKY for as many rounds as
+    ///    [`crate::team::Team::review_rounds`] allows. Still refused after that —
+    ///    or no verdict at all — and the run **stops before any code is written**
+    ///    and pushes the problem summary to ntfy. Building on a plan nobody
+    ///    approved is exactly what the gate exists to prevent.
+    /// 3. **JOEY codes, task by task**, each one verified by JOY before the next
+    ///    starts (the same per-task gate as `/coding` and `/coding_phase`), with
+    ///    the run stopping at a task that will not clear the review.
+    /// 4. **One report at the end** — the work summary pushed to ntfy, whether the
+    ///    run finished or stopped early.
+    ///
+    /// With `/verify off` steps 2 and the per-task review are skipped, and the run
+    /// is the plain plan-then-code it always was.
     pub async fn auto_run(&self, cancel: &CancellationToken) -> R<()> {
         let start = Instant::now();
         let n = self.notifier();
@@ -885,15 +902,22 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
         }
     }
 
+    /// The body of [`Coding::auto_run`], in the four steps its doc comment
+    /// lists. Notifications are held for the one report at the end (or at the
+    /// stop): the plan pass inside the run never pings on its own, or a long run
+    /// would start with a message about work nobody has verified yet.
     async fn auto_run_body(
         &self,
         cancel: &CancellationToken,
         n: &Notifier,
         start: Instant,
     ) -> R<()> {
-        // The internal plan call keeps notifications off: otherwise the plan
-        // would ping before any of the coding had happened.
-        self.plan_inner_silent(cancel).await?;
+        // `/autocoding` reports for itself (step 4 below, or the plan alert in
+        // step 2), so whatever an earlier command left in the mailbox is not this
+        // run's news — and must not be sent by the next reviewed command.
+        self.team.notice().clear();
+        // 1. The plan: JACKY generates it, reconciles it, or leaves it alone.
+        let plan = self.plan_checked(cancel).await?;
 
         let files = self.files();
         if !files.progress.exists() {
@@ -912,6 +936,52 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
                 progress_file()
             )));
         }
+
+        // 2. A plan that is new or just changed has to clear JOY before a single
+        // task is coded. One that was already up to date was ruled on when it was
+        // written, so it is not re-read every run.
+        let mut plan_note = String::new();
+        if self.verify() && plan.changed() {
+            let rounds = self.team.review_rounds();
+            self.ui.plainln(&format!(
+                "[autocoding] the plan is {} - joy verifies it before any task is coded",
+                match plan {
+                    PlanChange::Created => "new",
+                    _ => "changed",
+                }
+            ));
+            let what = format!("/autocoding plan on {}", progress_file());
+            let (verdict, used) = self.team.gate_plan_once(cancel, &what, rounds).await?;
+            let info = VerdictInfo::of(&verdict);
+            let findings = match &verdict {
+                Verdict::NeedsFix(f) => f.clone(),
+                _ => String::new(),
+            };
+            if info != VerdictInfo::Approved {
+                // Nothing has been coded, so there is no run report to write:
+                // the plan's own problems are the whole of the news, and they go
+                // out as one alert before the loop ever starts.
+                return Err(self
+                    .stop_at_plan(start, n, &files, plan, info, &findings, used)
+                    .await);
+            }
+            self.ui.plainln(&format!(
+                "[autocoding] joy approved the plan ({used} fix round(s)) - coding starts"
+            ));
+            plan_note = format!(
+                "Plan {} and joy approved it{}.\n",
+                match plan {
+                    PlanChange::Created => "generated from requirements.md",
+                    _ => "reconciled with the changed requirements.md",
+                },
+                if used > 0 {
+                    format!(" after {used} fix round(s)")
+                } else {
+                    String::new()
+                }
+            );
+        }
+
         if first_unsettled(&tasks, gate).is_none() {
             self.ui.plainln(&format!(
                 "[autocoding] all tasks in {} are settled",
@@ -921,7 +991,7 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
             // was left and there was nothing left to build — the person should
             // hear that rather than hear nothing.
             let mut summary = format!(
-                "All tasks already settled: {}",
+                "{plan_note}All tasks already settled: {}",
                 progress_summary_line_gate(&tasks, gate)
             );
             if let Ok(doc) = human::parse_progress_doc(&files.progress) {
@@ -941,12 +1011,14 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
             return Ok(());
         }
 
+        // 3. The tasks, each coded by JOEY and verified by JOY before the next.
         let coder = self.coder();
         let _guard = CodingModeGuard::on(&coder);
         let report = self
             .run_gated_loop(cancel, "autocoding", "/autocoding", &Scope::all(), start, n)
             .await?;
 
+        // 4. And the one summary of the whole run.
         let after =
             parse_progress(&files.progress).map_err(|e| err_read(progress_file(), e.message))?;
         let settled = first_unsettled(&after, gate).is_none();
@@ -959,7 +1031,7 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
             }
         ));
         let mut summary = format!(
-            "{}: {}",
+            "{plan_note}{}: {}",
             if settled {
                 "All tasks settled"
             } else {
@@ -1003,9 +1075,87 @@ word that it is done. Turn it on (`/verify on`) to have joy check the work.",
         Ok(())
     }
 
-    /// `/plan` without its notification, for `/autocoding`'s internal call.
-    async fn plan_inner_silent(&self, cancel: &CancellationToken) -> R<()> {
-        self.plan(cancel, false).await
+    /// The error (and its ntfy alert) for a run that stopped at the plan: the
+    /// verdict, the fix rounds it took, and every finding she left — with the
+    /// checklist figures, so the person can see how far the run got (nothing)
+    /// and what stands in the way.
+    ///
+    /// Marked notified like [`Coding::stop_run`], so the caller's failure path
+    /// sends nothing a second time.
+    async fn stop_at_plan(
+        &self,
+        start: Instant,
+        n: &Notifier,
+        files: &RunFiles,
+        plan: PlanChange,
+        verdict: VerdictInfo,
+        findings: &str,
+        rounds: i64,
+    ) -> AgentError {
+        let tasks = parse_progress(&files.progress).unwrap_or_default();
+        let plan_words = match plan {
+            PlanChange::Created => "the plan just generated from requirements.md",
+            _ => "the plan just reconciled with the changed requirements.md",
+        };
+        let mut err = AgentError::new(format!(
+            "/autocoding stopped: {plan_words} did not clear joy's review after {rounds} fix \
+round(s) - {note}; no task was coded",
+            note = verdict.note()
+        ));
+        let mut msg = format!(
+            "/autocoding STOPPED AT THE PLAN\n\nPlan: {}\nVerdict: {}\nFix rounds used: {}\n{}\n\n\
+NO TASK WAS CODED: the run stops here rather than building on a plan joy did not approve.",
+            match plan {
+                PlanChange::Created => format!("generated from {REQUIREMENTS_FILE}"),
+                _ => format!("reconciled with the changed {REQUIREMENTS_FILE}"),
+            },
+            verdict.note(),
+            rounds,
+            progress_summary_line_gate(&tasks, self.gate()),
+        );
+        if !findings.trim().is_empty() {
+            msg.push_str(&format!("\n\nJOY'S FINDINGS ON THE PLAN\n{}", findings.trim()));
+        }
+        if verdict == VerdictInfo::NoVerdict {
+            msg.push_str(
+                "\n\n(joy's review reached no verdict at all - neither APPROVE nor NEEDS FIX - so \
+it is treated as a refusal, never as a pass.)",
+            );
+        }
+        // A plan has no letter for her findings to live against, so they only
+        // exist in this message and in her own history: say where to look.
+        msg.push_str(&format!(
+            "\n\nTHE FULL REVIEW IS IN {} - settle it there, or correct {} and run /autocoding \
+again.",
+            crate::team::AgentName::Joy.context_file(),
+            progress_file()
+        ));
+        let title = "jonnyq: /autocoding stopped - joy did not approve the plan";
+        if n.enabled() {
+            let footer = format!(
+                "Started: {}\nStopped: {}\nDuration: {}",
+                super::chrono_start(start),
+                super::chrono_now(),
+                crate::ui::go_duration_string(start.elapsed().as_millis() as i64)
+            );
+            let body = format!(
+                "{}\n\n{}\n\n{}",
+                crate::notify::format_error(&err),
+                msg,
+                footer
+            );
+            if let Err(e) = n.send_alert(title, &body).await {
+                self.ui
+                    .plainln(&format!("warning: ntfy notification failed: {}", e.message));
+            }
+            err = err.mark_notified();
+        }
+        self.ui.plainln(&format!(
+            "[autocoding] stopped at the plan - {} ({} fix round(s))",
+            verdict.note(),
+            rounds
+        ));
+        err
     }
 }
 

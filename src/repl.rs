@@ -48,9 +48,9 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /plan_for_human                   JACKY: like /plan, but designed so a person can verify each phase by using the app; sends the how-to-verify guide via ntfy
   /coding                           JOEY: work on the next unfinished task in .context/progress.md, then stop (Ctrl-C cancels)
   /coding_phase [<phase number>]    JOEY: work through the next unfinished phase of .context/progress.md (or the given phase) in one run, then stop and notify how to verify it (Ctrl-C cancels)
-  /autocoding                       JOEY: plan if needed, then work through every task in .context/progress.md in one run (Ctrl-C cancels)
+  /autocoding                       the whole pipeline in one run: JACKY plans/reconciles .context/progress.md from requirements.md (only when it is missing or the requirements changed), JOY verifies that plan (/verify on) and nothing is coded until she approves, then JOEY works every task with JOY verifying each one before the next; stops and alerts on ntfy if a plan or task will not clear her review (Ctrl-C cancels)
   /watchfile [<word>|off]           watch the working directory for a magic word (default "AI!") and act on it when found
-  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: ONE report per /plan, /plan_for_human, /coding, /coding_phase or /autocoding run - with /verify on it goes out when JOY has ruled, carrying her verdict and the work summary (or, for a refusal, the problem and her findings); with /verify off it goes out when the work finishes. Also: the /plan_for_human verification guide, error/stall alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
+  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: ONE report per /plan, /plan_for_human, /coding, /coding_phase or /autocoding run - with /verify on it goes out when JOY has ruled, carrying her verdict and the work summary (or, for a refusal, the problem and her findings); with /verify off it goes out when the work finishes. /autocoding also pushes its stop alerts: a plan or a task joy would not approve after the fix rounds, with her findings as the summary. Also: the /plan_for_human verification guide, error/stall alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
   /proxy [<socks url>|off|auto]     use a SOCKS proxy for every request (model, web_search, web_fetch, ntfy): /proxy socks5h://host:port or /proxy host:port; off = always direct, auto = follow ALL_PROXY/HTTPS_PROXY; no arg shows what is in effect
   /proxy no-proxy <hosts>           hosts that bypass the proxy (comma-separated; default localhost,127.0.0.1,::1)
   /toolmode [native|prompt]         switch how tools are called: native tool-calling (default) or a plain-text fenced JSON block for models with unreliable native tool-calling
@@ -919,6 +919,11 @@ so it doesn't fire again.",
     /// joy reads *that* rather than trusting either agent's reply text - which
     /// is the whole value of her having her own conversation. `arg` is the
     /// command's own argument (`/coding_phase 3`).
+    ///
+    /// `/autocoding` is the exception: it runs the review loop *inside* the run
+    /// (the plan gated before any task, then every task gated before the next),
+    /// so there is no work left for a command-level review to find and a second
+    /// one would only re-read code joy already approved.
     async fn verified(
         &self,
         name: AgentName,
@@ -928,6 +933,9 @@ so it doesn't fire again.",
     ) -> R<()> {
         let what = format!("{cmd} on {}", crate::team::progress_file());
         let coding = self.coding(name, cmd).await;
+        if cmd == "/autocoding" {
+            return coding.auto_run(cancel).await;
+        }
         let work = async move {
             match (name, cmd) {
                 (_, "/plan") => coding.plan(cancel, true).await,
@@ -1577,6 +1585,10 @@ mod tests {
 
     /// `/plan` is jacky's and `/coding` is joey's: the command names the
     /// agent, and the banner says so before the turn runs.
+    ///
+    /// `/autocoding` is owned by joey but runs the whole pipeline, so it may
+    /// legitimately end on another lane (the plan is jacky's, a verdict is
+    /// joy's) — hence the weaker "who did it start with, and who is left" split.
     #[tokio::test]
     async fn the_coding_commands_name_the_agent_that_owns_them() {
         for (cmd, who) in [
@@ -1597,6 +1609,20 @@ mod tests {
                 text.contains(&format!("=== agent {who} |")),
                 "{cmd} did not announce {who}: {text}"
             );
+            if cmd == "/autocoding" {
+                // The run visited the planner (its first step is the plan) and
+                // left the session on one of the lanes the pipeline works on.
+                let left = t.repl.team.active_name().key();
+                assert!(
+                    text.contains("=== agent jacky |"),
+                    "{cmd} did not hand the plan to jacky: {text}"
+                );
+                assert!(
+                    ["joey", "jacky", "joy"].contains(&left),
+                    "{cmd} left the session on an unexpected lane: {left}"
+                );
+                continue;
+            }
             assert_eq!(
                 t.repl.team.active_name().key(),
                 who,

@@ -573,6 +573,44 @@ and the task waits at [+] until she re-reviews it",
         Ok((verdict, done))
     }
 
+    /// The gate for **the plan** — `/autocoding`'s first step, where the work
+    /// under review is the checklist itself rather than one coded task.
+    ///
+    /// It is [`Team::review`] (the plan brief: coverage of the requirements,
+    /// granularity, order, verifiability) rather than [`Team::review_task`],
+    /// because a checklist has nothing to build or run yet, and it loops
+    /// `rounds` fix cycles back to JACKY — a plan of his that she refused comes
+    /// back to him to correct, never to JOEY to code around.
+    ///
+    /// `rounds` is passed in rather than read from [`Team::review_rounds`] at the
+    /// call site, so the caller decides how much of the budget the plan gets:
+    /// `/autocoding` hands it the same `/review_rounds` figure the tasks get.
+    pub(crate) async fn gate_plan_once(
+        &self,
+        cancel: &CancellationToken,
+        what: &str,
+        rounds: i64,
+    ) -> R<(Verdict, i64)> {
+        let author = AgentName::Jacky;
+        let mut done = 0i64;
+        let mut verdict = self.review(cancel, author, what).await?;
+        loop {
+            let findings = match &verdict {
+                Verdict::NeedsFix(f) if done < rounds => f.clone(),
+                _ => break,
+            };
+            done += 1;
+            self.ui_note(&format!(
+                "[review] plan round {done}/{rounds}: joy refused the plan - her findings go back \
+to jacky to correct in {}; nothing is coded until she approves it",
+                progress_file()
+            ));
+            self.fix(cancel, author, what, &findings).await?;
+            verdict = self.review(cancel, author, what).await?;
+        }
+        Ok((verdict, done))
+    }
+
     /// The coder's fix turn for one refused task: her findings, plus the two
     /// things [`Team::fix`] cannot know — which checkbox is meant, and that the
     /// letter to move it to is `[+]` (still his own, since the fix is not

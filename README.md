@@ -6,7 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.2.1
+jonnyq v1.2.2
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.1`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.2`) above the first prompt, so a transcript and a screenshot carry the build they came from.
 
 ## Version
 
-jonnyq is at **v1.2.1**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+jonnyq is at **v1.2.2**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
 
 | Where | What you see |
 |---|---|
-| Terminal, at startup | `jonnyq v1.2.1` above the first prompt, and in the transcript log |
+| Terminal, at startup | `jonnyq v1.2.2` above the first prompt, and in the transcript log |
 | `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
 | `/version` | The same line, any time during a session |
 | `/help`, `/?` | The version above the slash command list |
-| Web console | In the browser tab's title (`jonnyq console v1.2.1`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
-| `GET /health` | `"version": "1.2.1"` in the JSON, so a script can identify a running session |
+| Web console | In the browser tab's title (`jonnyq console v1.2.2`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.2.2"` in the JSON, so a script can identify a running session |
 
 `-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
@@ -261,7 +261,7 @@ Notes:
 | `/plan_for_human` | JACKY: like `/plan`, but also writes `> How to run:` / `> Human check:` notes so a person can verify each phase by using the app |
 | `/coding` | JOEY: do the next unfinished task in `.context/progress.md`, then stop |
 | `/coding_phase [<n>]` | JOEY: do all tasks of one phase (fresh history per task), then stop; `/coding_phase 3` picks a phase explicitly |
-| `/autocoding` | JOEY: run `/plan` if needed, then every remaining task in one go |
+| `/autocoding` | the whole pipeline in one run: JACKY plans/reconciles the checklist (only when it is missing or `requirements.md` changed), JOY verifies that plan and nothing is coded until she approves, then JOEY works every task with JOY verifying each before the next |
 | `/watchfile [<word>\|off]` | Watch the working tree for a magic word and turn that line into a prompt |
 | `/ntfy [<topic url>\|off]` | Show/set/disable the ntfy topic |
 | `/proxy [<socks url>\|off\|auto]` | Show/set the proxy for all traffic, from the next request |
@@ -321,10 +321,11 @@ Write `requirements.md` yourself, then:
 
 | | `/plan` | `/coding` | `/coding_phase` | `/autocoding` |
 |---|---|---|---|---|
-| Creates `.context/progress.md` | Yes | No | No | Yes (calls `/plan`) |
+| Who works | JACKY | JOEY (+ JOY) | JOEY (+ JOY) | JACKY → JOY → JOEY (+ JOY per task) |
+| Creates `.context/progress.md` | Yes | No | No | Yes (its own plan pass) |
 | Work done | none | 1 task | 1 phase | all tasks |
 | Clears history per task | – | No | Yes | Yes |
-| Stops when | plan written | 1 task done | phase done | everything done |
+| Stops when | plan written | 1 task done | phase done | everything done — or earlier, see below |
 
 `.context/progress.md` is a GitHub-checkbox checklist grouped into phases, kept in sync with `requirements.md` by a SHA-256 hash in `.context/progress.hash` — changed requirements reconcile the existing plan instead of regenerating it:
 
@@ -358,6 +359,17 @@ While coding, the system prompt switches to an autonomous mode that forbids mark
 Both coding commands carry an explicit scope rule, and it is worth knowing why: an early session was told *"create the project root file `index.html`"* and wrote the entire calculator into it, then spent the rest of the turn inventing a DOM shim to test logic no task had asked for yet. Two things in the old prompt caused that — it named no boundary, and it demanded "the real build and test commands **for this project**", which a task with no behaviour yet can only satisfy by first writing behaviour. So a task line is now the whole of JOEY's assignment: implement exactly what it says, leave later tasks alone, and verify only what this task delivers — for a file/skeleton task, "the file exists with exactly the required content" *is* the verification. Going beyond the task is treated as a defect even when it works, because the reviewer can no longer tell task from surplus and later tasks lose their verification. JOY checks for exactly that, and a finding of "this is task 6's work" is fixed by removing the surplus, not by adding more.
 
 Joy's review briefs differ by author, for the same reason: a plan has no build to re-run. Reviewing **JACKY's plan** is a coverage audit — she walks `requirements.md` requirement by requirement and reports any requirement, edge case or constraint no task delivers, anything a coder would have to guess, any task too broad to verify in one sitting, any task that could be ticked without proving anything. A plan that can be followed to the letter and still yields an incomplete app is a failed plan, and that is what she is there to catch before `/coding` spends an hour on it. Reviewing **JOEY's change** is a correctness-and-scope check: re-run the build and tests, then confirm the change delivers exactly the task line it was ticked against.
+
+### What `/autocoding` does, in order
+
+`/autocoding` runs the whole pipeline unattended, in the order the work has to happen in:
+
+1. **JACKY plans** — the checklist is generated from `requirements.md` when there is none, and reconciled when the requirements changed since the last pass. When the requirements are unchanged, no planning turn runs at all: the plan is already settled, so it is neither rewritten nor re-read.
+2. **JOY verifies the plan** (`/verify on`, and only when step 1 actually wrote or changed it). Her findings go back to JACKY to correct in the checklist, for as many rounds as `/review_rounds` allows. Still refused — or no verdict at all — and the run **stops before a single task is coded** and pushes the problem summary to ntfy. Coding on a plan nobody approved is exactly what this gate exists to prevent.
+3. **JOEY codes, task by task**, each one verified by JOY (with the same fix-round budget) before the next starts. A task that will not clear her review stops the run rather than being built on.
+4. **One report** at the end — the summary of the run pushed to ntfy, whether it finished or stopped early.
+
+With `/verify off`, steps 2 and the per-task review are skipped and the run is the plain plan-then-code it always was. `/plan` and `/coding` are unchanged: each does its own lane and hands its output to JOY when `/verify` is on.
 
 `/watchfile` is pair programming without leaving the editor: start it with `/watchfile`, then drop a magic word into the code —
 
@@ -616,7 +628,7 @@ tree already listed and stopping a turn, nothing else.
 
 Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). **One command, one message**: `/plan`, `/plan_for_human`, `/coding`, `/coding_phase` and `/autocoding` push exactly once, when the run is over — not per task, and not again for the review.
 
-- **`/verify` on** (the default): the command's completion report is held while JOY reviews the work, and goes out with her verdict in front of it. Approved → a plain message with the work summary. Refused, or her findings still unresolved after `/review_rounds` fix rounds → the run has already stopped at the task that would not clear the gate, and one high-priority message carries what is wrong, her findings, and where the checklist stands.
+- **`/verify` on** (the default): the command's completion report is held while JOY reviews the work, and goes out with her verdict in front of it. Approved → a plain message with the work summary. Refused, or her findings still unresolved after `/review_rounds` fix rounds → the run has already stopped at the task that would not clear the gate, and one high-priority message carries what is wrong, her findings, and where the checklist stands. `/autocoding` gates twice like this and pushes for both: the plan (before any task is coded) and each task — the run stops at whichever one would not clear her review, and that stop report is its one message.
 - **`/verify` off**: nothing is held and nothing is waited for — the message goes out the moment the command finishes, with the same summary.
 
 On top of those, a high-priority `warning` message goes out when a turn fails or stalls (the failure text carries a `Reason:` line explaining the likely cause). Summaries are computed from `.context/progress.md` directly, not by calling the model.

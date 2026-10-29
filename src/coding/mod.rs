@@ -469,6 +469,18 @@ impl<'a> Coding<'a> {
     pub fn gate(&self) -> Gate {
         Gate::from_verify(self.team.verify())
     }
+
+    /// The planner of this run: JACKY's conversation, whether or not the caller
+    /// activated him first (a one-agent roster has him in every slot).
+    ///
+    /// `/plan`, `/plan_for_human` and `/autocoding`'s internal plan pass all run
+    /// their turns here. The plan is the planner's work: written from the
+    /// coder's conversation it would spend JOEY's context on design, and leave
+    /// JACKY's history — which is what JOY reads to check a plan's reasoning —
+    /// holding nothing of the pass that produced it.
+    pub fn planner(&self) -> Arc<Agent> {
+        self.team.get(crate::team::AgentName::Jacky)
+    }
 }
 
 /// The files one coding run reads and writes, resolved once so a task's
@@ -1095,6 +1107,29 @@ Do not mark a task you did not finish - the letter is the record a person reads.
 // /plan and /plan_for_human
 // ---------------------------------------------------------------------------
 
+/// What one planning pass did to the checklist — the question `/autocoding`
+/// turns on: a plan that was just written or reconciled is new work, and with
+/// `/verify` on JOY has to approve it before a single task is coded, while a
+/// plan that was already up to date was approved (or left alone) earlier and
+/// needs no re-reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanChange {
+    /// `requirements.md` had not changed: the checklist was left as it stood.
+    Unchanged,
+    /// The checklist was generated from `requirements.md` — there was none.
+    Created,
+    /// `requirements.md` had changed, so the existing checklist was reconciled.
+    Reconciled,
+}
+
+impl PlanChange {
+    /// Whether the plan is new or was just changed, so it must clear the gate
+    /// before any coding starts.
+    pub fn changed(self) -> bool {
+        self != PlanChange::Unchanged
+    }
+}
+
 impl<'a> Coding<'a> {
     /// /plan: generates .progress from requirements.md if missing, or
     /// reconciles it if requirements.md changed since .progress was last
@@ -1105,7 +1140,16 @@ impl<'a> Coding<'a> {
     /// up to date. `notify` false (as AutoRun uses for its internal call)
     /// disables the completion notification.
     pub async fn plan(&self, cancel: &CancellationToken, notify: bool) -> R<()> {
-        self.plan_inner(cancel, notify, false).await
+        self.plan_inner(cancel, notify, false, "/plan").await.map(|_| ())
+    }
+
+    /// The same pass as [`Coding::plan`], answering what `/autocoding` has to
+    /// know and a bare `/plan` does not: whether the plan was written or changed
+    /// now, or was already up to date ([`PlanChange`]). No notification of its
+    /// own — `/autocoding` reports once, at its end — and the banners name the
+    /// command that borrowed the planner.
+    pub async fn plan_checked(&self, cancel: &CancellationToken) -> R<PlanChange> {
+        self.plan_inner(cancel, false, false, "/autocoding").await
     }
 
     /// /plan_for_human: like plan, but the plan is designed so a person can
@@ -1114,18 +1158,26 @@ impl<'a> Coding<'a> {
     /// Human check:" note; if notifications are enabled, the verification
     /// guide is sent through them.
     pub async fn plan_for_human(&self, cancel: &CancellationToken) -> R<()> {
-        self.plan_inner(cancel, true, true).await
+        self.plan_inner(cancel, true, true, "/plan_for_human")
+            .await
+            .map(|_| ())
     }
 
-    async fn plan_inner(&self, cancel: &CancellationToken, notify: bool, human: bool) -> R<()> {
+    async fn plan_inner(
+        &self,
+        cancel: &CancellationToken,
+        notify: bool,
+        human: bool,
+        note: &str,
+    ) -> R<PlanChange> {
         let start = Instant::now();
         let cmd = if human { "/plan_for_human" } else { "/plan" };
         let n = self.notifier();
         let n = if notify { n } else { Notifier::disabled() };
 
-        let result = self.plan_body(cancel, &n, human, start).await;
+        let result = self.plan_body(cancel, &n, human, start, note).await;
         match result {
-            Ok(()) => Ok(()),
+            Ok((change, _)) => Ok(change),
             Err(e) => Err(notify_failure(
                 &n,
                 &self.ui,
@@ -1138,14 +1190,28 @@ impl<'a> Coding<'a> {
         }
     }
 
+    /// The planning pass itself: one of three outcomes, reported as
+    /// [`PlanChange`] with the summary the command notifies with (empty when
+    /// there is nothing to report — a checklist that is already up to date did
+    /// no work, so it has no news).
+    ///
+    /// Every turn runs on JACKY's conversation ([`Coding::planner`]), including
+    /// `/autocoding`'s internal call: the plan is the planner's lane, and the
+    /// coder must not spend his context designing it — nor JOY read a coder's
+    /// history for the reasoning behind a plan she is auditing.
     async fn plan_body(
         &self,
         cancel: &CancellationToken,
         n: &Notifier,
         human: bool,
         start: Instant,
-    ) -> R<()> {
+        note: &str,
+    ) -> R<(PlanChange, String)> {
         let cmd = if human { "/plan_for_human" } else { "/plan" };
+        // Announced, because with `/autocoding` the coder is the agent on screen
+        // when the plan pass starts, and a silent hand-off to the planner reads
+        // as the coder designing his own checklist.
+        let planner = self.team.start(crate::team::AgentName::Jacky, note);
         let req_path = self.path(REQUIREMENTS_FILE);
         let Ok(req_data) = std::fs::read(&req_path) else {
             return Err(AgentError::new(format!(
@@ -1157,18 +1223,18 @@ impl<'a> Coding<'a> {
         let prog_path = self.path(&progress_file());
         let hash_path = self.path(&hash_file());
 
-        let _mode_guard = CodingModeGuard::on(&self.agent);
+        let _mode_guard = CodingModeGuard::on(&planner);
         // Whether any model turn happened, so a notification reports real
         // usage figures (of the last turn) or n/a, never stale ones.
         let mut turn_ran = false;
         macro_rules! run_turn {
             ($prompt:expr) => {{
                 turn_ran = true;
-                self.agent.run_turn(cancel.child_token(), &$prompt).await
+                planner.run_turn(cancel.child_token(), &$prompt).await
             }};
         }
 
-        let outcome: R<String> = if !prog_path.exists() {
+        let outcome: R<(PlanChange, String)> = if !prog_path.exists() {
             self.ui.plainln(&format!(
                 "[plan] no {} found, generating task list from {}",
                 progress_file(),
@@ -1212,12 +1278,15 @@ impl<'a> Coding<'a> {
                 }
             }
             let tasks = parse_progress(&prog_path).unwrap_or_default();
-            Ok(format!(
-                "Generated {} from {}: {}.{}",
-                progress_file(),
-                REQUIREMENTS_FILE,
-                progress_summary_line_local(&tasks),
-                warn
+            Ok((
+                PlanChange::Created,
+                format!(
+                    "Generated {} from {}: {}.{}",
+                    progress_file(),
+                    REQUIREMENTS_FILE,
+                    progress_summary_line_local(&tasks),
+                    warn
+                ),
             ))
         } else if read_stored_hash(&hash_path) == current_hash {
             if !human {
@@ -1226,7 +1295,8 @@ impl<'a> Coding<'a> {
                     progress_file(),
                     REQUIREMENTS_FILE
                 ));
-                return Ok(()); // no notification
+                // No notification: a checklist that was left alone is no news.
+                return Ok((PlanChange::Unchanged, String::new()));
             }
             self.ui.plainln(&format!(
                 "[plan_for_human] {} is already up to date with {}",
@@ -1257,12 +1327,22 @@ impl<'a> Coding<'a> {
             } else {
                 "Added human verification notes to"
             };
-            Ok(format!(
-                "{} {}: {}.{}",
-                what,
-                progress_file(),
-                progress_summary_line_local(&tasks),
-                warn
+            // The notes are part of the plan document, so writing them is a
+            // change to it; re-sending a guide that was already there changed
+            // nothing.
+            Ok((
+                if had_guide {
+                    PlanChange::Unchanged
+                } else {
+                    PlanChange::Reconciled
+                },
+                format!(
+                    "{} {}: {}.{}",
+                    what,
+                    progress_file(),
+                    progress_summary_line_local(&tasks),
+                    warn
+                ),
             ))
         } else {
             let tasks_before = parse_progress(&prog_path).unwrap_or_default();
@@ -1303,20 +1383,23 @@ impl<'a> Coding<'a> {
                 }
             }
             let tasks_after = parse_progress(&prog_path).unwrap_or_default();
-            Ok(format!(
-                "Reconciled {} against {}: {} tasks total (was {}), {}.{}",
-                progress_file(),
-                REQUIREMENTS_FILE,
-                tasks_after.len(),
-                tasks_before.len(),
-                progress_summary_line_local(&tasks_after),
-                warn
+            Ok((
+                PlanChange::Reconciled,
+                format!(
+                    "Reconciled {} against {}: {} tasks total (was {}), {}.{}",
+                    progress_file(),
+                    REQUIREMENTS_FILE,
+                    tasks_after.len(),
+                    tasks_before.len(),
+                    progress_summary_line_local(&tasks_after),
+                    warn
+                ),
             ))
         };
 
-        let summary = outcome?;
+        let (change, summary) = outcome?;
         if summary.is_empty() {
-            return Ok(());
+            return Ok((change, String::new()));
         }
         // finish(): append the verification guide in human mode, then notify.
         let mut summary = summary;
@@ -1330,7 +1413,7 @@ impl<'a> Coding<'a> {
             }
         }
         let u = if turn_ran {
-            self.agent.last_usage.lock().unwrap().usage
+            planner.last_usage.lock().unwrap().usage
         } else {
             Usage::default()
         };
@@ -1341,7 +1424,7 @@ impl<'a> Coding<'a> {
             &with_timing(&summary, start, u),
         )
         .await;
-        Ok(())
+        Ok((change, summary))
     }
 }
 

@@ -402,6 +402,151 @@ mod tests {
 
     // ---- /autocoding ----
 
+    /// `/verify on` puts the plan in front of the coder: JOY reviews what JACKY
+    /// just wrote and approves it BEFORE a single task is coded. The order of the
+    /// provider's requests is the proof — the plan review must sit between the
+    /// generation of the checklist and the first coding turn.
+    #[tokio::test]
+    async fn auto_run_with_verify_on_has_joy_approve_the_plan_before_any_coding() {
+        let srv = ntfy().await;
+        let (e, provider) = env(
+            "auto-plan-gate-ok",
+            vec![
+                // jacky writes the plan.
+                write_progress_step(ONE_TASK),
+                content_step("planned it"),
+                // joy reads the plan itself (a plan review, not a build).
+                content_step("APPROVE\nthe checklist covers every requirement"),
+                // only now does joey get his turn, and joy verifies his work.
+                write_progress_step("- [?] task one\n"),
+                content_step("coded it"),
+                content_step("APPROVE"),
+            ],
+        );
+        e.dir.write(REQUIREMENTS_FILE, "build a thing");
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        team.set_review_rounds(1);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        c.auto_run(&CancellationToken::new()).await.unwrap();
+
+        assert_eq!(provider.call_count(), 6, "plan(2) + plan review + task(2) + review");
+        let reqs = provider.sent_reqs.lock().unwrap();
+        let plan_review = reqs[2].messages.last().unwrap().content.clone();
+        assert!(
+            plan_review.contains("Review the work jacky just finished"),
+            "the third turn is joy's review of the plan: {plan_review}"
+        );
+        assert!(
+            plan_review.contains("You are reviewing a PLAN"),
+            "a checklist gets the plan brief, not the code brief: {plan_review}"
+        );
+        let first_coding = reqs[3].messages.last().unwrap().content.clone();
+        assert!(
+            first_coding.contains("task one"),
+            "the task turn follows the plan verdict: {first_coding}"
+        );
+        assert_eq!(e.dir.read(&progress_file()), "- [A] task one\n");
+        // One push for the whole command, and it says the plan was approved.
+        let notes = srv.notifications();
+        assert_eq!(notes.len(), 1, "one push for the whole run: {notes:?}");
+        let (title, body) = &notes[0];
+        assert!(title.contains("/autocoding complete"), "title: {title}");
+        assert!(
+            body.contains("joy approved it"),
+            "the report says the plan was verified first: {body}"
+        );
+        assert!(body.contains("1/1 tasks approved"), "body: {body}");
+    }
+
+    /// A plan JOY will not approve stops the run BEFORE any coding: the checklist
+    /// is untouched, nothing was coded, and the one thing that goes out is the
+    /// problem summary at high priority, carrying her findings.
+    #[tokio::test]
+    async fn auto_run_stops_at_a_refused_plan_and_codes_nothing() {
+        let srv = ntfy().await;
+        let (e, provider) = env(
+            "auto-plan-gate-refused",
+            vec![
+                write_progress_step(ONE_TASK),
+                content_step("planned it"),
+                // joy refuses; jacky corrects the plan; joy still refuses, and
+                // the round budget is spent.
+                content_step("NEEDS FIX\n1. REQ-002 has no task at all"),
+                content_step("added the missing task"),
+                content_step("NEEDS FIX\n1. still no task for REQ-002"),
+            ],
+        );
+        e.dir.write(REQUIREMENTS_FILE, "build a thing");
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        team.set_review_rounds(1);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        let err = c.auto_run(&CancellationToken::new()).await.unwrap_err();
+
+        assert!(
+            err.message.contains("did not clear joy's review") && err.notified,
+            "the stop is reported once: {err:?}"
+        );
+        assert_eq!(provider.call_count(), 5, "plan(2) + review + fix + review");
+        // Nothing was coded: the checklist is exactly as it was generated.
+        assert_eq!(e.dir.read(&progress_file()), ONE_TASK);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1, "one push for the whole run: {reqs:?}");
+        let alert = &reqs[0];
+        assert_eq!(
+            alert.header("priority").as_deref(),
+            Some("high"),
+            "a stopped run is an alert"
+        );
+        assert!(
+            alert.header("title").unwrap_or_default().contains("did not approve the plan"),
+            "title: {}",
+            alert.header("title").unwrap_or_default()
+        );
+        // The findings that go out are the ones from the review that ended it —
+        // a re-review restates what still stands, as in the task gate.
+        for want in ["STOPPED AT THE PLAN", "NO TASK WAS CODED", "still no task for REQ-002"] {
+            assert!(alert.body.contains(want), "body missing {want}: {}", alert.body);
+        }
+    }
+
+    /// The requirements did not move, so the plan is not new work: JACKY runs no
+    /// turn and JOY is not asked to re-read a checklist she already ruled on —
+    /// the run goes straight to the tasks.
+    #[tokio::test]
+    async fn auto_run_does_not_re_plan_or_re_review_an_unchanged_plan() {
+        let (e, provider) = env(
+            "auto-plan-unchanged",
+            vec![
+                write_progress_step("- [?] task one\n"),
+                content_step("coded it"),
+                content_step("APPROVE"),
+            ],
+        );
+        e.dir.write(REQUIREMENTS_FILE, "build a thing");
+        e.dir.write(&progress_file(), ONE_TASK);
+        let hash = file_hash(e.dir.read(REQUIREMENTS_FILE).as_bytes());
+        e.dir.write(&hash_file(), &hash);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), "");
+        c.auto_run(&CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            provider.call_count(),
+            3,
+            "no planning turn and no plan review: only the task and its verdict"
+        );
+        let reqs = provider.sent_reqs.lock().unwrap();
+        assert!(
+            reqs[0].messages.last().unwrap().content.contains("task one"),
+            "the first turn is the coder's"
+        );
+        assert_eq!(e.dir.read(&progress_file()), "- [A] task one\n");
+    }
+
     #[tokio::test]
     async fn auto_run_generates_and_completes_all_tasks() {
         let (e, provider) = env(

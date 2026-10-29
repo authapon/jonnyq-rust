@@ -6,7 +6,7 @@
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.2.1
+jonnyq v1.2.2
 qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
 
-**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.2.1`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.2.2`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
 
 ## เวอร์ชัน
 
-jonnyq อยู่ที่ **v1.2.1** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
+jonnyq อยู่ที่ **v1.2.2** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
 
 | ที่ไหน | สิ่งที่เห็น |
 |---|---|
-| terminal, ตอนเปิด session | `jonnyq v1.2.1` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
+| terminal, ตอนเปิด session | `jonnyq v1.2.2` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
 | `jonnyq -h` / `-help` | เวอร์ชันเป็นบรรทัดแรกของ usage (พิมพ์ออกมาหลัง error ของ flag ผิดด้วย) |
 | `/version` | บรรทัดเดียวกัน เรียกใช้กลาง session ได้ตลอด |
 | `/help`, `/?` | เวอร์ชันอยู่เหนือรายการ slash command |
-| web console | ใน title ของ tab (`jonnyq console v1.2.1`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
-| `GET /health` | `"version": "1.2.1"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
+| web console | ใน title ของ tab (`jonnyq console v1.2.2`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
+| `GET /health` | `"version": "1.2.2"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
 
 `-h` ยัง exit ด้วย code 1 เหมือนโปรแกรมที่ใช้ Go `flag` เพราะถือเป็นการขอ usage ไม่ใช่คำสั่งปกติ และไม่มี flag `-version` — ใช้ `-h`, `/version` หรือ `curl 127.0.0.1:<port>/health` ของ session ที่เปิด `-web` แทน
 
@@ -261,7 +261,7 @@ syntax ของไฟล์รองรับ comment, `export KEY=value`, sing
 | `/plan_for_human` | JACKY: เหมือน `/plan` แต่เขียน `> How to run:` / `> Human check:` เพิ่ม เพื่อให้คนตรวจงานจริงได้ทีละ phase |
 | `/coding` | JOEY: ทำ task ถัดไปที่ยังไม่เสร็จใน `.context/progress.md` 1 ข้อแล้วหยุด |
 | `/coding_phase [<เลข>]` | JOEY: ทำทุก task ของ 1 phase (ล้าง history ก่อนทุก task) แล้วหยุด; เช่น `/coding_phase 3` |
-| `/autocoding` | JOEY: เรียก `/plan` ถ้าจำเป็น แล้วทำทุก task ที่เหลือรวดเดียว |
+| `/autocoding` | pipeline ทั้งชุดใน one run: JACKY วาง/reconcile checklist (เฉพาะเมื่อไม่มี หรือ `requirements.md` เปลี่ยน), JOY ตรวจ plan นั้นและยังไม่เขียนโค้ดจนกว่าเธอ approve, แล้ว JOEY ทำทุก task โดย JOY ตรวจก่อน task ถัดไป |
 | `/watchfile [<คำ>\|off]` | จับตาโฟลเดอร์หา magic word แล้วส่งบรรทัดนั้นเป็น prompt |
 | `/ntfy [<topic url>\|off]` | ดู/ตั้ง/ปิด ntfy topic |
 | `/proxy [<socks url>\|off\|auto]` | ดู/ตั้ง proxy ของ traffic ทั้งหมด มีผลตั้งแต่ request ถัดไป |
@@ -320,10 +320,11 @@ system prompt ของทุก agent มีรายชื่อทีมต�
 
 | | `/plan` | `/coding` | `/coding_phase` | `/autocoding` |
 |---|---|---|---|---|
-| สร้าง `.context/progress.md` | ได้ | ไม่ได้ | ไม่ได้ | ได้ (เรียก `/plan`) |
+| ผู้ทำงาน | JACKY | JOEY (+ JOY) | JOEY (+ JOY) | JACKY → JOY → JOEY (+ JOY ต่อ task) |
+| สร้าง `.context/progress.md` | ได้ | ไม่ได้ | ไม่ได้ | ได้ (ด้วย plan pass ของตัวเอง) |
 | ขอบเขตที่ทำ | ไม่เขียนโค้ด | 1 task | 1 phase | ทุก task |
 | ล้าง history ต่อ task | – | ไม่ได้ | ได้ | ได้ |
-| หยุดเมื่อ | เขียน plan เสร็จ | จบ 1 task | จบ phase | ครบทุก task |
+| หยุดเมื่อ | เขียน plan เสร็จ | จบ 1 task | จบ phase | ครบทุก task — หรือเร็วกว่านั้น ดูข้างล่าง |
 
 `.context/progress.md` คือ checklist แบบ GitHub checkbox จัดกลุ่มเป็น phase และถูก sync กับ `requirements.md` ด้วย SHA-256 ใน `.context/progress.hash` — ถ้า requirement เปลี่ยน jonnyq จะ **reconcile** plan เดิมแทนการ generate ใหม่ทั้งหมด:
 
@@ -357,6 +358,17 @@ system prompt ของทุก agent มีรายชื่อทีมต�
 คำสั่งกลุ่ม coding ทุกตัวมีกติกาขอบเขต (scope) กำกับไว้ ซึ่งเกิดจากของจริง: มี session หนึ่งได้ task ว่า *"สร้างไฟล์ `index.html` ไว้ใน working directory"* แล้ว JOEY เขียนเครื่องคิดเลขทั้งโปรแกรมลงไป จากนั้นใช้เวลาทั้ง turn ที่เหลือไปแต่ง DOM shim เพื่อทดสอบ logic ที่ยังไม่มี task ไหนสั่งให้เขียน สาเหตุมีสองอย่างใน prompt เดิม: มันไม่ได้ระบุขอบเขตไว้เลย และสั่งให้รัน "build and test commands **for this project**" ซึ่ง task ที่ยังไม่มี behaviour ไหนเลยจะผ่านได้ทางเดียวคือต้องเขียน behaviour ขึ้นมาก่อน ดังนั้นบรรทัด task จึงเป็นขอบเขตทั้งหมดของ JOEY: ทำให้ exactly ตามที่เขียนไว้ งานของ task หลังห้ามแตะ และตรวจเฉพาะสิ่งที่ task นี้ส่งมอบ — สำหรับ task ประเภทสร้างไฟล์/โครงไฟล์ "ไฟล์มีอยู่จริงและมีเนื้อหาตรงตามที่ task สั่ง" คือ verification ที่สมบูรณ์แล้ว การทำงานเกินขอบเขตถือเป็นข้อบกพร่องแม้จะรันได้ เพราะผู้ตรวจแยกไม่ออกว่าส่วนไหนคือ task ส่วนไหนคือส่วนเกิน และ task หลังก็สูญเสียการตรวจสอบของมันไปด้วย JOY ตรวจจุดนี้ด้วย และถ้า findings บอกว่า "นี่เป็นงานของ task 6" การแก้คือลบส่วนเกินออก ไม่ใช่เขียนเพิ่ม
 
 brief การตรวจงานของ JOY ต่างกันตามคนเขียน ด้วยเหตุผลเดียวกัน: plan ไม่มี build ให้รันซ้ำ — การตรวจ **plan ของ JACKY** คือการ audit ความครอบคลุม เธอไล่ `requirements.md` ทีละข้อแล้วรายงานข้อที่ task ไหน ๆ ไม่ส่งมอบ สิ่งที่ coder ต้องเดาเอง task ที่กว้างเกินจะตรวจเสร็จในการนั่งครั้งเดียว และ task ที่ติ๊กได้โดยไม่ได้พิสูจน์อะไรเลย — plan ที่ทำตามได้เป๊ะแต่ได้แอปไม่ครบคือ plan ที่ผิดพลาด และนั่นคือสิ่งที่เธอต้องดักไว้ก่อนที่ `/coding` จะเสียเวลาเป็นชั่วโมง ส่วนการตรวจ **code ของ JOEY** คือตรวจความถูกต้องและขอบเขต: รัน build/test จริง แล้วดูว่า changes ส่งมอบ exactly ตามบรรทัด task ที่ถูกติ๊กหรือไม่
+
+### `/autocoding` ทำอะไร เรียงตามลำดับ
+
+`/autocoding` รัน pipeline ทั้งชุดแบบไม่มีใครเฝ้า ตามลำดับที่งานต้องเกิด:
+
+1. **JACKY วาง plan** — checklist ถูก generate จาก `requirements.md` เมื่อไม่มีอยู่เดิม และถูก reconcile เมื่อ requirement เปลี่ยนตั้งแต่รอบก่อน ถ้า requirement ไม่เปลี่ยน จะไม่มีการ turn ของ model เลย: plan settles อยู่แล้ว จึงไม่ใช่สิ่งที่ต้องเขียนใหม่หรืออ่านซ้ำ
+2. **JOY ตรวจ plan** (`/verify on` และเฉพาะเมื่อข้อ 1 เขียนหรือแก้ plan จริง) — findings กลับไปให้ JACKY แก้ใน checklist กี่รอบก็ได้ตาม `/review_rounds` ถ้ายังไม่ผ่าน (หรือไม่มี verdict) งาน **หยุดก่อนเขียน task แรก** และ push สรุปปัญหาไป ntfy — การเขียนโค้ดบน plan ที่ไม่มีใคร approve คือสิ่งที่ gate นี้มีไว้กันพอดี
+3. **JOEY เขียนโค้ดทีละ task** — แต่ละ task ถูก JOY ตรวจ (ด้วยงบ fix รอบเท่ากัน) ก่อน task ถัดไปเริ่ม task ที่ไม่ผ่าน gate จะทำให้งานหยุด แทนที่จะถูกเขียนทับต่อไป
+4. **รายงานเดียว** ตอนจบ — สรุปงานทั้ง run push ไป ntfy ไม่ว่าจะจบครบหรือหยุดก่อน
+
+เปิด `/verify off` แล้วข้อ 2 และการตรวจต่อ task ถูกข้าม เหลือแค่ plan-then-code แบบเดิม ส่วน `/plan` กับ `/coding` ไม่เปลี่ยน: ทำ lane ของตัวเองแล้วส่งงานให้ JOY เมื่อ `/verify on`
 
 `/watchfile` คือ pair programming โดยไม่ต้องออกจาก editor — เริ่มด้วย `/watchfile` แล้วพิมพ์ magic word ลงในโค้ด:
 
@@ -552,7 +564,7 @@ keyboard เท่านั้น (ของบนหน้าเวบมีไ
 
 ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) — **หนึ่งคำสั่ง = หนึ่งข้อความ**: `/plan`, `/plan_for_human`, `/coding`, `/coding_phase` และ `/autocoding` จะ push เพียงครั้งเดียวตอนงานจบ ไม่ใช่ต่อ task และไม่แยกส่งเฉพาะงานกับเฉพาะการตรวจ
 
-- **`/verify on`** (default): รายงานจบงานของคำสั่งจะถูก hold ไว้ก่อน แล้วถูกส่งออกไปพร้อมกับ verdict ของ JOY — ผ่าน → ข้อความธรรมดาพร้อมสรุปงาน / ไม่ผ่าน หรือ findings ยังไม่เคลียร์หลังจากแก้ครบ `/review_rounds` รอบ → งานหยุดที่ task ที่ไม่ผ่าน gate อยู่แล้ว และมีข้อความ priority สูงหนึ่งฉบับบอกว่ามีปัญหาอะไร findings ของเธอ และ checklist ยืนอยู่ที่ไหน
+- **`/verify on`** (default): รายงานจบงานของคำสั่งจะถูก hold ไว้ก่อน แล้วถูกส่งออกไปพร้อมกับ verdict ของ JOY — ผ่าน → ข้อความธรรมดาพร้อมสรุปงาน / ไม่ผ่าน หรือ findings ยังไม่เคลียร์หลังจากแก้ครบ `/review_rounds` รอบ → งานหยุดที่ task ที่ไม่ผ่าน gate อยู่แล้ว และมีข้อความ priority สูงหนึ่งฉบับบอกว่ามีปัญหาอะไร findings ของเธอ และ checklist ยืนอยู่ที่ไหน `/autocoding` มี gate สองชั้นและส่งทั้งสองชั้น: plan (ก่อนมีการเขียน task ใด) และ task แต่ละตัว — run หยุดที่ชั้นที่ไม่ผ่าน review และข้อความ stop report นั้นคือข้อความเดียวของมัน
 - **`/verify off`**: ไม่มีอะไรต้องรอ — ข้อความออกไปทันทีที่คำสั่งจบ พร้อมสรุปงานแบบเดียวกัน
 
 เหนือจากนั้น มีข้อความ priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall (เนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น) สรุปงานคำนวณจาก `.context/progress.md` โดยตรง (ไม่เรียก model เพิ่ม)
