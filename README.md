@@ -6,7 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.2.0
+jonnyq v1.2.1
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.0`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.1`) above the first prompt, so a transcript and a screenshot carry the build they came from.
 
 ## Version
 
-jonnyq is at **v1.2.0**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+jonnyq is at **v1.2.1**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
 
 | Where | What you see |
 |---|---|
-| Terminal, at startup | `jonnyq v1.2.0` above the first prompt, and in the transcript log |
+| Terminal, at startup | `jonnyq v1.2.1` above the first prompt, and in the transcript log |
 | `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
 | `/version` | The same line, any time during a session |
 | `/help`, `/?` | The version above the slash command list |
-| Web console | In the browser tab's title (`jonnyq console v1.2.0`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
-| `GET /health` | `"version": "1.2.0"` in the JSON, so a script can identify a running session |
+| Web console | In the browser tab's title (`jonnyq console v1.2.1`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.2.1"` in the JSON, so a script can identify a running session |
 
 `-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
@@ -614,7 +614,14 @@ tree already listed and stopping a turn, nothing else.
 
 ## Notifications (ntfy)
 
-Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). jonnyq pushes a message when `/plan`, `/coding`, `/coding_phase` or `/autocoding` finishes, when **JOY hands in a verdict** (one per reviewed work and one per verified task, with her findings as a numbered list — a refusal goes out at high priority, an approval as a plain message), and a high-priority `warning` message when a turn fails or stalls — the failure text includes a `Reason:` line explaining the likely cause. Summaries are computed from `.context/progress.md` directly, not by calling the model.
+Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). **One command, one message**: `/plan`, `/plan_for_human`, `/coding`, `/coding_phase` and `/autocoding` push exactly once, when the run is over — not per task, and not again for the review.
+
+- **`/verify` on** (the default): the command's completion report is held while JOY reviews the work, and goes out with her verdict in front of it. Approved → a plain message with the work summary. Refused, or her findings still unresolved after `/review_rounds` fix rounds → the run has already stopped at the task that would not clear the gate, and one high-priority message carries what is wrong, her findings, and where the checklist stands.
+- **`/verify` off**: nothing is held and nothing is waited for — the message goes out the moment the command finishes, with the same summary.
+
+On top of those, a high-priority `warning` message goes out when a turn fails or stalls (the failure text carries a `Reason:` line explaining the likely cause). Summaries are computed from `.context/progress.md` directly, not by calling the model.
+
+One case sends nothing on a clean run: a bare `/plan` that finds `.context/progress.md` already in step with `requirements.md` did no work, so there is no summary to send — the terminal says so, and only a refusal from JOY still breaks the silence there. Everything else that runs a command reports, including a run that ended with its task still open (the attempt is on record in `.context/progress.retry`, and the message says how many attempts it has had).
 
 The same topic is also an inbound channel: `ask_user` pushes the question and subscribes for the reply, so you can answer from your phone (`answer: <text>`, or plain quick reply). Whoever answers first wins — keyboard, browser popup (`-web`) or phone; the losing channels are told, so the popup closes and the terminal prompt is not left hanging.
 

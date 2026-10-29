@@ -346,12 +346,20 @@ pub struct Team {
     /// How many fix/re-review cycles one command may run
     /// (`/review_rounds`, `JONNYQ_REVIEW_ROUNDS`).
     review_rounds: std::sync::atomic::AtomicI64,
-    /// The ntfy topic JOY's verdicts are posted to (`/ntfy`,
+    /// The ntfy topic the roster's reports are posted to (`/ntfy`,
     /// `JONNYQ_NTFY_URL`). Kept here rather than read from the config per
     /// review because the roster outlives `/ntfy` changes and `/ntfy off` must
     /// silence the alerts immediately; it is the same URL the coding commands
     /// build their own notifier from.
     ntfy_url: std::sync::Mutex<String>,
+    /// The completion report the command in flight is holding back until JOY
+    /// has ruled ([`crate::coding::NoticeSlot`], [`Team::settle_notice`]).
+    notice: crate::coding::NoticeSlot,
+    /// Whether a command in flight must hold that report. Armed by
+    /// [`Team::review_after`] for the duration of the work it is about to
+    /// review, and off at every other moment, so a command that no review is
+    /// waiting on never holds its news for a reviewer who is not coming.
+    defer: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for Team {
@@ -364,6 +372,8 @@ impl Clone for Team {
             verify: std::sync::atomic::AtomicBool::new(self.verify()),
             review_rounds: std::sync::atomic::AtomicI64::new(self.review_rounds()),
             ntfy_url: std::sync::Mutex::new(self.ntfy_url()),
+            notice: self.notice.clone(),
+            defer: std::sync::atomic::AtomicBool::new(self.defer_notices()),
         }
     }
 }
@@ -405,6 +415,8 @@ impl Team {
             verify: std::sync::atomic::AtomicBool::new(cfg.verify),
             review_rounds: std::sync::atomic::AtomicI64::new(cfg.review_rounds.max(0)),
             ntfy_url: std::sync::Mutex::new(cfg.ntfy_url.clone()),
+            notice: crate::coding::NoticeSlot::default(),
+            defer: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -465,7 +477,36 @@ impl Team {
             verify: std::sync::atomic::AtomicBool::new(false),
             review_rounds: std::sync::atomic::AtomicI64::new(0),
             ntfy_url: std::sync::Mutex::new(String::new()),
+            notice: crate::coding::NoticeSlot::default(),
+            defer: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The mailbox the coding command in flight leaves its report in, so the
+    /// review that follows can send it with the verdict on the front
+    /// ([`Team::settle_notice`]).
+    pub fn notice(&self) -> &crate::coding::NoticeSlot {
+        &self.notice
+    }
+
+    /// Whether a command must hold its completion report instead of sending it.
+    ///
+    /// True only while [`Team::review_after`] is running the work it is about to
+    /// review: the verdict is the part of the news a person is waiting for, and
+    /// it does not exist while the work is still running, so the command leaves
+    /// its summary in [`Team::notice`] and the review sends it once
+    /// ([`Team::settle_notice`]). Nobody armed the mailbox - a direct call to
+    /// [`crate::coding::Coding::run_one_task`] from a test or another embedding,
+    /// or any command running with `/verify off` - and the command reports the
+    /// moment it is done, as it always did. Either way a command notifies
+    /// **once**.
+    pub fn defer_notices(&self) -> bool {
+        self.defer.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arms the hold for the duration of one reviewed command.
+    fn set_defer(&self, on: bool) {
+        self.defer.store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn get(&self, name: AgentName) -> Arc<Agent> {

@@ -1157,35 +1157,54 @@ async fn a_hand_off_names_the_context_file_to_read() {
     }
 }
 
+/// The command's report is held while JOY reviews and goes out once she has
+/// ruled: one push per command, the verdict first, the command's own summary
+/// below it. A refusal is the one verdict worth waking someone for, so it goes
+/// out at high priority.
 #[tokio::test]
-async fn joy_s_verdict_is_pushed_to_ntfy() {
+async fn the_held_report_goes_out_once_with_the_verdict_on_the_front() {
     let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
     let log = TestLog::new("joy-notify");
     let t = team(&log, Vec::new());
     t.set_ntfy_url(&srv.url);
-    t.notify_verdict(
-        "joy reviewed /plan",
-        &Verdict::NeedsFix("1. nothing builds".into()),
-        "Work reviewed: /plan\n\nJOY'S FINDINGS\n1. nothing builds\n2. tests skipped",
+    t.notice().put(
+        "/plan",
+        "jonnyq: /plan complete",
+        "Generated .context/progress.md from requirements.md: 12/12 tasks approved",
+    );
+    t.settle_notice(
+        "/plan on .context/progress.md",
+        &Verdict::NeedsFix("1. nothing builds\n2. tests skipped".into()),
+        1,
+        1,
     )
     .await;
     let notes = srv.notifications();
-    assert_eq!(notes.len(), 1, "one push per verdict");
+    assert_eq!(notes.len(), 1, "one push per command");
     let (title, body) = &notes[0];
-    assert!(title.contains("joy"), "title: {title}");
-    assert!(body.contains("NEEDS FIX"), "body: {body}");
-    assert!(body.contains("/plan"), "body: {body}");
+    assert!(title.contains("/plan"), "title names the command: {title}");
+    assert!(title.contains("did NOT approve"), "title: {title}");
+    assert!(body.starts_with("VERDICT: joy: NEEDS FIX"), "body: {body}");
+    assert!(body.contains("Fix rounds used: 1 of 1"), "body: {body}");
+    // The command's own summary is still in there - that is the work summary.
+    assert!(
+        body.contains("Generated .context/progress.md"),
+        "body: {body}"
+    );
     // Her findings arrive as a list, not as one wrapped line.
     assert!(
         body.contains("1. nothing builds\n2. tests skipped"),
         "body: {body}"
     );
-    // A refusal is the one verdict worth waking someone for.
     assert_eq!(
         srv.requests()[0].header("priority").as_deref(),
         Some("high"),
         "a refusal is sent at high priority"
     );
+    // And the mailbox is empty afterwards: the same report cannot go out twice.
+    t.settle_notice("/plan on .context/progress.md", &Verdict::Approve, 0, 1)
+        .await;
+    assert_eq!(srv.request_count(), 1, "a held report is sent at most once");
 }
 
 #[tokio::test]
@@ -1194,15 +1213,19 @@ async fn joy_approves_quietly_and_no_topic_sends_nothing() {
     let log = TestLog::new("joy-notify-ok");
     let t = team(&log, Vec::new());
     t.set_ntfy_url(&srv.url);
-    t.notify_verdict(
-        "joy verified one task of /autocoding",
+    t.notice()
+        .put("/autocoding", "jonnyq: /autocoding complete", "all done");
+    t.settle_notice(
+        "/autocoding on .context/progress.md",
         &Verdict::Approve,
-        "Task: make it so",
+        0,
+        1,
     )
     .await;
     let notes = srv.notifications();
     assert_eq!(notes.len(), 1);
     assert!(notes[0].1.contains("APPROVED"), "body: {}", notes[0].1);
+    assert!(notes[0].0.contains("/autocoding"), "title: {}", notes[0].0);
     assert_eq!(
         srv.requests()[0].header("priority").as_deref(),
         None,
@@ -1210,24 +1233,51 @@ async fn joy_approves_quietly_and_no_topic_sends_nothing() {
     );
     // /ntfy off: the same call is a no-op rather than an error.
     t.set_ntfy_url("");
-    t.notify_verdict("joy reviewed /plan", &Verdict::Unresolved, "")
+    t.notice().put("/plan", "jonnyq: /plan complete", "planned");
+    t.settle_notice("/plan on .context/progress.md", &Verdict::Unresolved, 0, 1)
         .await;
     assert_eq!(srv.request_count(), 1, "no topic, no push");
 }
 
 #[tokio::test]
-async fn a_verdict_that_was_never_given_is_not_pushed() {
-    // /verify off: the loop reports "verification off" on the terminal, but a
-    // push per skipped task would be noise on every run.
+async fn a_command_that_reported_nothing_sends_nothing() {
+    // /plan on an up-to-date checklist does no work and holds no report: there
+    // is no news to push, verdict or no verdict.
     let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
     let log = TestLog::new("joy-notify-skipped");
     let t = team(&log, Vec::new());
     t.set_ntfy_url(&srv.url);
-    t.notify_verdict(
-        "joy reviewed /plan",
-        &Verdict::Skipped,
-        "Work reviewed: /plan",
+    t.settle_notice("/plan on .context/progress.md", &Verdict::Skipped, 0, 1)
+        .await;
+    t.settle_notice("/plan on .context/progress.md", &Verdict::Approve, 0, 1)
+        .await;
+    assert_eq!(srv.request_count(), 0, "nothing held, nothing pushed");
+}
+
+/// A refusal is never silence, even when the command had no summary to hold: a
+/// `/plan` that found the checklist up to date reports nothing, but if JOY then
+/// refused the plan, the verdict is the whole of the news and must go out.
+#[tokio::test]
+async fn a_refusal_is_pushed_even_when_the_command_held_no_summary() {
+    let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
+    let log = TestLog::new("joy-notify-refused-only");
+    let t = team(&log, Vec::new());
+    t.set_ntfy_url(&srv.url);
+    t.settle_notice(
+        "/plan on .context/progress.md",
+        &Verdict::NeedsFix("1. no task delivers REQ-004".into()),
+        1,
+        1,
     )
     .await;
-    assert_eq!(srv.request_count(), 0, "a skipped review is not news");
+    assert_eq!(srv.request_count(), 1, "the refusal is reported");
+    let req = &srv.requests()[0];
+    assert_eq!(req.header("priority").as_deref(), Some("high"));
+    assert!(req.header("title").unwrap().contains("/plan"), "{req:?}");
+    let body = req.body.clone();
+    assert!(
+        body.contains("Work: /plan on .context/progress.md"),
+        "{body}"
+    );
+    assert!(body.contains("no task delivers REQ-004"), "{body}");
 }

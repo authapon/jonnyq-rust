@@ -296,6 +296,93 @@ mod tests {
         assert!(state.contains("task one"));
     }
 
+    /// The case that used to end in silence: `/verify off`, the coder's turn is
+    /// spent, the box never moves — so nothing was gated, nothing was refused,
+    /// and the command simply returned. The person gets one message saying the
+    /// task is still open and why nothing was checked.
+    #[tokio::test]
+    async fn verify_off_reports_when_the_task_did_not_move() {
+        let srv = ntfy().await;
+        let (e, _p) = env("one-open-off", vec![content_step("I already did this")]);
+        e.dir.write(&progress_file(), ONE_TASK);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(false);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        team.review_after(
+            &CancellationToken::new(),
+            crate::team::AgentName::Joey,
+            "/coding on .context/progress.md",
+            c.run_one_task(&CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        let notes = srv.notifications();
+        assert_eq!(notes.len(), 1, "one push for the whole command: {notes:?}");
+        let (title, body) = &notes[0];
+        assert!(
+            title.contains("/coding"),
+            "title names the command: {title}"
+        );
+        assert!(
+            title.contains("still open"),
+            "the title says the task did not finish: {title}"
+        );
+        for want in [
+            "STILL OPEN",
+            "task one",
+            "1 attempt",
+            "verify off",
+            "Verify is off",
+        ] {
+            assert!(body.contains(want), "body missing {want}: {body}");
+        }
+    }
+
+    /// The same ending with verification on: the run reports the open task, but
+    /// the report waits for JOY's verdict and goes out under it — one message,
+    /// the verdict in front.
+    #[tokio::test]
+    async fn verify_on_reports_the_open_task_under_the_verdict() {
+        let srv = ntfy().await;
+        let (e, provider) = env(
+            "one-open-on",
+            vec![
+                content_step("I already did this"),
+                content_step("NEEDS FIX\n1. the checklist still says the task is open"),
+            ],
+        );
+        e.dir.write(&progress_file(), ONE_TASK);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        team.set_review_rounds(0);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        team.review_after(
+            &CancellationToken::new(),
+            crate::team::AgentName::Joey,
+            "/coding on .context/progress.md",
+            c.run_one_task(&CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.call_count(), 2, "one coding turn, one review");
+        let notes = srv.notifications();
+        assert_eq!(notes.len(), 1, "one push for the whole command: {notes:?}");
+        let (title, body) = &notes[0];
+        // The held report's own title is replaced by the verdict's: the review,
+        // not the attempt, is what a person reads the outcome from.
+        assert!(
+            title.contains("/coding") && title.contains("did NOT approve"),
+            "title: {title}"
+        );
+        assert!(
+            body.starts_with("VERDICT:"),
+            "the verdict comes first: {body}"
+        );
+        assert!(body.contains("STILL OPEN"), "body: {body}");
+    }
+
     #[tokio::test]
     async fn run_one_task_stalls_after_max_attempts() {
         let (e, _p) = env("one-stall", vec![content_step("still done, trust me")]);
@@ -437,12 +524,12 @@ mod tests {
         }
     }
 
-    /// The gate pushed to ntfy: with `/verify` on, every task JOY verifies gets
-    /// its own push the moment she rules on it — that is what makes a long
-    /// `/autocoding` followable from a phone — before the run's own completion
-    /// notification arrives at the end.
+    /// `/verify` on, run the way the REPL runs it: the command under the
+    /// review. One command, one notification — the run's summary goes out once,
+    /// after JOY has ruled, with her verdict on the front. No push per task, and
+    /// no second push for the review.
     #[tokio::test]
-    async fn a_verified_task_is_pushed_before_the_run_finishes() {
+    async fn a_verified_run_notifies_once_with_the_verdict_on_the_front() {
         let srv = ntfy().await;
         let (e, provider) = env(
             "joy-gate-push",
@@ -450,42 +537,51 @@ mod tests {
                 // joey's turn: tick [?], then his final answer...
                 write_progress_step("- [?] task one\n"),
                 content_step("coded it"),
-                // ...then joy's review, one turn with no tool calls.
+                // ...then joy's review of the task, one turn with no tool calls,
+                // then her review of the command.
                 content_step("APPROVE\n\nbuild and the tests for it both pass"),
+                content_step("APPROVE\n\nthe task matches its line"),
             ],
         );
         e.dir.write(&progress_file(), ONE_TASK);
         let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
         team.set_verify(true);
         // The REPL keeps the roster's topic and the command's copy in step; a
-        // test that wants verdict pushes has to do the same.
+        // test that wants the report pushed has to do the same.
         team.set_ntfy_url(&srv.url);
-        let c = crate::coding::Coding::new(team, e.ui.clone(), &e.dir.str(), &srv.url);
-        c.run_one_task(&CancellationToken::new()).await.unwrap();
-        // joey's own turn is two calls (the tick, then his answer); joy's
-        // review states a verdict, so it needs only one.
-        assert_eq!(provider.call_count(), 3);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        let cancel = CancellationToken::new();
+        team.review_after(
+            &cancel,
+            crate::team::AgentName::Joey,
+            "/coding on .context/progress.md",
+            c.run_one_task(&cancel),
+        )
+        .await
+        .unwrap();
+        // joey's turn is two calls (the tick, then his answer), then two reviews.
+        assert_eq!(provider.call_count(), 4);
         assert_eq!(e.dir.read(&progress_file()), "- [A] task one\n");
         let notes = srv.notifications();
-        assert_eq!(notes.len(), 2, "verdict push, then completion: {notes:?}");
+        assert_eq!(notes.len(), 1, "one push for the whole command: {notes:?}");
         let (title, body) = &notes[0];
-        assert!(title.contains("joy APPROVED"), "verdict title: {title}");
         assert!(
-            body.contains("Task: task one"),
-            "body names the task: {body}"
+            title.contains("/coding"),
+            "title names the command: {title}"
         );
-        assert!(body.contains("/coding"), "body names the command: {body}");
-        assert!(
-            notes[1].0.contains("/coding complete"),
-            "completion last: {:?}",
-            notes[1].0
-        );
+        assert!(title.contains("approved"), "title: {title}");
+        assert!(body.starts_with("VERDICT: joy: APPROVED"), "body: {body}");
+        // The work summary rides along underneath the verdict.
+        assert!(body.contains("Completed:"), "body: {body}");
+        assert!(body.contains("1/1 tasks approved"), "body: {body}");
     }
 
-    /// A refusal is the news worth waking for: it goes out at high priority,
-    /// carries JOY's findings, and the run stops rather than building on it.
+    /// The other half of the contract: JOY keeps refusing after the fix rounds
+    /// are spent, so the run stops rather than building on the refused task, and
+    /// the one notification that goes out is the stop report at high priority,
+    /// carrying her findings as the problem summary.
     #[tokio::test]
-    async fn a_refused_task_is_pushed_at_high_priority_and_stops_the_run() {
+    async fn a_refused_run_stops_and_pushes_one_high_priority_report() {
         let srv = ntfy().await;
         let (e, _p) = env(
             "joy-gate-refused",
@@ -505,21 +601,80 @@ mod tests {
         team.set_verify(true);
         team.set_review_rounds(1);
         team.set_ntfy_url(&srv.url);
-        let c = crate::coding::Coding::new(team, e.ui.clone(), &e.dir.str(), &srv.url);
-        let err = c.run_one_task(&CancellationToken::new()).await.unwrap_err();
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        let cancel = CancellationToken::new();
+        let err = team
+            .review_after(
+                &cancel,
+                crate::team::AgentName::Joey,
+                "/coding on .context/progress.md",
+                c.run_one_task(&cancel),
+            )
+            .await
+            .unwrap_err();
         assert!(err.notified, "the refusal was reported once: {err:?}");
         assert_eq!(e.dir.read(&progress_file()), "- [F] task one\n");
-        let notes = srv.notifications();
-        assert!(notes.len() >= 2, "verdict push + stop report: {notes:?}");
         let reqs = srv.requests();
-        let refused = reqs
-            .iter()
-            .find(|r| r.header("priority").as_deref() == Some("high"))
-            .expect("a refusal is sent at high priority");
+        assert_eq!(reqs.len(), 1, "one push for the whole command: {reqs:?}");
+        let refused = &reqs[0];
+        assert_eq!(
+            refused.header("priority").as_deref(),
+            Some("high"),
+            "a refusal is sent at high priority"
+        );
         assert!(
             refused.body.contains("nothing builds"),
             "body: {}",
             refused.body
+        );
+        // The report says the work stopped and what is still open.
+        assert!(refused.body.contains("STOPPED"), "body: {}", refused.body);
+    }
+
+    /// `/verify off`: nobody is reviewing, so there is no verdict to wait for.
+    /// The command reports the moment its work is done — still exactly one push,
+    /// and it is the plain completion summary, not a verdict.
+    #[tokio::test]
+    async fn verify_off_reports_once_when_the_work_is_done() {
+        let srv = ntfy().await;
+        let (e, provider) = env(
+            "gate-off-once",
+            vec![
+                write_progress_step("- [?] task one\n"),
+                content_step("coded it"),
+            ],
+        );
+        e.dir.write(&progress_file(), ONE_TASK);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(false);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team.clone(), e.ui.clone(), &e.dir.str(), &srv.url);
+        let cancel = CancellationToken::new();
+        team.review_after(
+            &cancel,
+            crate::team::AgentName::Joey,
+            "/coding on .context/progress.md",
+            c.run_one_task(&cancel),
+        )
+        .await
+        .unwrap();
+        // No review conversation at all.
+        assert_eq!(provider.call_count(), 2, "joey's two calls, no joy");
+        let notes = srv.notifications();
+        assert_eq!(
+            notes.len(),
+            1,
+            "one push, at the end of the work: {notes:?}"
+        );
+        assert!(
+            notes[0].0.contains("/coding complete"),
+            "title: {}",
+            notes[0].0
+        );
+        assert!(
+            !notes[0].1.contains("VERDICT"),
+            "no verdict to report: {}",
+            notes[0].1
         );
     }
 

@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use super::human::{self, PhaseInfo, ProgressDoc};
 use super::Task;
 use super::{
-    completion_guide, notify_or_warn, progress_file, progress_summary_line, run_usage, with_timing,
-    Coding, CodingModeGuard, Gate, Scope, REQUIREMENTS_FILE,
+    completion_guide, progress_file, progress_summary_line_gate, run_usage, with_timing, Coding,
+    CodingModeGuard, Gate, Scope, REQUIREMENTS_FILE,
 };
 use crate::error::{AgentError, R};
 use crate::llm::Usage;
@@ -82,16 +82,16 @@ impl<'a> Coding<'a> {
             let tasks_after = super::parse_progress(&files.progress).unwrap_or_default();
             let mut summary = format!(
                 "Every task is settled: {}",
-                progress_summary_line(&tasks_after)
+                progress_summary_line_gate(&tasks_after, gate)
             );
             let g = doc.guide_text();
             if !g.is_empty() {
                 summary.push_str("\n\n");
                 summary.push_str(&human::truncate_bytes(&g, human::NOTIFY_GUIDE_LIMIT));
             }
-            notify_or_warn(
+            self.report_to(
                 n,
-                &self.ui,
+                "/coding_phase",
                 "jonnyq: /coding_phase complete",
                 &with_timing(&summary, start, Usage::default()),
             )
@@ -161,7 +161,7 @@ impl<'a> Coding<'a> {
             } else {
                 "Phase NOT complete"
             },
-            progress_summary_line(&tasks_after)
+            progress_summary_line_gate(&tasks_after, gate)
         );
         sb.push_str(&format!("\n{}", report.footer()));
         if !report.findings.is_empty() {
@@ -192,9 +192,9 @@ impl<'a> Coding<'a> {
 written."
             ));
         }
-        notify_or_warn(
+        self.report_to(
             n,
-            &self.ui,
+            "/coding_phase",
             &title,
             &with_timing(&sb, start, run_usage(&self.coder(), report.ran_turn)),
         )

@@ -1,6 +1,6 @@
 [package]
 name = "jonnyq"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Interactive coding agent CLI (Rust + tokio port of the Go jonnyq)"
 

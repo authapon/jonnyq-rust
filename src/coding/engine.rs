@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use super::human::{self, ProgressDoc};
 use super::{
     count_done, first_unsettled, load_retry_state, load_task_reviews, next_work, parse_progress,
-    progress_file, progress_summary_line, review_file, same_task, write_retry_state, Coding, Gate,
-    RunFiles, Task, Work, MAX_NO_PROGRESS_ROUNDS, MAX_STALL_ROUNDS, REQUIREMENTS_FILE,
+    progress_file, progress_summary_line_gate, review_file, same_task, write_retry_state, Coding,
+    Gate, RunFiles, Task, Work, MAX_NO_PROGRESS_ROUNDS, MAX_STALL_ROUNDS, REQUIREMENTS_FILE,
 };
 use crate::agent::Agent;
 use crate::error::{AgentError, R};
@@ -490,7 +490,7 @@ impl<'a> Coding<'a> {
                     "[{}] joy approved: {} - {}",
                     label,
                     task.text,
-                    progress_summary_line(tasks)
+                    progress_summary_line_gate(tasks, self.gate())
                 ));
                 Ok(())
             }
@@ -551,7 +551,7 @@ the remaining tasks were not started",
             stop.task.text,
             stop.verdict.note(),
             stop.rounds,
-            progress_summary_line(&tasks)
+            progress_summary_line_gate(&tasks, self.gate())
         );
         if !stop.findings.trim().is_empty() {
             msg.push_str(&format!(
@@ -580,15 +580,32 @@ CODER.",
         }
         msg.push('\n');
         msg.push_str(&report.footer());
-        err = super::notify_failure(
-            n,
-            &self.ui,
-            &format!("jonnyq: {label} stopped - joy did not approve"),
-            start,
-            &not_cancelled(),
-            err,
-        )
-        .await;
+        // The problem summary goes out as the body, not just the error line: the
+        // task that stopped the run, JOY's findings on it and on the earlier
+        // tasks of the run, and where the checklist stands — the parts a person
+        // needs in order to settle it. `notify_failure` would have sent the bare
+        // error and dropped all of that, so the alert is posted here and the
+        // error is marked notified to keep the caller's failure path silent.
+        let title = format!("jonnyq: {label} stopped - joy did not approve");
+        if n.enabled() {
+            let footer = format!(
+                "Started: {}\nStopped: {}\nDuration: {}",
+                super::chrono_start(start),
+                super::chrono_now(),
+                crate::ui::go_duration_string(start.elapsed().as_millis() as i64)
+            );
+            let body = format!(
+                "{}\n\n{}\n\n{}",
+                crate::notify::format_error(&err),
+                msg,
+                footer
+            );
+            if let Err(e) = n.send_alert(&title, &body).await {
+                self.ui
+                    .plainln(&format!("warning: ntfy notification failed: {}", e.message));
+            }
+            err = err.mark_notified();
+        }
         self.ui.plainln(&format!(
             "[{label}] stopped: {} - {}",
             stop.task.text,
@@ -641,7 +658,7 @@ CODER.",
             ));
             let mut summary = format!(
                 "All tasks already settled: {}",
-                progress_summary_line(&tasks)
+                progress_summary_line_gate(&tasks, self.gate())
             );
             if let Ok(doc) = human::parse_progress_doc(&files.progress) {
                 let g = doc.guide_text();
@@ -653,9 +670,9 @@ CODER.",
             // No turn ran, so there are no fresh usage figures to report -
             // Usage::default() renders as "n/a" rather than quoting some
             // unrelated earlier turn.
-            super::notify_or_warn(
+            self.report_to(
                 n,
-                &self.ui,
+                "/coding",
                 "jonnyq: /coding complete",
                 &super::with_timing(&summary, start, Default::default()),
             )
@@ -723,8 +740,49 @@ CODER.",
                 "[coding] {} is still open ({} attempt(s)) - {}",
                 next.text,
                 count,
-                progress_summary_line(&after)
+                progress_summary_line_gate(&after, self.gate())
             ));
+            // The run did not finish the task, and that is the news — so it is
+            // reported like any other ending, through the command's one report.
+            // Held for the verdict while `/verify` is on (the review of what the
+            // attempt left is still to come, and her answer belongs in front of
+            // it); sent now when verification is off, which is exactly the case
+            // that used to end in silence: with no reviewer gate, an attempt
+            // that did not move the box simply returned.
+            let findings = load_task_reviews(&files.review)
+                .findings_for(&next.text)
+                .unwrap_or_default()
+                .to_string();
+            let mut summary = format!(
+                "Task {:?} is STILL OPEN after {} attempt(s)\n{}",
+                next.text,
+                count,
+                progress_summary_line_gate(&after, self.gate())
+            );
+            if !findings.trim().is_empty() {
+                summary.push_str(&format!("\n\nJOY'S FINDINGS\n{}", findings.trim()));
+            }
+            if self.verify() {
+                // The gate only reviews a ticked box, so an attempt that left
+                // the task `[ ]` was never her turn to check.
+                summary.push_str(
+                    "\n\nThe task-level check never ran: joy verifies a task once the coder marks \
+it done, and this attempt left it unticked.",
+                );
+            } else {
+                summary.push_str(&format!(
+                    "\n\nVerify is off, so nothing was reviewed: {} settles a task on his own \
+word that it is done. Turn it on (`/verify on`) to have joy check the work.",
+                    AgentName::Joey
+                ));
+            }
+            self.report_to(
+                n,
+                "/coding",
+                "jonnyq: /coding - task still open",
+                &super::with_timing(&summary, start, run_usage(&self.coder(), report.ran_turn)),
+            )
+            .await;
             return Ok(());
         }
         clear_retry(&retry_path);
@@ -732,7 +790,7 @@ CODER.",
         let mut summary = format!(
             "Completed: {:?}\n{}",
             next.text,
-            progress_summary_line(&after)
+            progress_summary_line_gate(&after, self.gate())
         );
         if self.verify() {
             summary.push_str(&format!("\n{}", report.summary()));
@@ -749,9 +807,9 @@ CODER.",
             title = format!("jonnyq: /coding {kind} complete");
         }
         let usage = run_usage(&self.coder(), report.ran_turn);
-        super::notify_or_warn(
+        self.report_to(
             n,
-            &self.ui,
+            "/coding",
             &title,
             &super::with_timing(&summary, start, usage),
         )
@@ -779,7 +837,7 @@ CODER.",
             MAX_STALL_ROUNDS,
             progress_file(),
             REQUIREMENTS_FILE,
-            progress_summary_line(&tasks)
+            progress_summary_line_gate(&tasks, self.gate())
         );
         if !findings.trim().is_empty() {
             summary.push_str(&format!("\n\nJOY'S FINDINGS\n{}", findings.trim()));
@@ -859,6 +917,27 @@ CODER.",
                 "[autocoding] all tasks in {} are settled",
                 progress_file()
             ));
+            // Still the command's one report: the run was asked to build what
+            // was left and there was nothing left to build — the person should
+            // hear that rather than hear nothing.
+            let mut summary = format!(
+                "All tasks already settled: {}",
+                progress_summary_line_gate(&tasks, gate)
+            );
+            if let Ok(doc) = human::parse_progress_doc(&files.progress) {
+                let g = doc.guide_text();
+                if !g.is_empty() {
+                    summary.push_str("\n\n");
+                    summary.push_str(&human::truncate_bytes(&g, human::NOTIFY_GUIDE_LIMIT));
+                }
+            }
+            self.report_to(
+                n,
+                "/autocoding",
+                "jonnyq: /autocoding complete",
+                &super::with_timing(&summary, start, Default::default()),
+            )
+            .await;
             return Ok(());
         }
 
@@ -886,7 +965,7 @@ CODER.",
             } else {
                 "Run ended with open tasks"
             },
-            progress_summary_line(&after)
+            progress_summary_line_gate(&after, self.gate())
         );
         summary.push_str(&format!("\n{}", report.footer()));
         if !report.findings.is_empty() {
@@ -914,9 +993,9 @@ CODER.",
         } else {
             "jonnyq: /autocoding ended with open tasks"
         };
-        super::notify_or_warn(
+        self.report_to(
             n,
-            &self.ui,
+            "/autocoding",
             title,
             &super::with_timing(&summary, start, run_usage(&self.coder(), report.ran_turn)),
         )
@@ -986,12 +1065,6 @@ fn describe_phase(name: &str) -> String {
     } else {
         format!("phase {name}")
     }
-}
-
-/// `notify_failure` needs a cancel token to avoid pinging about a Ctrl-C; a run
-/// that stopped on a verdict was not cancelled, so this stands in for "no".
-fn not_cancelled() -> CancellationToken {
-    CancellationToken::new()
 }
 
 /// The usage figures of a run, or `n/a` when no turn ran: quoting the last

@@ -150,15 +150,26 @@ impl Status {
         matches!(self, Status::Coded | Status::Refixed)
     }
 
-    /// One word for a notification or log line.
-    pub fn label(self) -> &'static str {
+    /// One word for a notification or log line, under `gate`.
+    ///
+    /// The letters mean the same thing either way, but the report must not say a
+    /// task is waiting for a reviewer who is not coming: with verification
+    /// switched off, `[?]`/`[+]` is as far as a task gets and the coder's own
+    /// proof is what settled it.
+    pub fn label_for(self, gate: Gate) -> &'static str {
         match self {
             Status::Open => "not started",
-            Status::Coded => "awaiting review",
-            Status::Failed => "refused by joy",
-            Status::Refixed => "awaiting re-review",
             Status::Approved => "approved",
+            Status::Failed => "refused by joy",
+            Status::Coded if gate == Gate::Joy => "awaiting review",
+            Status::Refixed if gate == Gate::Joy => "awaiting re-review",
+            Status::Coded | Status::Refixed => "settled by joey (verify off)",
         }
+    }
+
+    /// One word for a notification or log line, as the reviewer's gate reads it.
+    pub fn label(self) -> &'static str {
+        self.label_for(Gate::Joy)
     }
 }
 
@@ -294,10 +305,24 @@ pub fn count_approved(tasks: &[Task]) -> i64 {
     count_done(tasks)
 }
 
-/// One line of checklist figures for a notification or log line: approved out
-/// of total, plus what is still out for review when anything is.
-pub fn progress_summary_line(tasks: &[Task]) -> String {
+/// One line of checklist figures for a notification or log line, read under
+/// `gate`: what JOY approved out of the total, plus what is still out for review
+/// when anything is.
+///
+/// With verification off, `[A]` is never written, so counting it would report
+/// "0/5 tasks approved" for a run that finished and reported its work — the line
+/// counts what the gate actually settles, and says so.
+pub fn progress_summary_line_gate(tasks: &[Task], gate: Gate) -> String {
     let total = tasks.len();
+    if gate == Gate::Off {
+        let settled = tasks.iter().filter(|t| gate.settles(t.status)).count();
+        let left = total - settled;
+        let mut out = format!("{settled}/{total} tasks settled (verify off)");
+        if left > 0 {
+            out.push_str(&format!(" ({left} not started)"));
+        }
+        return out;
+    }
     let approved = count_approved(tasks);
     let mut out = format!("{approved}/{total} tasks approved");
     let mut pending: Vec<String> = Vec::new();
@@ -311,6 +336,59 @@ pub fn progress_summary_line(tasks: &[Task]) -> String {
         out.push_str(&format!(" ({})", pending.join(", ")));
     }
     out
+}
+
+/// The summary line as the reviewer's gate reads it — used by `/plan`, whose
+/// checklist has nothing coded yet, and by any caller with no gate to hand.
+pub fn progress_summary_line(tasks: &[Task]) -> String {
+    progress_summary_line_gate(tasks, Gate::Joy)
+}
+
+/// The one report a coding command has for the person: its title and body,
+/// computed the moment the work is done but **not sent yet**.
+///
+/// With `/verify` on, the command's work is only half the story — the run's
+/// real outcome is JOY's verdict, which does not exist until after it. So the
+/// command hands its summary here instead of pushing it, and the caller that
+/// runs the review sends it once, with the verdict in front of it
+/// ([`crate::team::Team::settle_notice`]). One command, one notification.
+#[derive(Clone, Debug)]
+pub struct PendingNotice {
+    /// The command itself (`/coding`), so the reviewer can name it in a refusal
+    /// title without the title being cut up.
+    pub cmd: String,
+    /// The title the command chose for its own report (`jonnyq: /coding complete`).
+    pub title: String,
+    pub body: String,
+}
+
+/// The mailbox a deferred report is left in. Shared so the command writes it
+/// through the `Coding` handle and the caller reads it back after the review.
+#[derive(Clone, Debug, Default)]
+pub struct NoticeSlot(Arc<std::sync::Mutex<Option<PendingNotice>>>);
+
+impl NoticeSlot {
+    /// Leaves a report in the slot, replacing anything already there (a command
+    /// reports once; a second write would mean a nested call reporting too).
+    pub fn put(&self, cmd: &str, title: &str, body: &str) {
+        *self.0.lock().unwrap() = Some(PendingNotice {
+            cmd: cmd.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        });
+    }
+    /// Takes the held report, leaving the slot empty — so a report can only
+    /// ever be sent once.
+    pub fn take(&self) -> Option<PendingNotice> {
+        self.0.lock().unwrap().take()
+    }
+
+    /// Drops whatever is held: a run that ended in an error reported itself
+    /// through the failure path, and a leftover report must not be sent by
+    /// whatever command runs next.
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 
 /// Settings shared by every coding command.
@@ -347,6 +425,29 @@ impl<'a> Coding<'a> {
 
     fn notifier(&self) -> Notifier {
         Notifier::new(&self.ntfy_url)
+    }
+
+    /// This command's one report to the person.
+    ///
+    /// A command notifies **once**. With `/verify` on the REPL runs JOY's review
+    /// after the work, and the outcome a person cares about is her verdict —
+    /// which does not exist yet when the work ends. So while a review is pending
+    /// ([`crate::team::Team::defer_notices`]) the summary is held here and the
+    /// review sends it with the verdict in front of it; called on its own (a
+    /// test, or any caller without a review to wait for), it goes out now.
+    ///
+    /// A disabled notifier (no topic, or `/autocoding`'s silent internal `/plan`)
+    /// drops the report rather than holding it, so nothing stale is left for the
+    /// next command to send.
+    pub async fn report_to(&self, n: &Notifier, cmd: &str, title: &str, body: &str) {
+        if !n.enabled() {
+            return;
+        }
+        if self.team.defer_notices() {
+            self.team.notice().put(cmd, title, body);
+            return;
+        }
+        notify_or_warn(n, &self.ui, title, body).await;
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -1233,9 +1334,9 @@ impl<'a> Coding<'a> {
         } else {
             Usage::default()
         };
-        notify_or_warn(
+        self.report_to(
             n,
-            &self.ui,
+            cmd,
             &format!("jonnyq: {} complete", cmd),
             &with_timing(&summary, start, u),
         )

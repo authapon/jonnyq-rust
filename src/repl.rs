@@ -50,7 +50,7 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /coding_phase [<phase number>]    JOEY: work through the next unfinished phase of .context/progress.md (or the given phase) in one run, then stop and notify how to verify it (Ctrl-C cancels)
   /autocoding                       JOEY: plan if needed, then work through every task in .context/progress.md in one run (Ctrl-C cancels)
   /watchfile [<word>|off]           watch the working directory for a magic word (default "AI!") and act on it when found
-  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: /plan and /coding completion notifications (incl. the /plan_for_human verification guide), JOY's review verdicts (one per reviewed command and per verified task), error alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
+  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: ONE report per /plan, /plan_for_human, /coding, /coding_phase or /autocoding run - with /verify on it goes out when JOY has ruled, carrying her verdict and the work summary (or, for a refusal, the problem and her findings); with /verify off it goes out when the work finishes. Also: the /plan_for_human verification guide, error/stall alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
   /proxy [<socks url>|off|auto]     use a SOCKS proxy for every request (model, web_search, web_fetch, ntfy): /proxy socks5h://host:port or /proxy host:port; off = always direct, auto = follow ALL_PROXY/HTTPS_PROXY; no arg shows what is in effect
   /proxy no-proxy <hosts>           hosts that bypass the proxy (comma-separated; default localhost,127.0.0.1,::1)
   /toolmode [native|prompt]         switch how tools are called: native tool-calling (default) or a plain-text fenced JSON block for models with unreliable native tool-calling
@@ -63,7 +63,7 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /joey                             talk to JOEY, the coder: /coding, /coding_phase, /autocoding
   /joy                              talk to JOY, the reviewer: tests, checks, and the verdict on a phase
   /team                             who is on the roster, which one is active, and what each one remembers
-  /verify [on|off]                  whether joy reviews what /plan and /coding produced (default on)
+  /verify [on|off]                  whether joy reviews what /plan and /coding produced (default on). On: the run's one notification waits for her verdict. Off: it is sent as soon as the work finishes
   /review_rounds [n]                fix/re-review cycles a command may run after joy's findings (default 1)
   /finish [notes]                   the active agent writes a hand-off summary into the transcript log, then saves every history
   /version                          print the jonnyq version (same figure as -h and the web console)

@@ -245,33 +245,65 @@ fn short_findings(findings: &str) -> String {
 }
 
 impl Team {
-    /// Posts JOY's verdict as an ntfy notification — the same channel /plan and
-    /// /coding already use, so a long run can be followed from a phone instead
-    /// of a terminal. What goes out is what she decided, in her words: the
-    /// verdict line, the task or command it is about, and her findings when she
-    /// left any. A refusal is sent at high priority, since it is the one verdict
-    /// a person may want to act on while the session is still running.
+    /// Posts the command's one report — the summary it held back, with JOY's
+    /// verdict on the front. This is the only place a reviewed command
+    /// notifies, so `/plan`/`/coding`/`/coding_phase`/`/autocoding` each produce
+    /// exactly one push: not one per task verified, and not a second one for the
+    /// review itself.
+    ///
+    /// What goes out is the verdict first (`joy: APPROVED`, or her findings as a
+    /// numbered list), then the command's own summary — the checklist figures,
+    /// the run's stats, and the human-verification notes when it has them. A
+    /// refusal goes out at high priority, since it is the news a person may want
+    /// to act on while the session is still running; an approval is a plain
+    /// message.
+    ///
+    /// A command that held nothing — a `/plan` that found the checklist already
+    /// up to date did no work, so it has no summary — stays silent on an
+    /// approval, but a refusal is always pushed: there the verdict is the whole
+    /// of the news, and silence is how a refused plan starts getting built
+    /// anyway.
     ///
     /// A no-op when no topic is set (`/ntfy off`), and a failed send is a warning
     /// on the terminal, never an error: a broken notification endpoint must not
     /// fail the review that was already done.
-    pub(crate) async fn notify_verdict(&self, title: &str, verdict: &Verdict, body: &str) {
-        // `/verify off` is not news: there is no verdict to report, and a push
-        // per skipped task would be noise on every run.
-        if verdict == &Verdict::Skipped {
+    pub(crate) async fn settle_notice(
+        &self,
+        what: &str,
+        verdict: &Verdict,
+        rounds: i64,
+        total: i64,
+    ) {
+        let held = self.notice().take();
+        if held.is_none() && matches!(verdict, Verdict::Approve | Verdict::Skipped) {
             return;
         }
         let n = self.notifier();
         if !n.enabled() {
             return;
         }
-        let mut msg = format!("{title}\nVerdict: {}", verdict.note());
-        if !body.trim().is_empty() {
-            msg.push_str(&format!("\n\n{}", body.trim()));
+        let cmd = held
+            .as_ref()
+            .map(|h| h.cmd.clone())
+            .unwrap_or_else(|| what.split(" on ").next().unwrap_or(what).to_string());
+        let mut msg = format!("VERDICT: {}\n", verdict.note());
+        if rounds > 0 {
+            msg.push_str(&format!("Fix rounds used: {rounds} of {total}\n"));
+        }
+        msg.push_str("Work: ");
+        msg.push_str(what);
+        if let Some(h) = &held {
+            msg.push_str(&format!("\n\n{}", h.body.trim()));
+        }
+        if let Some(f) = verdict.findings() {
+            msg.push_str(&format!("\n\nJOY'S FINDINGS\n{}", short_findings(f)));
         }
         let sent = match verdict {
-            Verdict::Approve => n.send("jonnyq: joy APPROVED", &msg).await,
-            _ => n.send_alert("jonnyq: joy did NOT approve", &msg).await,
+            Verdict::Approve => n.send(&format!("jonnyq: {cmd} approved"), &msg).await,
+            _ => {
+                n.send_alert(&format!("jonnyq: {cmd} - joy did NOT approve"), &msg)
+                    .await
+            }
         };
         if let Err(e) = sent {
             self.ui_note(&format!(
@@ -507,6 +539,11 @@ that answer.",
     /// The gate for one coded task: review it, and while she refuses it and the
     /// rounds hold, send the findings back to the coder and re-review. Returns
     /// the verdict that ended it and how many fix rounds that took.
+    ///
+    /// She is not pushed here: a run reports **once**, at its end, with the
+    /// verdict of the task that ended it ([`Team::settle_notice`]). A per-task
+    /// push turned a long `/autocoding` into a hundred notifications, which is
+    /// how a person ends up muting the topic and hearing nothing at all.
     pub(crate) async fn gate_task_once(
         &self,
         cancel: &CancellationToken,
@@ -533,23 +570,6 @@ and the task waits at [+] until she re-reviews it",
                 .await?;
             verdict = self.review_task(cancel, &task.text, phase, what).await?;
         }
-        // One push per verified task: this is the moment the person waiting on
-        // a long run cares about - the task is settled or it is not. (A
-        // checklist with no headings gives its tasks a placeholder phase name;
-        // quoting that in a notification would read like a bug.)
-        let scope = match phase {
-            p if p.is_empty() || p == "(no phase)" => String::new(),
-            p => format!(" ({p})"),
-        };
-        let mut body = format!("Task: {}{scope}\nCommand: {what}", task.text);
-        if let Some(f) = verdict.findings() {
-            body.push_str(&format!("\n\nJOY'S FINDINGS\n{}", short_findings(f)));
-        }
-        if done > 0 {
-            body.push_str(&format!("\n\nFix rounds used: {done} of {rounds}"));
-        }
-        self.notify_verdict(&format!("joy verified one task of {what}"), &verdict, &body)
-            .await;
         Ok((verdict, done))
     }
 
@@ -617,13 +637,26 @@ proves it.",
     }
 
     /// `work`, then joy's review, then up to [`Team::review_rounds`] fix and
-    /// re-review cycles; returns the verdict that ends it.
+    /// re-review cycles; returns the verdict that ended it.
+    ///
+    /// **One command, one notification.** With verification on, the work is
+    /// armed to hold its completion report ([`Team::defer_notices`]) and that
+    /// report goes out here once JOY has ruled — the verdict on the front, the
+    /// command's own summary below it ([`Team::settle_notice`]): the summary of
+    /// the work when she approved, or of what is wrong and what stopped when she
+    /// did not. Nothing is pushed per task, and the review itself does not push
+    /// a second time. With verification off there is no verdict to wait for and
+    /// the command reports the moment it is done.
     ///
     /// The loop is bounded on purpose: an agent and a reviewer that disagree can
     /// otherwise trade turns indefinitely, and the person finds out only after
-    /// the session has spent an hour on it. When the rounds run out the findings
-    /// come back for the caller to report - a disagreement is information, not
-    /// something to bury.
+    /// the session has spent an hour on it. When the rounds run out the run has
+    /// already stopped at the task that would not clear the gate, and her
+    /// findings are the body of that one report.
+    ///
+    /// A run that failed on the way sends no held report: the failure was
+    /// already reported by the command that hit it, and whatever the mailbox
+    /// holds belongs to work that did not finish.
     pub async fn review_after<F>(
         &self,
         cancel: &CancellationToken,
@@ -634,8 +667,42 @@ proves it.",
     where
         F: Future<Output = R<()>>,
     {
-        work.await?;
+        // Anything the previous command left behind is not this run's news.
+        self.notice().clear();
+        // Only hold the report if a verdict is actually coming. `/verify off`
+        // must not silence the command's own completion report.
+        let hold = self.verify();
+        self.set_defer(hold);
+        let outcome = work.await;
+        self.set_defer(false);
+        let verdict = match outcome {
+            Ok(()) => self.review_command(cancel, author, what).await,
+            Err(e) => {
+                self.notice().clear();
+                return Err(e);
+            }
+        };
+        match verdict {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.notice().clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// The half of [`Team::review_after`] that runs after the work: the review,
+    /// the fix rounds it asks for, and the one report that closes the command.
+    /// Split out so `review_after` can disarm the hold and clear the mailbox on
+    /// every exit path without repeating that on each `?`.
+    async fn review_command(
+        &self,
+        cancel: &CancellationToken,
+        author: AgentName,
+        what: &str,
+    ) -> R<Verdict> {
         if !self.verify() {
+            // Nothing to wait for: the command already reported when it finished.
             return Ok(Verdict::Skipped);
         }
         let rounds = self.review_rounds();
@@ -645,7 +712,7 @@ proves it.",
             if done >= rounds {
                 self.ui_note(&format!(
                     "[review] still unresolved after {done} fix round(s) - joy's findings stand, \
-settle them yourself or run the command again"
+the run stopped; settle them and run the command again"
                 ));
                 break;
             }
@@ -661,23 +728,16 @@ settle them yourself or run the command again"
         }
         match &verdict {
             Verdict::Approve => self.ui_note(&format!("[review] joy verified {what}: APPROVED")),
+            Verdict::NeedsFix(_) => self.ui_note(&format!(
+                "[review] joy did NOT approve {what} - her findings go out with the run's report"
+            )),
             Verdict::Unresolved => self.ui_note(&format!(
                 "[review] joy gave no verdict for {what} (neither APPROVE nor NEEDS FIX, after \
 being asked again) - the work is NOT verified"
             )),
             _ => {}
         }
-        // The same verdict, pushed: a plan or command reviewed while the person
-        // is away is worth a notification, and a refusal especially so.
-        let mut body = format!("Work reviewed: {what}");
-        if let Some(f) = verdict.findings() {
-            body.push_str(&format!("\n\nJOY'S FINDINGS\n{}", short_findings(f)));
-        }
-        if done > 0 {
-            body.push_str(&format!("\n\nFix rounds used: {done} of {rounds}"));
-        }
-        self.notify_verdict(&format!("joy reviewed {what}"), &verdict, &body)
-            .await;
+        self.settle_notice(what, &verdict, done, rounds).await;
         Ok(verdict)
     }
 }
