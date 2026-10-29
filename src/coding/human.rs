@@ -94,7 +94,11 @@ impl ProgressDoc {
         self.phases.iter().any(|p| !p.check.is_empty())
     }
 
-    /// Index of the first phase that still has an unchecked task, or -1.
+    /// Index of the first phase that still has an unsettled task under the old
+    /// `[x]` rule. The commands themselves ask the gate now (see
+    /// [`crate::coding::Gate`] and `/coding_phase`'s own `select_phase`); this
+    /// stays for the parser's own tests of phase bookkeeping.
+    #[allow(dead_code)]
     pub fn first_incomplete_phase(&self) -> i64 {
         for (i, p) in self.phases.iter().enumerate() {
             if !p.tasks.is_empty() && !p.complete() {
@@ -208,7 +212,7 @@ pub fn parse_progress_doc_text(data: &str) -> super::R<ProgressDoc> {
                 cur = 0;
             }
             let t = Task {
-                done: caps[2].to_lowercase() == "x",
+                status: super::Status::from_letter(caps[2].chars().next().unwrap_or(' ')),
                 text: caps[3].to_string(),
             };
             doc.phases[cur as usize].tasks.push(t);
@@ -314,7 +318,7 @@ pub fn build_add_checks_prompt() -> String {
         "Read {progress_file}, {REQUIREMENTS_FILE} and the existing code in the working directory, then edit \
 {progress_file} to add notes that let a HUMAN verify the work by actually using the application (preferably \
 through its frontend, without reading code). Do not change, remove, reorder, check or uncheck any existing task \
-line - every \"- [ ]\" / \"- [x]\" line must stay exactly as it is. Only add the following: (1) {HOW_TO_RUN_RULE} \
+line - every \"- [...]\" task line, whatever letter its box holds, must stay exactly as it is. Only add the following: (1) {HOW_TO_RUN_RULE} \
 (2) {HUMAN_CHECK_RULE} (3) {REVIEW_TASK_RULE} (add that one new unchecked task at the end of the last phase if \
 it is not already there). {BLOCKQUOTE_RULE} Do not implement anything - only edit {progress_file}.",
     )

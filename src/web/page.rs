@@ -30,7 +30,8 @@
 //!   still want
 //!
 //! The prompt textarea is disabled unless the session says it is ready for a
-//! prompt, and is resizable (`resize: vertical` plus a draggable splitter).
+//! prompt, and is resizable: `resize: vertical` plus a drag bar of its own, the
+//! same pair the ask popup's answer field has (see `makeResizable`).
 //! Beside it sits **Stop**, enabled exactly while the session says a turn is in
 //! flight; pressing it sends one `stop` message, which cancels the same token
 //! the terminal's Ctrl-C cancels (see [`crate::web::WebConsole::request_stop`]).
@@ -256,8 +257,12 @@ body {
 }
 #prompt-hint { font-size: 12px; color: var(--fg4); display: flex; gap: 8px; align-items: baseline; }
 #prompt-hint .mode { color: var(--f3); }
-#splitter { flex: 0 0 auto; height: 5px; cursor: row-resize; background: var(--bg0); }
-#splitter:hover { background: var(--bg2); }
+/* The drag bar above a resizable textarea. One class, because the console's
+   prompt box and the ask popup's answer field resize the same way — and both
+   also carry the browser's own `resize: vertical` corner, so nobody has to find
+   the bar to get what they wanted. */
+.resizer { flex: 0 0 auto; height: 5px; cursor: row-resize; background: var(--bg0); }
+.resizer:hover { background: var(--bg2); }
 #prompt {
   width: 100%; min-height: 3em; height: 5.5em; max-height: 70vh; resize: vertical;
   background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
@@ -469,6 +474,11 @@ body {
   padding: 14px 16px 16px 16px; width: 100%; max-width: 44em;
   box-shadow: 0 6px 30px rgba(0,0,0,.6);
   display: flex; flex-direction: column; gap: 8px;
+  /* A centred box taller than the mask overflows it at *both* ends, and the top
+     end is then unreachable — for this popup that would mean a question whose
+     answer field is off screen with nothing to dismiss it with. So the box is
+     capped to what the mask leaves and scrolls instead. */
+  max-height: 94vh; overflow: auto;
 }
 #ask h3 { margin: 0; font-size: 13px; color: var(--f3); letter-spacing: .02em; }
 #ask-q {
@@ -478,6 +488,16 @@ body {
   max-height: 40vh; overflow: auto; scrollbar-width: thin;
 }
 #ask-more { font-size: 12px; color: var(--f12); }
+/* The answer field's drag bar is the popup's own colour, so here it is cut into
+   the box as a groove with a grip in it: the prompt box's bar needs no help,
+   because the rule above the prompt box already delimits it, but out here an
+   invisible handle is a handle nobody finds. */
+#ask .resizer { background: var(--bg0h); border-radius: 3px; height: 8px; }
+#ask .resizer::before {
+  content: ""; display: block; width: 3em; height: 3px; margin: 1px auto;
+  border-radius: 2px; background: var(--bg3);
+}
+#ask .resizer:hover::before { background: var(--bg4); }
 #ask-answer {
   width: 100%; min-height: 3em; height: 4.5em; max-height: 40vh; resize: vertical;
   background: var(--bg1); color: var(--fg); border: 1px solid var(--bg2);
@@ -548,12 +568,12 @@ body {
   <h3 id="ask-title">Question from the model</h3>
   <pre id="ask-q"></pre>
   <div id="ask-more"></div>
-  <textarea id="ask-answer" spellcheck="false" wrap="soft"
-    placeholder="Type your answer. Enter sends, Shift-Enter adds a newline."></textarea>
+  <div class="resizer" id="ask-resizer" title="drag to resize the answer field"></div>
+  <textarea id="ask-answer" spellcheck="false" wrap="soft"></textarea>
   <div id="ask-row">
     <span id="ask-note"></span>
     <button id="ask-stop" title="cancel the turn that is asking, like Ctrl-C in the terminal">Stop</button>
-    <button id="ask-send">Send answer</button>
+    <button id="ask-send" title="send this answer, the same chord as the prompt box">Send answer (Ctrl+Enter)</button>
   </div>
 </div></div>
 <script>
@@ -779,6 +799,56 @@ $("popup-dl").onclick = () => downloadFile(popupPath);
 $("mask").onclick = (e) => { if (e.target === $("mask")) $("mask").classList.remove("show"); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("mask").classList.remove("show"); });
 
+/* ------------------------------------------------------- the two send boxes
+   The prompt box and the ask popup's answer field are both multi-line textareas
+   and they behave as one thing: **Ctrl-Enter (Cmd-Enter on a Mac) sends, a bare
+   Enter only breaks the line.** One implementation, because a page where one box
+   sends on Enter and the other breaks the line is a page you have to remember
+   twice.
+
+   Why Enter is not the send key: both boxes are for prose that spans lines —
+   Thai sentences that end in Enter as often as not, a pasted stack trace, a
+   multi-line `/command` — and under the old rule every one of those fired the
+   turn with half of it missing. A newline that should have been a send is one
+   keystroke to undo; a prompt sent half-finished is a turn spent on the wrong
+   thing.
+
+   The IME guard is not decoration, either, and matters most here: with a Thai
+   input method, Enter *commits a composition*, and the word being composed is
+   not in the textarea's value yet. An unguarded rule would send the text without
+   the word the human had just finished typing. */
+function insertNewline(ta) {
+  /* `insertText` rather than reassigning `ta.value`: reassigning throws away the
+     textarea's own undo history, and now that Enter is the ordinary way to break
+     a line, Ctrl-Z after one is exactly what a person writing a long answer
+     reaches for. Where a browser has no `insertText`, the caret is spliced by
+     hand — the same result, less polish. */
+  if (typeof document.execCommand === "function") {
+    try { if (document.execCommand("insertText", false, "\n")) return; } catch (e) {}
+  }
+  const s = ta.selectionStart, en = ta.selectionEnd, v = ta.value;
+  ta.value = v.slice(0, s) + "\n" + v.slice(en);
+  ta.selectionStart = ta.selectionEnd = s + 1;
+}
+
+/* The one sentence that states the rule. Both boxes that take text from a human
+   write their placeholder from it — the prompt's on every readiness change, the
+   popup's once at boot — because two hand-typed copies of a key binding are two
+   chances to promise the wrong chord, and answering a question with half an
+   answer is exactly what the chord exists to prevent. */
+const SEND_HINT = "Ctrl+Enter sends, Enter adds a newline.";
+
+/* Returns whether this key was one of ours (so a caller's listener can return
+   early). A composition-committing Enter is deliberately *not* ours: it belongs
+   to the input method, and is left to it untouched. */
+function sendOrBreak(e, ta, send) {
+  if (e.key !== "Enter" || e.isComposing) return false;
+  e.preventDefault();
+  if (!(e.ctrlKey || e.metaKey)) { insertNewline(ta); return true; }
+  send();
+  return true;
+}
+
 /* ------------------------------------------------------- ask_user popup
    The browser's half of `ask_user`: the question the model is blocked on, an
    answer field, and a Send button. The server owns the lifecycle: it opens the
@@ -896,16 +966,24 @@ function sendAsk() {
 
 function wireAsk() {
   const ta = $("ask-answer");
+  /* The field starts empty in the markup and is written here, so its hint is
+     the prompt box's own string rather than a second typing of it. */
+  ta.placeholder = "Type your answer. " + SEND_HINT;
   ta.addEventListener("keydown", (e) => {
-    /* Enter sends, Shift/Ctrl-Enter is a newline (the textarea edits itself),
-       and the IME guard matters for Thai input, where Enter commits a
-       composition. */
-    if (e.key !== "Enter" || e.isComposing) return;
-    if (e.shiftKey || e.ctrlKey || e.metaKey) return;
-    e.preventDefault();
-    sendAsk();
+    /* Ctrl-Enter sends, a bare Enter breaks the line — the prompt box's rule,
+       through the one shared implementation, so both boxes answer to the same
+       keys. (`sendOrBreak` is declared further down with the page's other
+       functions; a declaration is hoisted, and this listener only ever runs
+       long after boot.) */
+    sendOrBreak(e, ta, sendAsk);
   });
   ta.addEventListener("input", () => { if (asks[0]) askDrafts.set(asks[0].id, ta.value); });
+  /* The same drag bar the prompt box has, with a lower ceiling: the popup holds
+     its question above the field and its Send button below it, and a field
+     dragged past the question's own height would push both off the screen —
+     which, for a popup that cannot be dismissed, is a way of losing the answer
+     field with the question still waiting on it. */
+  makeResizable(ta, "ask-resizer", 0.4);
   $("ask-send").addEventListener("click", sendAsk);
   /* Stop belongs in this row because the mask covers the prompt box: a session
      blocked on a question would otherwise be uncancellable from the browser,
@@ -2420,14 +2498,14 @@ function makeTab(name, kind, path) {
   if (kind === "console") {
     panel.innerHTML =
       '<div class="console-wrap"><pre id="console-out"></pre></div>' +
-      '<div id="splitter" title="drag to resize"></div>' +
+      '<div class="resizer" id="prompt-resizer" title="drag to resize the prompt box"></div>' +
       '<div id="prompt-box">' +
       '<div id="prompt-hint"><span class="mode"></span><span id="prompt-note"></span></div>' +
       '<textarea id="prompt" spellcheck="false" wrap="soft"></textarea>' +
       '<div id="prompt-row">' +
       '<button id="stop" title="cancel the turn in flight, like Ctrl-C in the terminal">Stop</button>' +
       '<button id="term" title="open a shell in the working directory">Terminal</button>' +
-      '<button id="send">Send (Enter)</button></div></div>';
+      '<button id="send">Send (Ctrl+Enter)</button></div></div>';
   } else if (kind === "term") {
     panel.innerHTML =
       '<div class="term-head"><span class="dir"></span><span class="shell"></span>' +
@@ -2552,18 +2630,15 @@ function wireConsole(panel) {
   const ta = panel.querySelector("#prompt");
   const btn = panel.querySelector("#send");
   ta.addEventListener("keydown", (e) => {
-    /* Enter sends, Shift-Enter (and Ctrl-Enter) is a newline. The IME guard
-       matters for Thai/Japanese input, where Enter commits a composition. */
-    if (e.key !== "Enter" || e.isComposing) return;
-    if (e.shiftKey || e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      const s = ta.selectionStart, en = ta.selectionEnd, v = ta.value;
-      ta.value = v.slice(0, s) + "\n" + v.slice(en);
-      ta.selectionStart = ta.selectionEnd = s + 1;
-      return;
-    }
-    e.preventDefault();
-    sendPrompt();
+    /* **Ctrl-Enter (or Cmd-Enter) sends; a bare Enter is only a newline.** The
+       prompt is a multi-line text box and a prompt that is half-sent is worse
+       than one not sent at all: Thai prose, a pasted stack trace or a
+       multi-line /command all end in Enter inside the box, and the old
+       Enter-sends rule fired on every one of them. The IME guard stays, and
+       matters more here than anywhere else on the page: with a Thai input
+       method Enter commits a composition, and the word being composed is not in
+       the box yet — so an unguarded Enter would send the prompt without it. */
+    if (sendOrBreak(e, ta, sendPrompt)) return;
   });
   btn.addEventListener("click", sendPrompt);
   /* Not `sendStop` itself: as a listener it would be handed the click event as
@@ -2572,7 +2647,7 @@ function wireConsole(panel) {
   /* The shell is jonnyq's, not the model's: nothing here goes through a turn,
      and the tab stays when the console's session ends. */
   panel.querySelector("#term").addEventListener("click", () => termOpen(null));
-  makeResizable(panel);
+  makeResizable(ta, "prompt-resizer", 0.8);
 }
 
 /* The browser's Ctrl-C. One request, and the session's own `ready`/`busy`
@@ -2633,8 +2708,9 @@ function sendPrompt() {
   const text = ta.value;
   if (!text.trim()) return;
   if (!ready) { popup("jonnyq is busy", busy ? "A turn is in progress. Stop it with the Stop button (the browser's Ctrl-C), or wait for it to finish." : "The session is not waiting for a prompt right now - wait for the turn in progress to finish (or press Ctrl-C in the terminal to cancel it)."); return; }
-  /* The box clears straight away so a second Enter cannot send the same text
-     twice, and the answer comes back as an ack (`ok`, or why it was refused).
+  /* The box clears straight away so a second Ctrl-Enter cannot send the same
+     text twice, and the answer comes back as an ack (`ok`, or why it was
+     refused).
      A prompt that never reached the socket - the link dropped in the moment
      between - is put back rather than lost, but only if the box is still empty,
      so nothing the human typed since is ever overwritten. */
@@ -2662,7 +2738,7 @@ function setReady(state, note, busyNow) {
   const btn = t.el.querySelector("#send");
   const noteEl = t.el.querySelector("#prompt-note");
   ta.disabled = !ready;
-  ta.placeholder = ready ? "Type a prompt, or a /command. Enter sends, Shift-Enter adds a newline."
+  ta.placeholder = ready ? "Type a prompt, or a /command. " + SEND_HINT
                         : "not ready - jonnyq is working";
   btn.disabled = !ready;
   syncStop();
@@ -2701,12 +2777,15 @@ function syncStop() {
   if (askStop && askStop.textContent !== "stopping\u2026") askStop.disabled = !busy;
 }
 
-/* Drag the bar above the textarea, or use its own resize handle: both change
-   the same height, and the height survives a tab switch because it lives on
-   the textarea element. */
-function makeResizable(panel) {
-  const bar = panel.querySelector("#splitter");
-  const ta = panel.querySelector("#prompt");
+/* Drag the bar above a textarea, or use its own resize handle: both change the
+   same height, and the height survives a tab switch because it lives on the
+   textarea element. One function serves the console's prompt box and the ask
+   popup's answer field, so the two resize the same way — but each with its own
+   ceiling, because a popup whose field grew to the prompt's 80% of the screen
+   would push its own question off the top and its Send button off the bottom. */
+function makeResizable(ta, barId, maxFrac) {
+  const bar = $(barId);
+  const min = () => 2.2 * parseFloat(getComputedStyle(ta).lineHeight || "20");
   let dragging = false, startY = 0, startH = 0;
   bar.addEventListener("mousedown", (e) => {
     dragging = true; startY = e.clientY; startH = ta.offsetHeight;
@@ -2714,8 +2793,9 @@ function makeResizable(panel) {
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const h = Math.min(window.innerHeight * 0.8, Math.max(2.2 * parseFloat(getComputedStyle(ta).lineHeight || "20"), startH - (e.clientY - startY)));
+    const h = Math.min(window.innerHeight * maxFrac, Math.max(min(), startH - (e.clientY - startY)));
     ta.style.height = h + "px";
+    ta.style.maxHeight = "none";      /* the bar beats the CSS cap, on purpose */
   });
   window.addEventListener("mouseup", () => { dragging = false; });
 }
@@ -5131,6 +5211,127 @@ mod tests {
         assert!(
             esc.contains(r#"$("mask").classList.remove("show")"#) && !esc.contains("ask-mask"),
             "Escape closes the file popup only: {esc}"
+        );
+    }
+
+    /// The answer field is a real writing box, not a one-line input: **Ctrl-Enter
+    /// sends and a bare Enter breaks the line** — the prompt box's rule, so one
+    /// habit works in both places — and it is **resizable** the same way, since
+    /// an answer worth typing is often longer than the four lines the field
+    /// starts with.
+    ///
+    /// Both are pinned as *sharing* rather than as resembling: the popup calls
+    /// the prompt box's own `sendOrBreak` and the prompt box's own
+    /// `makeResizable`, and both placeholders are built from one [`SEND_HINT`]
+    /// string. Two similar implementations are two things that can disagree, and
+    /// the disagreement that matters is a field that promises "Enter sends" and
+    /// then sends half an answer.
+    #[test]
+    fn the_answer_field_keeps_the_prompts_keys_and_its_resize() {
+        let wire = INDEX_HTML
+            .split("function wireAsk()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("wireAsk");
+        assert!(
+            wire.contains("sendOrBreak(e, ta, sendAsk)"),
+            "the popup sends with the prompt box's own key rule: {wire}"
+        );
+        assert!(
+            wire.contains("makeResizable(ta, \"ask-resizer\""),
+            "and resizes with the prompt box's own drag: {wire}"
+        );
+        // Neither box keys Enter by itself any more.
+        for func in ["wireAsk", "wireConsole"] {
+            let body = INDEX_HTML
+                .split(format!("function {func}").as_str())
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap_or_default();
+            assert!(
+                !body.contains("e.shiftKey"),
+                "{func} must not keep an Enter-sends fallback: {body}"
+            );
+        }
+
+        // One hint, two boxes: the popup's field gets it from the page, not from
+        // a second typing of the sentence in the markup.
+        let markup = INDEX_HTML
+            .split("<textarea id=\"ask-answer\"")
+            .nth(1)
+            .and_then(|s| s.split("></textarea>").next())
+            .expect("the answer field's markup");
+        assert!(
+            !markup.contains("placeholder"),
+            "its placeholder is written in the page, from SEND_HINT: {markup}"
+        );
+        let ask_hint = INDEX_HTML
+            .matches("ta.placeholder = \"Type your answer. \" + SEND_HINT;")
+            .count();
+        let prompt_hint = INDEX_HTML
+            .matches("\"Type a prompt, or a /command. \" + SEND_HINT")
+            .count();
+        assert_eq!(ask_hint, 1, "the popup writes the shared hint");
+        assert_eq!(prompt_hint, 1, "as does the prompt box");
+        let hint = INDEX_HTML
+            .split("const SEND_HINT = ")
+            .nth(1)
+            .and_then(|s| s.split("\n").next())
+            .expect("SEND_HINT");
+        assert!(
+            hint.contains("Ctrl+Enter sends") && hint.contains("Enter adds a newline"),
+            "and it states the chord and the newline: {hint}"
+        );
+
+        // The button names the chord, as the console's Send does: the
+        // placeholder disappears the moment a character is typed, and an answer
+        // is exactly the text that gets typed before the send.
+        let send_btn = INDEX_HTML
+            .split("id=\"ask-send\"")
+            .nth(1)
+            .and_then(|s| s.split("</button>").next())
+            .expect("the Send answer button");
+        assert!(
+            send_btn.contains(">Send answer (Ctrl+Enter)"),
+            "the button states its chord: {send_btn}"
+        );
+
+        // The drag bar exists in the markup of both boxes, and shares one class
+        // and one CSS rule so the two are the same control.
+        for id in ["id=\"prompt-resizer\"", "id=\"ask-resizer\""] {
+            assert!(INDEX_HTML.contains(id), "missing {id}");
+        }
+        assert_eq!(
+            INDEX_HTML.matches("class=\"resizer\"").count(),
+            2,
+            "both bars carry the shared class"
+        );
+        assert!(INDEX_HTML.contains(".resizer {"), "and one rule styles it");
+        assert!(
+            !INDEX_HTML.contains("#splitter"),
+            "the prompt's bar is not a one-off id any more"
+        );
+        // The answer field itself is still a textarea the browser can resize,
+        // with the same type pairing as the prompt box.
+        let css = INDEX_HTML
+            .split("#ask-answer {")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("the #ask-answer rule");
+        for prop in ["resize: vertical", "var(--ui-font)", "var(--ui-size)"] {
+            assert!(css.contains(prop), "#ask-answer must have {prop}: {css}");
+        }
+        // The popup caps its own height: the field can be dragged, the popup
+        // cannot be dismissed, and a box taller than the screen with neither a
+        // way to scroll it nor a way to hide it is a question nobody can answer.
+        let ask = INDEX_HTML
+            .split("#ask {")
+            .nth(1)
+            .and_then(|s| s.split("}\n").next())
+            .expect("the #ask rule");
+        assert!(
+            ask.contains("max-height:") && ask.contains("overflow: auto"),
+            "the popup scrolls instead of overflowing the mask: {ask}"
         );
     }
 

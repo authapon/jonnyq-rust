@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{progress_file, AgentName, Team};
 use crate::agent::Agent;
-use crate::coding::REQUIREMENTS_FILE;
+use crate::coding::{self, REQUIREMENTS_FILE};
 use crate::error::R;
 
 /// The outcome of one review, as read from joy's reply.
@@ -211,7 +211,76 @@ pub fn parse_verdict(reply: &str) -> Verdict {
     Verdict::Unresolved
 }
 
+/// One finding per line, numbered the way JOY numbers them, wrapped so the
+/// push stays readable on a phone: ntfy carries a wall of text as one blob, and
+/// a reviewer's list is the one thing that must not arrive unlined.
+fn findings_block(findings: &str) -> String {
+    findings
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Longest findings text a push carries. ntfy caps a message at 4096 bytes, and
+/// the rest of the body (task, verdict, summary, stats footer) needs room; a
+/// reviewer who wrote more than this has her full review in the sidecar anyway.
+const NOTIFY_FINDINGS_LIMIT: usize = 1500;
+
+fn short_findings(findings: &str) -> String {
+    let block = findings_block(findings);
+    if block.len() <= NOTIFY_FINDINGS_LIMIT {
+        return block;
+    }
+    let note = format!(
+        "\n... (truncated; the full review is in {})",
+        coding::review_file()
+    );
+    let mut cut = NOTIFY_FINDINGS_LIMIT.min(block.len().saturating_sub(note.len()));
+    while cut > 0 && !block.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &block[..cut], note)
+}
+
 impl Team {
+    /// Posts JOY's verdict as an ntfy notification — the same channel /plan and
+    /// /coding already use, so a long run can be followed from a phone instead
+    /// of a terminal. What goes out is what she decided, in her words: the
+    /// verdict line, the task or command it is about, and her findings when she
+    /// left any. A refusal is sent at high priority, since it is the one verdict
+    /// a person may want to act on while the session is still running.
+    ///
+    /// A no-op when no topic is set (`/ntfy off`), and a failed send is a warning
+    /// on the terminal, never an error: a broken notification endpoint must not
+    /// fail the review that was already done.
+    pub(crate) async fn notify_verdict(&self, title: &str, verdict: &Verdict, body: &str) {
+        // `/verify off` is not news: there is no verdict to report, and a push
+        // per skipped task would be noise on every run.
+        if verdict == &Verdict::Skipped {
+            return;
+        }
+        let n = self.notifier();
+        if !n.enabled() {
+            return;
+        }
+        let mut msg = format!("{title}\nVerdict: {}", verdict.note());
+        if !body.trim().is_empty() {
+            msg.push_str(&format!("\n\n{}", body.trim()));
+        }
+        let sent = match verdict {
+            Verdict::Approve => n.send("jonnyq: joy APPROVED", &msg).await,
+            _ => n.send_alert("jonnyq: joy did NOT approve", &msg).await,
+        };
+        if let Err(e) = sent {
+            self.ui_note(&format!(
+                "[review] warning: ntfy notification failed: {}",
+                e.message
+            ));
+        }
+    }
+
     /// What joy is told to check, per author: reviewing a plan and reviewing an
     /// implementation are different jobs, and the one code-shaped brief she
     /// used to get sent her off to re-run build and test commands over a
@@ -355,6 +424,169 @@ must change, that is `NEEDS FIX` - put it on that first line, then the numbered 
         verdict
     }
 
+    /// JOY's review of **one task** — the unit the coding loops gate on, where
+    /// [`Team::review`] reviews a whole command's output. `task_text` is the
+    /// checklist line that defines its scope, `phase` names the part of the run
+    /// it belongs to (`"Phase 2: Orders"`), and `what` is how the review is
+    /// announced (`"/coding_phase 2"`).
+    ///
+    /// She is told to leave the checklist alone: her verdict reaches the file
+    /// through [`Team::record_verdict`], never through her own edit — a reviewer
+    /// who ticks the boxes she judges is a rubber stamp.
+    ///
+    /// As in [`Team::review`], a review whose answer holds no verdict is asked
+    /// once more for the line alone before it is reported as
+    /// [`Verdict::Unresolved`].
+    async fn review_task(
+        &self,
+        cancel: &CancellationToken,
+        task_text: &str,
+        phase: &str,
+        what: &str,
+    ) -> R<Verdict> {
+        let author = AgentName::Joey;
+        let pf = progress_file();
+        let note = format!("{what}: review of {task_text:?}");
+        let joy = self.start(AgentName::Joy, &note);
+        let scope = if phase.is_empty() {
+            String::new()
+        } else {
+            format!("It belongs to {phase}. ")
+        };
+        let prompt = format!(
+            "Review the one task {author} just finished: {task_text:?}\n\
+{scope}{}\n\
+Read {author}'s own history at {} for the decisions and findings behind it - it says what {author} \
+believed it was doing, which is what your evidence has to contradict or confirm. Read {pf} to see \
+this task and its neighbours as they are worded in the checklist. Do not take the reply text on \
+trust - tool output is the evidence - and do not fix, edit or implement anything yourself: in \
+particular do not change any checkbox in {pf}, because jonnyq writes your verdict into it.\n\
+Your final answer - not your reasoning - must open with the verdict on its own first line: \
+APPROVE, or NEEDS FIX followed by numbered findings, each naming the file or task and what \
+{author} must change. Everything you work out along the way counts for nothing until it is in \
+that answer.",
+            Self::review_brief(author, &pf),
+            author.context_file()
+        );
+        joy.run_turn(cancel.clone(), &prompt).await?;
+        let answer = joy.turn_answer().unwrap_or_default();
+        let verdict = parse_verdict(&answer);
+        if verdict != Verdict::Unresolved {
+            return Ok(verdict);
+        }
+        Ok(self.demand_verdict(cancel, &joy, &answer).await)
+    }
+
+    /// Writes JOY's verdict into the checklist: `[A]` on approval, `[F]` plus
+    /// her findings in the review sidecar on a refusal. Anything else leaves the
+    /// letter where the coder put it — an unverified task stays `[?]` rather
+    /// than silently becoming either a pass or a failure.
+    pub(crate) fn record_verdict(
+        &self,
+        paths: &coding::RunFiles,
+        tasks: &[coding::Task],
+        task: &coding::Task,
+        verdict: &Verdict,
+    ) -> R<()> {
+        match verdict {
+            Verdict::Approve => {
+                coding::set_task_status(&paths.progress, &task.text, coding::Status::Approved)?;
+                // Her complaint on an approved task is stale the moment it is
+                // approved.
+                let _ = coding::set_task_findings(&paths.review, tasks, &task.text, None);
+            }
+            Verdict::NeedsFix(f) => {
+                coding::set_task_status(&paths.progress, &task.text, coding::Status::Failed)?;
+                coding::set_task_findings(&paths.review, tasks, &task.text, Some(f))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The gate for one coded task: review it, and while she refuses it and the
+    /// rounds hold, send the findings back to the coder and re-review. Returns
+    /// the verdict that ended it and how many fix rounds that took.
+    pub(crate) async fn gate_task_once(
+        &self,
+        cancel: &CancellationToken,
+        task: &coding::Task,
+        _paths: &coding::RunFiles,
+        phase: &str,
+        what: &str,
+    ) -> R<(Verdict, i64)> {
+        let rounds = self.review_rounds();
+        let mut done = 0i64;
+        let mut verdict = self.review_task(cancel, &task.text, phase, what).await?;
+        loop {
+            let findings = match &verdict {
+                Verdict::NeedsFix(f) if done < rounds => f.clone(),
+                _ => break,
+            };
+            done += 1;
+            self.ui_note(&format!(
+                "[review] round {done}/{rounds}: joy refused {:?} - her findings go back to joey, \
+and the task waits at [+] until she re-reviews it",
+                task.text
+            ));
+            self.fix_task(cancel, &task.text, phase, &findings, what)
+                .await?;
+            verdict = self.review_task(cancel, &task.text, phase, what).await?;
+        }
+        // One push per verified task: this is the moment the person waiting on
+        // a long run cares about - the task is settled or it is not. (A
+        // checklist with no headings gives its tasks a placeholder phase name;
+        // quoting that in a notification would read like a bug.)
+        let scope = match phase {
+            p if p.is_empty() || p == "(no phase)" => String::new(),
+            p => format!(" ({p})"),
+        };
+        let mut body = format!("Task: {}{scope}\nCommand: {what}", task.text);
+        if let Some(f) = verdict.findings() {
+            body.push_str(&format!("\n\nJOY'S FINDINGS\n{}", short_findings(f)));
+        }
+        if done > 0 {
+            body.push_str(&format!("\n\nFix rounds used: {done} of {rounds}"));
+        }
+        self.notify_verdict(&format!("joy verified one task of {what}"), &verdict, &body)
+            .await;
+        Ok((verdict, done))
+    }
+
+    /// The coder's fix turn for one refused task: her findings, plus the two
+    /// things [`Team::fix`] cannot know — which checkbox is meant, and that the
+    /// letter to move it to is `[+]` (still his own, since the fix is not
+    /// verified until she says so).
+    async fn fix_task(
+        &self,
+        cancel: &CancellationToken,
+        task_text: &str,
+        phase: &str,
+        findings: &str,
+        what: &str,
+    ) -> R<()> {
+        let pf = progress_file();
+        let note = format!("{what}: joy's findings on {task_text:?}");
+        let agent = self.start(AgentName::Joey, &note);
+        let scope = if phase.is_empty() {
+            String::new()
+        } else {
+            format!("{phase} - ")
+        };
+        let prompt = format!(
+            "JOY reviewed the task {task_text:?} ({scope}{what}) and returned NEEDS FIX. Her \
+findings:\n\n{findings}\n\nAct on them now. You are the coder: stay inside that task's own scope - \
+if the finding is that you went beyond it, remove the surplus rather than adding more - and never \
+redesign the plan or reword another task. Her own history at {} holds how she reached them, if the \
+findings alone are not specific enough.\n\nWhen the fix is genuinely verified with real command \
+output in this turn, read_file {pf} and edit that one line's checkbox from \"- [F]\" to \"- [+]\": \
+the re-verification is hers to do, so \"[A]\" is not yours to write. Then reply with what you \
+changed and the command output that proves it.",
+            AgentName::Joy.context_file()
+        );
+        agent.run_turn(cancel.clone(), &prompt).await
+    }
+
     /// Hands `findings` back to `author` as its own turn, phrased for its lane.
     pub async fn fix(
         &self,
@@ -435,6 +667,17 @@ being asked again) - the work is NOT verified"
             )),
             _ => {}
         }
+        // The same verdict, pushed: a plan or command reviewed while the person
+        // is away is worth a notification, and a refusal especially so.
+        let mut body = format!("Work reviewed: {what}");
+        if let Some(f) = verdict.findings() {
+            body.push_str(&format!("\n\nJOY'S FINDINGS\n{}", short_findings(f)));
+        }
+        if done > 0 {
+            body.push_str(&format!("\n\nFix rounds used: {done} of {rounds}"));
+        }
+        self.notify_verdict(&format!("joy reviewed {what}"), &verdict, &body)
+            .await;
         Ok(verdict)
     }
 }

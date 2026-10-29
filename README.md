@@ -6,7 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.1.1
+jonnyq v1.2.0
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.1.1`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.0`) above the first prompt, so a transcript and a screenshot carry the build they came from.
 
 ## Version
 
-jonnyq is at **v1.1.1**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+jonnyq is at **v1.2.0**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
 
 | Where | What you see |
 |---|---|
-| Terminal, at startup | `jonnyq v1.1.1` above the first prompt, and in the transcript log |
+| Terminal, at startup | `jonnyq v1.2.0` above the first prompt, and in the transcript log |
 | `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
 | `/version` | The same line, any time during a session |
 | `/help`, `/?` | The version above the slash command list |
-| Web console | In the browser tab's title (`jonnyq console v1.1.1`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
-| `GET /health` | `"version": "1.1.1"` in the JSON, so a script can identify a running session |
+| Web console | In the browser tab's title (`jonnyq console v1.2.0`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.2.0"` in the JSON, so a script can identify a running session |
 
 `-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
@@ -338,8 +338,20 @@ Write `requirements.md` yourself, then:
 > Human check: run `cargo build` -> no errors, binary in target/debug
 
 - [ ] Init Cargo.toml with tokio + serde dependencies (REQ-001)
-- [x] Implement the tool registry
+- [A] Implement the tool registry
 ```
+
+Five letters, one per hand that has touched the task — and the order is not free, it is the pipeline:
+
+| Mark | Means | Written by |
+| --- | --- | --- |
+| `- [ ]` | created, nobody has worked on it | JACKY (in the plan) |
+| `- [?]` | coded, never verified by JOY | JOEY |
+| `- [F]` | verified and **refused** by JOY — her findings are in `.context/progress.review` | jonnyq, from her verdict |
+| `- [+]` | re-coded after her findings, waiting to be verified again | JOEY |
+| `- [A]` | coded, verified and **approved** by JOY | jonnyq, from her verdict |
+
+The split is the point: the coder ticks his own box only as far as `?`/`+`, and the last two letters belong to the reviewer — so a task cannot reach `A` by its author claiming it works. A task is worked strictly one at a time: JOY verifies a task before JOEY starts the next. Old checklists marked with `[x]` still read as approved, and with `/verify off`, `?`/`+` is as far as a task can get — your own command output is what settles it.
 
 While coding, the system prompt switches to an autonomous mode that forbids marking a task done without actually running the checks for that task in that round. Task completion is verified against the real file content, so false "done" claims stall the loop and surface an error.
 
@@ -393,7 +405,7 @@ lined up either way.
 | **console tab** (centre) | Every byte jonnyq prints to stdout, mirrored live and rendered in gruvbox dark colours — the same text, in the same colours, as the terminal |
 | **terminal tabs** | A real shell in the working directory, in the browser — the **Terminal** button beside Send opens one; see below |
 | **file tabs** | One per opened file, with its source syntax-highlighted in the same gruvbox dark palette; click a tab to switch between the console and any number of files. The head of each has a **Download** that saves that file to your computer |
-| **prompt box** (below the console) | Type a prompt or a `/command`. Enter sends, Shift-Enter adds a newline. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
+| **prompt box** (below the console) | Type a prompt or a `/command`. **Ctrl-Enter sends** (Cmd-Enter on a Mac) and a plain Enter only starts a new line, so a multi-line prompt is never sent half-finished. Drag the bar above it, or its own corner, to resize. It is greyed out whenever the session cannot take a prompt — no model yet, a turn in flight, or the session exiting — with the reason next to it |
 | **Stop button** (next to Send) | The browser's Ctrl-C: it cancels the turn in flight and is enabled only while there is one. It presses the same cancellation as Ctrl-C at the terminal, so the model's stream is dropped, a running command's process group is killed and a pending `ask_user` question is withdrawn — and the session survives to take the next prompt, with `[cancelled]` in the transcript. The popup carries its own copy, since a question covers the prompt box |
 | **ask popup** | When the model calls `ask_user`, the question pops up over the page with its own answer field and a **Send answer** button — see below |
 | **tree** (right) | The working directory, folders first, **kept up to date by itself** — a file created, deleted or renamed appears in the panel without any clicking, and the folders you had expanded stay expanded. Expand a folder to list it; click a text file to open it in a new tab. A PDF, image or binary pops up why it cannot be shown — and offers it as a download |
@@ -560,9 +572,12 @@ rather than pretending. A turn that ignores the cancellation is not the page's
 problem to explain: the console shows what the turn is still doing.
 
 **Answering `ask_user` from the page.** A question the model asks is shown as a
-popup: the question, an answer field, and **Send answer** (Enter sends,
-Shift-Enter adds a newline). The terminal prints the same question, so you can
-answer in either place — the browser popup, the keyboard or an ntfy reply are
+popup: the question, an answer field, and **Send answer (Ctrl+Enter)** — the
+answer field takes the same keys as the prompt box, so **Ctrl-Enter sends** and a
+plain Enter only starts a new line, and it resizes the same way (drag the bar
+above it, or its own corner) so a long answer is not written into four visible
+lines. The terminal prints the same question, so you can answer in either place
+— the browser popup, the keyboard or an ntfy reply are
 three channels raced against each other and the first answer wins. Whoever wins,
 the others are told: the popup closes the moment the answer arrives anywhere
 (and says *answered elsewhere*, so a box never vanishes without a reason), and an
@@ -599,7 +614,7 @@ tree already listed and stopping a turn, nothing else.
 
 ## Notifications (ntfy)
 
-Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). jonnyq pushes a message when `/plan`, `/coding`, `/coding_phase` or `/autocoding` finishes, and a high-priority `warning` message when a turn fails or stalls — the failure text includes a `Reason:` line explaining the likely cause. Summaries are computed from `.context/progress.md` directly, not by calling the model.
+Set a full topic URL with `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (empty disables everything). jonnyq pushes a message when `/plan`, `/coding`, `/coding_phase` or `/autocoding` finishes, when **JOY hands in a verdict** (one per reviewed work and one per verified task, with her findings as a numbered list — a refusal goes out at high priority, an approval as a plain message), and a high-priority `warning` message when a turn fails or stalls — the failure text includes a `Reason:` line explaining the likely cause. Summaries are computed from `.context/progress.md` directly, not by calling the model.
 
 The same topic is also an inbound channel: `ask_user` pushes the question and subscribes for the reply, so you can answer from your phone (`answer: <text>`, or plain quick reply). Whoever answers first wins — keyboard, browser popup (`-web`) or phone; the losing channels are told, so the popup closes and the terminal prompt is not left hanging.
 

@@ -50,7 +50,7 @@ pub const HELP_TEXT: &str = r#"Slash commands:
   /coding_phase [<phase number>]    JOEY: work through the next unfinished phase of .context/progress.md (or the given phase) in one run, then stop and notify how to verify it (Ctrl-C cancels)
   /autocoding                       JOEY: plan if needed, then work through every task in .context/progress.md in one run (Ctrl-C cancels)
   /watchfile [<word>|off]           watch the working directory for a magic word (default "AI!") and act on it when found
-  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: /plan and /coding completion notifications (incl. the /plan_for_human verification guide), error alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
+  /ntfy [<topic url>|off]           set/clear the ntfy.sh topic URL: /plan and /coding completion notifications (incl. the /plan_for_human verification guide), JOY's review verdicts (one per reviewed command and per verified task), error alerts, and the question/answer round-trip of the ask_user tool (reply to a question with "answer: <text>")
   /proxy [<socks url>|off|auto]     use a SOCKS proxy for every request (model, web_search, web_fetch, ntfy): /proxy socks5h://host:port or /proxy host:port; off = always direct, auto = follow ALL_PROXY/HTTPS_PROXY; no arg shows what is in effect
   /proxy no-proxy <hosts>           hosts that bypass the proxy (comma-separated; default localhost,127.0.0.1,::1)
   /toolmode [native|prompt]         switch how tools are called: native tool-calling (default) or a plain-text fenced JSON block for models with unreliable native tool-calling
@@ -894,8 +894,12 @@ so it doesn't fire again.",
     /// context: jacky's history stays jacky's.
     async fn coding_for(&self, name: AgentName, note: &str) -> Coding<'static> {
         let ntfy_url = self.cfg.lock().await.ntfy_url.clone();
+        // Announce first, then hand the whole roster over: the coding commands
+        // need the reviewer as well as the coder, and `Team::active` is the
+        // agent that was just announced.
+        self.team.start(name, note);
         Coding::new(
-            self.team.start(name, note),
+            self.team.clone(),
             self.ui.clone(),
             &self.run_command.work_dir,
             &ntfy_url,
@@ -1156,6 +1160,9 @@ Write in the language the person has been writing in. Do not start new work."#
             // subscribes for the answer), so push the change through it. The
             // roster shares one tool registry, so this reaches all four.
             self.agent.tools.configure(&cfg);
+            // The review lane keeps its own copy of the topic (it must fall
+            // silent with the same keystroke), so push the change there too.
+            self.team.set_ntfy_url("");
             self.ui.plainln("[ntfy] notifications disabled");
             return;
         }
@@ -1175,6 +1182,7 @@ Write in the language the person has been writing in. Do not start new work."#
         let mut cfg = self.cfg.lock().await;
         cfg.ntfy_url = arg.clone();
         self.agent.tools.configure(&cfg);
+        self.team.set_ntfy_url(&arg);
         self.ui
             .plainln(&format!("[ntfy] notifications enabled: {arg}"));
     }

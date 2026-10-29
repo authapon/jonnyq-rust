@@ -620,8 +620,11 @@ is open (-web), and no ntfy topic is set (configure one with /ntfy <topic url>)"
             Err(e) => return NtfyOutcome::Failed(e.message),
         };
         while let Some(msg) = rx.recv().await {
-            if msg.title == NTFY_QUESTION_TITLE || msg.body == question {
-                continue; // our own question, replayed from the cache
+            // Anything jonnyq published itself is not an answer: the question
+            // sitting in the topic's cache, and every completion or verdict push
+            // on the same topic (they share the `jonnyq: ` title prefix).
+            if msg.title.starts_with(crate::notify::OWN_TITLE_PREFIX) || msg.body == question {
+                continue;
             }
             return match parse_ntfy_answer(&msg.body) {
                 Some(text) => NtfyOutcome::Answer(Answer {
@@ -1154,6 +1157,43 @@ mod tests {
                 ),
                 (
                     "{\"event\":\"message\",\"id\":\"a\",\"time\":2,\"message\":\"sqlite\"}\n".to_string(),
+                    std::time::Duration::from_millis(20),
+                ),
+            ]),
+        ])
+        .await;
+
+        let (t, _log) = tool(&srv.url);
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            t.ask(&CancellationToken::new(), question),
+        )
+        .await
+        .expect("only the real answer should have been taken")
+        .unwrap();
+        assert_eq!(answer.text, "sqlite");
+        assert_eq!(answer.source, ANSWER_SOURCE_NTFY);
+    }
+
+    /// The topic carries jonnyq's own pushes too - a verdict from JOY, a command
+    /// that finished - and one of those replayed from the cache must not be taken
+    /// for the answer either, however well its text would read as one.
+    #[tokio::test]
+    async fn a_notification_jonnyq_published_itself_is_never_the_answer() {
+        let question = "Which DB?";
+        let srv = crate::testsupport::TestServer::canned(vec![
+            crate::testsupport::StubResponse::status(200, ""),
+            crate::testsupport::StubResponse::ndjson_staged(vec![
+                (
+                    "{\"event\":\"message\",\"id\":\"v\",\"time\":1,\"title\":\"jonnyq: joy APPROVED\",\"message\":\"postgres\"}\n".to_string(),
+                    std::time::Duration::ZERO,
+                ),
+                (
+                    "{\"event\":\"message\",\"id\":\"c\",\"time\":2,\"title\":\"jonnyq: /autocoding complete\",\"message\":\"All tasks settled\"}\n".to_string(),
+                    std::time::Duration::ZERO,
+                ),
+                (
+                    "{\"event\":\"message\",\"id\":\"a\",\"time\":3,\"message\":\"answer: sqlite\"}\n".to_string(),
                     std::time::Duration::from_millis(20),
                 ),
             ]),

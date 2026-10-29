@@ -2,7 +2,8 @@ use super::*;
 use crate::llm::{Message, Role, ToolCall};
 use crate::team::review::{parse_verdict, Verdict};
 use crate::testsupport::{
-    content_step, thinking_then_prose_step, EchoTool, SequenceProvider, TempDir, TestLog,
+    content_step, thinking_then_prose_step, EchoTool, SequenceProvider, StubResponse, TempDir,
+    TestLog, TestServer,
 };
 use crate::tools::Registry;
 use crate::ui::Writer;
@@ -1154,4 +1155,79 @@ async fn a_hand_off_names_the_context_file_to_read() {
             "a hand-off asks for a history to be written: {p}"
         );
     }
+}
+
+#[tokio::test]
+async fn joy_s_verdict_is_pushed_to_ntfy() {
+    let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
+    let log = TestLog::new("joy-notify");
+    let t = team(&log, Vec::new());
+    t.set_ntfy_url(&srv.url);
+    t.notify_verdict(
+        "joy reviewed /plan",
+        &Verdict::NeedsFix("1. nothing builds".into()),
+        "Work reviewed: /plan\n\nJOY'S FINDINGS\n1. nothing builds\n2. tests skipped",
+    )
+    .await;
+    let notes = srv.notifications();
+    assert_eq!(notes.len(), 1, "one push per verdict");
+    let (title, body) = &notes[0];
+    assert!(title.contains("joy"), "title: {title}");
+    assert!(body.contains("NEEDS FIX"), "body: {body}");
+    assert!(body.contains("/plan"), "body: {body}");
+    // Her findings arrive as a list, not as one wrapped line.
+    assert!(
+        body.contains("1. nothing builds\n2. tests skipped"),
+        "body: {body}"
+    );
+    // A refusal is the one verdict worth waking someone for.
+    assert_eq!(
+        srv.requests()[0].header("priority").as_deref(),
+        Some("high"),
+        "a refusal is sent at high priority"
+    );
+}
+
+#[tokio::test]
+async fn joy_approves_quietly_and_no_topic_sends_nothing() {
+    let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
+    let log = TestLog::new("joy-notify-ok");
+    let t = team(&log, Vec::new());
+    t.set_ntfy_url(&srv.url);
+    t.notify_verdict(
+        "joy verified one task of /autocoding",
+        &Verdict::Approve,
+        "Task: make it so",
+    )
+    .await;
+    let notes = srv.notifications();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].1.contains("APPROVED"), "body: {}", notes[0].1);
+    assert_eq!(
+        srv.requests()[0].header("priority").as_deref(),
+        None,
+        "an approval is not an alert"
+    );
+    // /ntfy off: the same call is a no-op rather than an error.
+    t.set_ntfy_url("");
+    t.notify_verdict("joy reviewed /plan", &Verdict::Unresolved, "")
+        .await;
+    assert_eq!(srv.request_count(), 1, "no topic, no push");
+}
+
+#[tokio::test]
+async fn a_verdict_that_was_never_given_is_not_pushed() {
+    // /verify off: the loop reports "verification off" on the terminal, but a
+    // push per skipped task would be noise on every run.
+    let srv = TestServer::canned(vec![StubResponse::json("ok")]).await;
+    let log = TestLog::new("joy-notify-skipped");
+    let t = team(&log, Vec::new());
+    t.set_ntfy_url(&srv.url);
+    t.notify_verdict(
+        "joy reviewed /plan",
+        &Verdict::Skipped,
+        "Work reviewed: /plan",
+    )
+    .await;
+    assert_eq!(srv.request_count(), 0, "a skipped review is not news");
 }

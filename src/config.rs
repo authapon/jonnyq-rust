@@ -80,6 +80,17 @@ pub fn progress_retry_file() -> String {
     format!("{}/progress.retry", context_dir())
 }
 
+/// JOY's verdict on each task of the last coding run, `<dir>/progress.review`.
+///
+/// The checklist itself cannot carry the findings: JOY may not write to it (no
+/// reviewer does — the coder ticks his own box, on his own proof), yet a
+/// `[!]`/`[F]` has to outlive her conversation so the next /coding retry can
+/// read what to fix. Hence a sidecar of her own, in the same shape as
+/// `progress.retry`.
+pub fn progress_review_file() -> String {
+    format!("{}/progress.review", context_dir())
+}
+
 /// The transcript log path for a given state directory - what `-output`
 /// defaults to, so `-context-dir .state` moves the log along with the
 /// histories unless a path was named explicitly.

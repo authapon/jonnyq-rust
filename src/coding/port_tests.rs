@@ -252,7 +252,13 @@ mod tests {
     /// that would be worth testing.
     #[test]
     fn task_prompt_bounds_the_task_and_its_verification() {
-        let p = build_task_prompt("Create the file `index.html`.", 0, false);
+        let p = build_task_prompt(
+            "Create the file `index.html`.",
+            Status::Open,
+            0,
+            false,
+            None,
+        );
         for want in [
             "SCOPE",
             "nothing beyond it",
@@ -416,7 +422,7 @@ mod tests {
         let (title, body) = &notes[0];
         assert!(title.contains("/plan"), "title: {title}");
         for want in [
-            "1/2 tasks done",
+            "1/2 tasks approved",
             "Started:",
             "Finished:",
             "Duration:",
@@ -429,6 +435,92 @@ mod tests {
         ] {
             assert!(body.contains(want), "body missing {want}: {body}");
         }
+    }
+
+    /// The gate pushed to ntfy: with `/verify` on, every task JOY verifies gets
+    /// its own push the moment she rules on it — that is what makes a long
+    /// `/autocoding` followable from a phone — before the run's own completion
+    /// notification arrives at the end.
+    #[tokio::test]
+    async fn a_verified_task_is_pushed_before_the_run_finishes() {
+        let srv = ntfy().await;
+        let (e, provider) = env(
+            "joy-gate-push",
+            vec![
+                // joey's turn: tick [?], then his final answer...
+                write_progress_step("- [?] task one\n"),
+                content_step("coded it"),
+                // ...then joy's review, one turn with no tool calls.
+                content_step("APPROVE\n\nbuild and the tests for it both pass"),
+            ],
+        );
+        e.dir.write(&progress_file(), ONE_TASK);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        // The REPL keeps the roster's topic and the command's copy in step; a
+        // test that wants verdict pushes has to do the same.
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team, e.ui.clone(), &e.dir.str(), &srv.url);
+        c.run_one_task(&CancellationToken::new()).await.unwrap();
+        // joey's own turn is two calls (the tick, then his answer); joy's
+        // review states a verdict, so it needs only one.
+        assert_eq!(provider.call_count(), 3);
+        assert_eq!(e.dir.read(&progress_file()), "- [A] task one\n");
+        let notes = srv.notifications();
+        assert_eq!(notes.len(), 2, "verdict push, then completion: {notes:?}");
+        let (title, body) = &notes[0];
+        assert!(title.contains("joy APPROVED"), "verdict title: {title}");
+        assert!(
+            body.contains("Task: task one"),
+            "body names the task: {body}"
+        );
+        assert!(body.contains("/coding"), "body names the command: {body}");
+        assert!(
+            notes[1].0.contains("/coding complete"),
+            "completion last: {:?}",
+            notes[1].0
+        );
+    }
+
+    /// A refusal is the news worth waking for: it goes out at high priority,
+    /// carries JOY's findings, and the run stops rather than building on it.
+    #[tokio::test]
+    async fn a_refused_task_is_pushed_at_high_priority_and_stops_the_run() {
+        let srv = ntfy().await;
+        let (e, _p) = env(
+            "joy-gate-refused",
+            vec![
+                // joey codes it; joy refuses; joey re-ticks it [+] and answers;
+                // joy refuses again and the round budget is spent.
+                write_progress_step("- [?] task one\n"),
+                content_step("coded it"),
+                content_step("NEEDS FIX\n1. nothing builds\n2. no tests were run"),
+                write_progress_step("- [+] task one\n"),
+                content_step("fixed, it builds now"),
+                content_step("NEEDS FIX\n1. still nothing builds"),
+            ],
+        );
+        e.dir.write(&progress_file(), ONE_TASK);
+        let team = Arc::new(crate::team::Team::solo(e.agent.clone()));
+        team.set_verify(true);
+        team.set_review_rounds(1);
+        team.set_ntfy_url(&srv.url);
+        let c = crate::coding::Coding::new(team, e.ui.clone(), &e.dir.str(), &srv.url);
+        let err = c.run_one_task(&CancellationToken::new()).await.unwrap_err();
+        assert!(err.notified, "the refusal was reported once: {err:?}");
+        assert_eq!(e.dir.read(&progress_file()), "- [F] task one\n");
+        let notes = srv.notifications();
+        assert!(notes.len() >= 2, "verdict push + stop report: {notes:?}");
+        let reqs = srv.requests();
+        let refused = reqs
+            .iter()
+            .find(|r| r.header("priority").as_deref() == Some("high"))
+            .expect("a refusal is sent at high priority");
+        assert!(
+            refused.body.contains("nothing builds"),
+            "body: {}",
+            refused.body
+        );
     }
 
     #[tokio::test]

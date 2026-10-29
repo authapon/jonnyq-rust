@@ -9,12 +9,17 @@
 //!
 //! Port of Go `internal/coding`.
 
+mod engine;
 mod human;
 mod phase;
 
+pub use engine::{
+    completion_guide, run_usage, CodingModeGuard, RunReport, Scope, StoppedRun, VerdictInfo,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +50,13 @@ pub fn hash_file() -> String {
 pub fn retry_file() -> String {
     crate::config::progress_retry_file()
 }
+/// Persists JOY's findings per task, so a task she refused (`[F]`) comes back
+/// to the coder with her findings on the next run. Her verdicts themselves are
+/// written by jonnyq, never by her: she may not write to the checklist any more
+/// than she may edit code.
+pub fn review_file() -> String {
+    crate::config::progress_review_file()
+}
 /// Aborts once the same task stays unchecked after this many consecutive
 /// attempts, so a genuinely stuck task surfaces to the user instead of being
 /// retried forever unnoticed.
@@ -59,8 +71,154 @@ pub const MAX_NO_PROGRESS_ROUNDS: i64 = 15;
 
 fn checklist_re() -> &'static Regex {
     static RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^(- \[([ xX])\])\s*(.+)$").unwrap());
+        std::sync::LazyLock::new(|| Regex::new(r"^(- \[([ xX?FA+])\])\s*(.+)$").unwrap());
     &RE
+}
+
+/// How far a task has got, as the letter inside its checkbox in
+/// [`.context/progress.md`](progress_file()). The letters are the record a
+/// person reads when they open the checklist, so they carry the review state
+/// and not just "someone ticked it":
+///
+/// | Letter | Meaning | Who writes it |
+/// |---|---|---|
+/// | ` ` | created, nobody has worked on it | JACKY (in the plan) |
+/// | `?` | coded, never verified by JOY | JOEY |
+/// | `F` | coded, JOY verified and **refused** it | jonnyq, from JOY's verdict |
+/// | `+` | re-coded after JOY's findings, awaiting re-verification | JOEY |
+/// | `A` | coded, verified, **APPROVED** by JOY | jonnyq, from JOY's verdict |
+///
+/// The whole point of the split is that the coder ticks his own box only as far
+/// as `?`/`+`: the last two letters belong to the reviewer, so a task cannot
+/// reach `A` by its author claiming it works.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Status {
+    /// `[ ]` — planned, untouched.
+    #[default]
+    Open,
+    /// `[?]` — coded, awaiting JOY's first verdict.
+    Coded,
+    /// `[F]` — JOY verified and refused it; the findings are in the review
+    /// sidecar ([`review_file()`]).
+    Failed,
+    /// `[+]` — re-coded after JOY's findings, awaiting re-verification.
+    Refixed,
+    /// `[A]` — coded, verified and approved by JOY.
+    Approved,
+}
+
+impl Status {
+    /// The letter as it appears between the brackets.
+    pub fn letter(self) -> char {
+        match self {
+            Status::Open => ' ',
+            Status::Coded => '?',
+            Status::Failed => 'F',
+            Status::Refixed => '+',
+            Status::Approved => 'A',
+        }
+    }
+
+    /// Reads a letter; unknown letters fall back to [`Status::Open`] (an
+    /// unrecognised box has not been verified by anyone, which is exactly what
+    /// `[ ]` says).
+    pub fn from_letter(c: char) -> Status {
+        match c {
+            '?' => Status::Coded,
+            'F' | 'f' => Status::Failed,
+            '+' => Status::Refixed,
+            'A' | 'a' | 'x' | 'X' => Status::Approved,
+            _ => Status::Open,
+        }
+    }
+
+    /// Whether the task counts as finished: approved. `x`/`X` — the only letter
+    /// checklists used before JOY joined the roster — reads as approved, so a
+    /// plan ticked under the old scheme stays ticked.
+    pub fn is_done(self) -> bool {
+        self == Status::Approved
+    }
+
+    /// Whether the coder has work to do on it: untouched, or refused and
+    /// waiting for the fix.
+    pub fn needs_coding(self) -> bool {
+        matches!(self, Status::Open | Status::Failed)
+    }
+
+    /// Whether it sits with the reviewer: coded, or re-coded, no verdict yet.
+    pub fn awaits_review(self) -> bool {
+        matches!(self, Status::Coded | Status::Refixed)
+    }
+
+    /// One word for a notification or log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Open => "not started",
+            Status::Coded => "awaiting review",
+            Status::Failed => "refused by joy",
+            Status::Refixed => "awaiting re-review",
+            Status::Approved => "approved",
+        }
+    }
+}
+
+/// What the coding loop can usefully do to a task next. The two are exclusive
+/// because a task is worked strictly one at a time: JOY verifies a task before
+/// the coder is allowed to start the next one (see [`next_work`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// Code it, or fix what JOY refused.
+    Code,
+    /// It is coded and sits waiting for JOY's verdict.
+    Review,
+}
+
+/// Which checklists count as finished work: while JOY verifies, only `[A]`
+/// does; with verification switched off (`/verify off`) `[?]`/`[+]` is the
+/// furthest a task can ever get, so the coder's own proof is what settles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    Joy,
+    Off,
+}
+
+impl Gate {
+    pub fn from_verify(on: bool) -> Gate {
+        if on {
+            Gate::Joy
+        } else {
+            Gate::Off
+        }
+    }
+
+    /// Whether the task in `s` needs no further work under this gate.
+    pub fn settles(self, s: Status) -> bool {
+        match self {
+            Gate::Joy => s.is_done(),
+            Gate::Off => matches!(s, Status::Approved | Status::Coded | Status::Refixed),
+        }
+    }
+}
+
+/// The next task to work on and what to do with it, `None` when the list is
+/// settled. Tasks are taken in checklist order - the first one that is not
+/// settled decides both, so no task is coded while an earlier one still sits
+/// unverified ([`Gate::Joy`]).
+pub fn next_work(tasks: &[Task], gate: Gate) -> Option<(Task, Work)> {
+    for t in tasks {
+        if gate.settles(t.status) {
+            continue;
+        }
+        let work = if t.status.needs_coding() {
+            Work::Code
+        } else if t.status.awaits_review() {
+            Work::Review
+        } else {
+            continue;
+        };
+        return Some((t.clone(), work));
+    }
+    None
 }
 
 /// Included in every prompt that writes to .progress. Some models write
@@ -78,8 +236,16 @@ Only keep names, labels, or short quoted terms from {} in their original languag
 
 #[derive(Clone, Debug, Default)]
 pub struct Task {
-    pub done: bool,
+    /// The letter in its checkbox - see [`Status`].
+    pub status: Status,
     pub text: String,
+}
+
+impl Task {
+    /// Whether this task counts as finished (`[A]`, or the legacy `[x]`).
+    pub fn done(&self) -> bool {
+        self.status.is_done()
+    }
 }
 
 pub fn parse_progress(path: &Path) -> R<Vec<Task>> {
@@ -88,7 +254,7 @@ pub fn parse_progress(path: &Path) -> R<Vec<Task>> {
     for line in data.split('\n') {
         if let Some(caps) = checklist_re().captures(line) {
             tasks.push(Task {
-                done: caps[2].to_lowercase() == "x",
+                status: Status::from_letter(caps[2].chars().next().unwrap_or(' ')),
                 text: caps[3].to_string(),
             });
         }
@@ -96,21 +262,65 @@ pub fn parse_progress(path: &Path) -> R<Vec<Task>> {
     Ok(tasks)
 }
 
-pub fn first_unfinished(tasks: &[Task]) -> Option<Task> {
-    tasks.iter().find(|t| !t.done).cloned()
+/// The first task not yet settled under `gate`, whatever its letter says - the
+/// queue both the coder and the reviewer take from.
+pub fn first_unsettled(tasks: &[Task], gate: Gate) -> Option<Task> {
+    tasks.iter().find(|t| !gate.settles(t.status)).cloned()
 }
 
+/// The first task the coder has to work on: `[ ]` or `[F]` (and, with
+/// verification switched off, a `[?]` is his too - nobody else will settle it).
+/// A `[?]`/`[+]` is JOY's turn, and the coding loop must not walk past it into
+/// the next task - that is what makes a review a gate and not a footnote.
+pub fn first_uncoded(tasks: &[Task], gate: Gate) -> Option<Task> {
+    next_work(tasks, gate)
+        .filter(|(_, w)| *w == Work::Code)
+        .map(|(t, _)| t)
+}
+
+/// Whether every task in the list is settled under `gate`.
+pub fn all_settled(tasks: &[Task], gate: Gate) -> bool {
+    first_unsettled(tasks, gate).is_none()
+}
+
+/// Tasks that are finished in the sense the summary reports: approved.
 pub fn count_done(tasks: &[Task]) -> i64 {
-    tasks.iter().filter(|t| t.done).count() as i64
+    tasks.iter().filter(|t| t.done()).count() as i64
 }
 
+/// `[A]` count, as the summary line words it now that the letter is `A` and
+/// not `x`.
+pub fn count_approved(tasks: &[Task]) -> i64 {
+    count_done(tasks)
+}
+
+/// One line of checklist figures for a notification or log line: approved out
+/// of total, plus what is still out for review when anything is.
 pub fn progress_summary_line(tasks: &[Task]) -> String {
-    format!("{}/{} tasks done", count_done(tasks), tasks.len())
+    let total = tasks.len();
+    let approved = count_approved(tasks);
+    let mut out = format!("{approved}/{total} tasks approved");
+    let mut pending: Vec<String> = Vec::new();
+    for s in [Status::Coded, Status::Refixed, Status::Failed, Status::Open] {
+        let n = tasks.iter().filter(|t| t.status == s).count();
+        if n > 0 {
+            pending.push(format!("{n} {}", s.label()));
+        }
+    }
+    if !pending.is_empty() {
+        out.push_str(&format!(" ({})", pending.join(", ")));
+    }
+    out
 }
 
 /// Settings shared by every coding command.
 pub struct Coding<'a> {
     pub agent: Arc<Agent>,
+    /// The roster, because the coding lane cannot be run without the reviewer:
+    /// every task is coded *and* verified before the next one starts, and the
+    /// verdict is not the coder's to give (see [`crate::team::Team`] and
+    /// [`crate::team::review`]).
+    pub team: Arc<crate::team::Team>,
     pub ui: Arc<Writer>,
     pub work_dir: String,
     pub ntfy_url: String,
@@ -118,9 +328,16 @@ pub struct Coding<'a> {
 }
 
 impl<'a> Coding<'a> {
-    pub fn new(agent: Arc<Agent>, ui: Arc<Writer>, work_dir: &str, ntfy_url: &str) -> Self {
+    pub fn new(
+        team: Arc<crate::team::Team>,
+        ui: Arc<Writer>,
+        work_dir: &str,
+        ntfy_url: &str,
+    ) -> Self {
+        let agent = team.active();
         Self {
             agent,
+            team,
             ui,
             work_dir: work_dir.to_string(),
             ntfy_url: ntfy_url.to_string(),
@@ -135,6 +352,32 @@ impl<'a> Coding<'a> {
     fn path(&self, name: &str) -> PathBuf {
         Path::new(&self.work_dir).join(name)
     }
+
+    /// The three files a coding run drives: the checklist, JOY's findings
+    /// sidecar and the same-task stall counter. Read at call time, because
+    /// `JONNYQ_CONTEXT_DIR` moves the whole state folder.
+    pub fn files(&self) -> RunFiles {
+        RunFiles {
+            progress: self.path(&progress_file()),
+            review: self.path(&review_file()),
+            retry: self.path(&retry_file()),
+        }
+    }
+
+    /// Whether the tasks of this run are gated on JOY's verdict (`/verify`).
+    pub fn gate(&self) -> Gate {
+        Gate::from_verify(self.team.verify())
+    }
+}
+
+/// The files one coding run reads and writes, resolved once so a task's
+/// coding turn, JOY's review of it and the state written back after all use
+/// the same paths.
+#[derive(Clone, Debug)]
+pub struct RunFiles {
+    pub progress: PathBuf,
+    pub review: PathBuf,
+    pub retry: PathBuf,
 }
 
 /// Sends a completion notification via n, printing a non-fatal warning
@@ -283,7 +526,7 @@ fn write_retry_state(path: &Path, s: &RetryState) -> std::io::Result<()> {
 /// i.e. the model never called edit_file/write_file on it at all (a read
 /// error counts as "changed" so a missing/unreadable file never falsely
 /// reports "unchanged").
-fn progress_unchanged(path: &Path, before: &[u8]) -> bool {
+pub(crate) fn progress_unchanged(path: &Path, before: &[u8]) -> bool {
     match std::fs::read(path) {
         Ok(after) => after == before,
         Err(_) => false,
@@ -295,8 +538,263 @@ fn clear_retry_state(path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// writing a task's letter, and joy's findings sidecar
+// ---------------------------------------------------------------------------
+
+/// The checkbox line with its parts separated for *rewriting*: `(- [)(x)(]   )(text)`.
+/// [`checklist_re`] drops the whitespace between `]` and the text, so using it
+/// to write would reformat the line; this one keeps it.
+fn checklist_line_re() -> &'static Regex {
+    static RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(- \[)([ xX?FA+])(\]\s*)(.*)$").unwrap());
+    &RE
+}
+
+pub(crate) fn same_task(a: &str, b: &str) -> bool {
+    a == b || {
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        !a.is_empty() && norm(a) == norm(b)
+    }
+}
+
+/// Rewrites one task's checkbox letter in the checklist file, leaving every
+/// other line untouched — which matters because the file also holds the
+/// plan's phase headings and the human-verification notes.
+///
+/// Only jonnyq calls this, and only for the two letters the coder may not
+/// write for himself: `[A]` on JOY's APPROVE and `[F]` on her refusal (see
+/// [`Status`]). JOEY moves his own box to `[?]`/`[+]` with the file tools.
+///
+/// A task whose line cannot be found is an error rather than a silent no-op:
+/// the caller is about to report the task as approved or refused, and a
+/// checklist that says otherwise afterwards is worse than a failed command.
+pub fn set_task_status(path: &Path, task_text: &str, to: Status) -> R<()> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| AgentError::new(format!("reading {}: {}", progress_file(), e)))?;
+    let mut out = String::with_capacity(data.len());
+    let mut done = false;
+    for line in data.split_inclusive('\n') {
+        let (body, eol) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let nl = if body.ends_with('\r') || eol.is_empty() {
+            ""
+        } else {
+            eol
+        };
+        let body = body.trim_end_matches('\r');
+        if !done {
+            if let Some(caps) = checklist_line_re().captures(body) {
+                if same_task(&caps[4], task_text) {
+                    out.push_str(&format!(
+                        "{}{}{}{}{}",
+                        &caps[1],
+                        to.letter(),
+                        &caps[3],
+                        &caps[4],
+                        nl
+                    ));
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(body);
+        out.push_str(nl);
+    }
+    if !done {
+        return Err(AgentError::new(format!(
+            "task {:?} is no longer a checkbox line in {} - the checklist was changed while it was \
+being worked on, so its state could not be set to \"[{}]\"",
+            task_text,
+            progress_file(),
+            to.letter()
+        )));
+    }
+    std::fs::write(path, out).map_err(|e| {
+        AgentError::new(format!(
+            "writing {} (task status \"[{}]\"): {}",
+            progress_file(),
+            to.letter(),
+            e
+        ))
+    })
+}
+
+/// JOY's verdicts on the tasks of the run that just finished, in
+/// [`retry_file()`]'s shape: one line per task, `flag\t<task>\t<findings>`,
+/// tabs and newlines flattened inside the fields.
+///
+/// Why a file at all: JOY must not write to the checklist — she reviews, she
+/// does not edit, and a reviewer who ticks his own author's boxes is how a
+/// rubber stamp gets made — yet a refusal has to survive her conversation so
+/// the coder can be sent the same findings on the next run, and so a person
+/// who stopped the session can resume it. The letter in the checklist says
+/// *that* she refused; this says *what* she refused it for.
+///
+/// The file describes one run: [`set_task_findings`] drops the lines of tasks
+/// that are no longer in it, so it never grows across a long project.
+#[derive(Clone, Debug, Default)]
+pub struct TaskReview {
+    findings: Vec<(String, String)>,
+}
+
+impl TaskReview {
+    /// Her findings on `task_text`, if she left any.
+    pub fn findings_for(&self, task_text: &str) -> Option<&str> {
+        self.findings
+            .iter()
+            .find(|(t, _)| same_task(t, task_text))
+            .map(|(_, f)| f.as_str())
+            .filter(|f| !f.trim().is_empty())
+    }
+
+    /// Every task she refused, with her findings — the body of the "this run
+    /// stopped" report, whether or not the findings survived in the sidecar.
+    pub fn all(&self) -> &[(String, String)] {
+        &self.findings
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+/// One field of the sidecar on one line: backslash, tab and newline escaped so
+/// a finding keeps its numbered-list layout across a run boundary.
+fn escape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The inverse of [`escape_field`].
+fn unescape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn flat(s: &str) -> String {
+    s.replace('\t', " ").trim().to_string()
+}
+
+pub fn load_task_reviews(path: &Path) -> TaskReview {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return TaskReview::default();
+    };
+    let mut findings = Vec::new();
+    for line in data.split('\n') {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() != 3 || parts[1].is_empty() {
+            continue;
+        }
+        findings.push((unescape_field(parts[1]), unescape_field(parts[2])));
+    }
+    TaskReview { findings }
+}
+
+/// The flag of a task that is not settled - the one worth keeping a note about.
+pub const REVIEW_PENDING: char = 'R';
+
+/// Records JOY's findings for one task and drops the notes of tasks that are no
+/// longer the ones under review. `findings` `None` means "she approved it": the
+/// task's line is removed rather than left to come back as a stale complaint.
+pub fn set_task_findings(
+    path: &Path,
+    tasks: &[Task],
+    task_text: &str,
+    findings: Option<&str>,
+) -> R<()> {
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for line in std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split('\n')
+    {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() != 3 || parts[1].is_empty() {
+            continue;
+        }
+        let text = unescape_field(parts[1]);
+        if same_task(&text, task_text) {
+            continue; // rewritten below, or dropped on approval
+        }
+        // Anything no longer in the run's scope is stale by definition.
+        if tasks.iter().any(|t| !t.done() && same_task(&t.text, &text)) {
+            kept.push((text, unescape_field(parts[2])));
+        }
+    }
+    if let Some(f) = findings {
+        let f = flat(f);
+        if !f.is_empty() {
+            kept.push((flat(task_text), f));
+        }
+    }
+    let mut out = String::new();
+    for (t, f) in &kept {
+        out.push_str(&format!(
+            "{REVIEW_PENDING}\t{}\t{}\n",
+            escape_field(t),
+            escape_field(f)
+        ));
+    }
+    if out.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    }
+    std::fs::write(path, out)
+        .map_err(|e| AgentError::new(format!("writing {}: {}", review_file(), e)))
+}
+
+// ---------------------------------------------------------------------------
 // prompts
 // ---------------------------------------------------------------------------
+
+/// The checklist's letters, in the wording every prompt that touches the
+/// checklist carries. A model that does not know `[A]` is the reviewer's to
+/// write will tick `[x]` and consider the task finished - which is exactly the
+/// hole the letters close.
+pub fn status_legend() -> String {
+    format!(
+        "CHECKLIST STATES - the letter in each \"- [ ]\" line of {} is the task's whole history:\n\
+\"- [ ]\" planned, nobody has worked on it.\n\
+\"- [?]\" coded, never verified by JOY (the reviewer).\n\
+\"- [F]\" coded, verified by JOY and REFUSED - her findings are in {}.\n\
+\"- [+]\" re-coded after JOY's findings, waiting to be re-verified.\n\
+\"- [A]\" coded, verified and APPROVED by JOY - the only state that means finished.\n\
+A coder moves his own task \"[ ]\" -> \"[?]\" (or \"[F]\" -> \"[+]\" when fixing what JOY refused) \
+and NEVER writes \"[A]\" or \"[x]\": the last letter is jonnyq's, copied from JOY's verdict, so \
+finishing is not something an author can do to his own work.",
+        progress_file(),
+        review_file()
+    )
+}
 
 pub fn build_generate_prompt() -> String {
     format!(
@@ -316,7 +814,9 @@ Group related tasks under phase headings, ordered so each phase's dependencies c
 actual phases to what the project needs - typically scaffolding/configuration first, then data/storage, \
 then core logic, then API/integration, then UI, then testing and final verification last). Every task \
 line must still be a GitHub-style checkbox \"- [ ] <task>\" - only those lines are tracked as tasks; phase \
-headings and any other text are ignored. If {} labels requirements with IDs (e.g. REQ-012), reference the \
+headings and any other text are ignored. A new plan is always written with every task as \"- [ ]\": you never \
+write \"[?]\", \"[F]\", \"[+]\" or \"[A]\", and you never re-tick a task a coder or the reviewer has already \
+settled. If {} labels requirements with IDs (e.g. REQ-012), reference the \
 relevant ID(s) in parentheses at the end of each task description for traceability, e.g. \"- [ ] Do the \
 thing (REQ-012)\" - only when such IDs actually appear in {}, never invent them. Include an initial phase \
 covering any missing project scaffolding/toolchain setup, and a final phase with a task that verifies the \
@@ -333,10 +833,13 @@ Do not implement anything yet - only produce the task list.",
 pub fn build_reconcile_prompt() -> String {
     format!(
         "{} has changed since {} was last updated. Compare the current content of {} against {} and the existing code in \
-the working directory, then update {}: add new unchecked tasks (\"- [ ] ...\") for anything new or changed that \
-still needs work, and if a previously completed task (\"- [x]\") no longer matches the current requirement or \
-the actual code, uncheck it back to \"- [ ]\" and adjust its description to reflect what's actually needed now. \
-Leave unrelated existing tasks and their checked state as-is. Keep new tasks as detailed and granular as the \
+the working directory, then update {}: add new tasks as \"- [ ] ...\" for anything new or changed that \
+still needs work, and if a previously approved task (\"- [A]\", or an older \"- [x]\") no longer matches the current \
+requirement or \
+the actual code, set it back to \"- [ ]\" and adjust its description to reflect what's actually needed now. \
+Leave unrelated existing tasks and their state letter as-is - in particular never change the letter of a \
+task that is merely waiting for the reviewer (\"[?]\", \"[F]\", \"[+]\"), that is not your call to make. \
+Keep new tasks as detailed and granular as the \
 existing ones (small, independently verifiable, referencing requirement IDs in parentheses the same way the \
 existing tasks do, if any), and organize them under the existing \"## Phase N: <name>\" heading they best \
 fit, adding a new phase heading only if genuinely new work doesn't fit any existing phase. Preserve any \
@@ -373,7 +876,27 @@ not build a test harness for behaviour a later task has not written yet.\n\
 - If the task does carry behaviour, run the project's real build and test commands for it and fix any \
 failures until they genuinely pass.";
 
-pub fn build_task_prompt(task_text: &str, stall: i64, prev_untouched: bool) -> String {
+/// The line a coder has to move a task to, given where it stands now:
+/// `[ ]` -> `[?]`, `[F]` -> `[+]`. `[?]`/`[+]` stay as they are — a task
+/// already out for review is not his to move again.
+fn next_coder_letter(from: Status) -> Status {
+    match from {
+        Status::Failed => Status::Refixed,
+        _ => Status::Coded,
+    }
+}
+
+/// The task prompt JOEY gets. `stall`/`prev_untouched` carry the retry history
+/// of a task that stayed unfinished across attempts; `findings` is JOY's
+/// refusal note when the task is being fixed after `[F]`.
+pub fn build_task_prompt(
+    task_text: &str,
+    status: Status,
+    stall: i64,
+    prev_untouched: bool,
+    findings: Option<&str>,
+) -> String {
+    let to = next_coder_letter(status);
     let retry_note = if stall > 0 && prev_untouched {
         // The model's previous attempt never called edit_file/write_file on
         // .progress at all - it only ran shell commands and/or narrated the
@@ -385,40 +908,85 @@ pub fn build_task_prompt(task_text: &str, stall: i64, prev_untouched: bool) -> S
 write_file on {} at all - describing the change in your reply, or printing success messages via \
 run_command (e.g. echo), does not change the file and does not count as finishing the task. This time, \
 after you've genuinely verified it, you MUST make a real edit_file (preferred) or write_file tool call \
-that changes this task's checkbox in {} from \"- [ ]\" to \"- [x]\".\n\n",
-            stall, progress_file(), progress_file()
+that changes this task's checkbox in {} from \"- [{}]\" to \"- [{}]\".\n\n",
+            stall,
+            progress_file(),
+            progress_file(),
+            status.letter(),
+            to.letter()
         )
     } else if stall > 0 {
-        // The same task came back unchecked after a previous attempt that
+        // The same task came back unfinished after a previous attempt that
         // did touch .progress. Models have been observed to just repeat "I
         // already did this and verified it" without noticing that .progress
-        // on disk still shows it unchecked - typically because an earlier
+        // on disk still shows it unsettled - typically because an earlier
         // edit_file call silently failed to match or a write_file rewrite
         // was based on a stale copy. Point this out explicitly.
         format!(
-            "Note: this task was already attempted {} time(s) before and is STILL shown as unchecked (\"- [ ]\") in {} right \
+            "Note: this task was already attempted {} time(s) before and is STILL shown as \"- [{}]\" in {} right \
 now. Do not assume you already finished it, even if it looks familiar - re-check from scratch: read_file {} \
 and your implementation files to see their real current state, figure out concretely why the checkbox didn't \
 end up set (a common cause: edit_file's old_string must match the line in {} exactly, or a prior write_file \
 rewrote {} from a stale in-memory copy and clobbered the change), and fix it for real this time.\n\n",
-            stall, progress_file(), progress_file(), progress_file(), progress_file()
+            stall,
+            status.letter(),
+            progress_file(),
+            progress_file(),
+            progress_file(),
+            progress_file()
         )
     } else {
         String::new()
     };
+    let fix_note = match findings {
+        Some(f) if !f.trim().is_empty() => format!(
+            "JOY verified your earlier work on this task and REFUSED it (the checklist shows \"- [F]\"). \
+Her findings:\n\n{}\n\nFix exactly these, and anything else you find broken while fixing them - do not \
+simply re-state that it works.\n\n",
+            f.trim()
+        ),
+        _ => String::new(),
+    };
+    let from_letter = status.letter();
+    let to_letter = to.letter();
+    let legend = status_legend();
     format!(
-        "{retry_note}\
+        "{retry_note}{fix_note}\
 Work on this task from {REQUIREMENTS_FILE}: {task_text:?}\n\n\
 {TASK_SCOPE_RULE}\n\n\
+{legend}\n\n\
 Before changing {pf}, always read_file it first to see its exact current content - never edit it from \
 memory, since your view of it may be stale. Prefer edit_file for a single checkbox change over \
 rewriting the whole file with write_file, which risks clobbering other tasks' state if your copy of it \
 is out of date. Only once you have seen this task's own verification pass in this turn, actually call \
-edit_file or write_file to change this task's checkbox in {pf} from \"- [ ]\" to \"- [x]\" - stating in \
-your reply that it's done, without making that tool call, does not count and leaves the task unfinished. \
-If you discover the task needs to be split into smaller steps, edit {pf} to reflect that instead of \
-marking it done.",
+edit_file or write_file to change this task's checkbox in {pf} from \"- [{from_letter}]\" to \"- [{to_letter}]\" - \
+stating in your reply that it's done, without making that tool call, does not count and leaves the task \
+unfinished. Never write \"[A]\" or \"[x]\" yourself: JOY verifies this task next and only jonnyq writes \
+her verdict into the checklist. If you discover the task needs to be split into smaller steps, edit {pf} \
+to reflect that instead of marking it done.",
         pf = progress_file()
+    )
+}
+
+/// [`build_task_prompt`] for a task the coder starts from scratch.
+#[allow(dead_code)]
+pub fn build_coding_prompt(task_text: &str) -> String {
+    build_task_prompt(task_text, Status::Open, 0, false, None)
+}
+
+/// What the gate means for the letter the coder may write, appended to his
+/// prompt. [`build_task_prompt`] already tells him JOY verifies next and that
+/// `[A]` is not his to write, so with verification on there is nothing to add;
+/// with it switched off the prompt would otherwise promise a reviewer who is
+/// not coming, and `[?]`/`[+]` are then as far as a task can ever get.
+pub(crate) fn gate_note(verify: bool) -> String {
+    if verify {
+        return String::new();
+    }
+    format!(
+        "\n\nVerification is OFF (/verify off), so nobody reviews this task: \"- [?]\" (or \"- \
+[+]\" after a re-work) is the furthest it gets, and your own command output is what settles it. \
+Do not mark a task you did not finish - the letter is the record a person reads.\n\n"
     )
 }
 
@@ -686,388 +1254,6 @@ fn human_guide_present(prog_path: &Path) -> bool {
         Err(_) => false,
     }
 }
-
-// ---------------------------------------------------------------------------
-// /coding (one task)
-// ---------------------------------------------------------------------------
-
-impl<'a> Coding<'a> {
-    /// /coding: works on exactly one unfinished task from .progress and then
-    /// returns, without looping through the rest. .progress must already
-    /// exist (via /plan or /autocoding) - it is not generated here.
-    pub async fn run_one_task(&self, cancel: &CancellationToken) -> R<()> {
-        let start = Instant::now();
-        let n = self.notifier();
-        let result = self.run_one_task_body(cancel, &n, start).await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                Err(notify_failure(&n, &self.ui, "jonnyq: /coding failed", start, cancel, e).await)
-            }
-        }
-    }
-
-    async fn run_one_task_body(
-        &self,
-        cancel: &CancellationToken,
-        n: &Notifier,
-        start: Instant,
-    ) -> R<()> {
-        let prog_path = self.path(&progress_file());
-        if !prog_path.exists() {
-            return Err(AgentError::new(format!(
-                "{} not found; run /plan first to generate it from {}",
-                progress_file(),
-                REQUIREMENTS_FILE
-            )));
-        }
-
-        let tasks = parse_progress(&prog_path)
-            .map_err(|e| AgentError::new(format!("reading {}: {}", progress_file(), e.message)))?;
-        let Some(next) = first_unfinished(&tasks) else {
-            self.ui.plainln(&format!(
-                "[coding] all tasks in {} are checked off",
-                progress_file()
-            ));
-            let mut summary = format!(
-                "All tasks already complete: {}",
-                progress_summary_line_local(&tasks)
-            );
-            if let Ok(doc) = human::parse_progress_doc(&prog_path) {
-                let g = doc.guide_text();
-                if !g.is_empty() {
-                    summary.push_str("\n\n");
-                    summary.push_str(&human::truncate_bytes(&g, human::NOTIFY_GUIDE_LIMIT));
-                }
-            }
-            // No run_turn happened, so there's no fresh last_usage to report
-            // - Usage::default() renders as "n/a" rather than stale figures
-            // from an unrelated earlier turn.
-            notify_or_warn(
-                n,
-                &self.ui,
-                "jonnyq: /coding complete",
-                &with_timing(&summary, start, Usage::default()),
-            )
-            .await;
-            return Ok(());
-        };
-
-        let retry_path = self.path(&retry_file());
-        let prev = load_retry_state(&retry_path);
-        let mut stall = 0;
-        let mut prev_untouched = false;
-        if prev.text == next.text {
-            stall = prev.count;
-            prev_untouched = prev.untouched;
-        }
-
-        let _mode_guard = CodingModeGuard::on(&self.agent);
-        self.ui
-            .plainln(&format!("[coding] working on: {}", next.text));
-        let before = std::fs::read(&prog_path).unwrap_or_default();
-        let doc_before = human::parse_progress_doc(&prog_path).ok();
-        let phase_idx = doc_before
-            .as_ref()
-            .map(|d| d.first_incomplete_phase())
-            .unwrap_or(-1);
-        let prompt = build_task_prompt(&next.text, stall, prev_untouched)
-            + &doc_before
-                .map(|d| human::human_guide_note(&d))
-                .unwrap_or_default();
-        let turn = self.agent.run_turn(cancel.child_token(), &prompt).await;
-        turn.map_err(|e| AgentError::new(format!("working on {:?}: {}", next.text, e.message)))?;
-
-        let tasks_after = parse_progress(&prog_path)
-            .map_err(|e| AgentError::new(format!("reading {}: {}", progress_file(), e.message)))?;
-        if let Some(next_after) = first_unfinished(&tasks_after) {
-            if next_after.text == next.text {
-                let new_count = stall + 1;
-                if new_count >= MAX_STALL_ROUNDS {
-                    clear_retry_state(&retry_path);
-                    let summary = format!(
-                        "Task {:?} made no progress after {} attempts; check {} and requirements.md manually. {}",
-                        next.text,
-                        MAX_STALL_ROUNDS,
-                        progress_file(),
-                        progress_summary_line_local(&tasks_after)
-                    );
-                    let stall_err = AgentError::new(format!(
-                        "task {:?} made no progress after {} attempts via /coding; check {} and requirements.md manually",
-                        next.text, MAX_STALL_ROUNDS, progress_file()
-                    ));
-                    if n.enabled() {
-                        let msg = format!(
-                            "{}\n\n{}",
-                            crate::notify::format_error(&stall_err),
-                            with_timing(
-                                &summary,
-                                start,
-                                self.agent.last_usage.lock().unwrap().usage
-                            )
-                        );
-                        if let Err(e) = n.send_alert("jonnyq: /coding stalled", &msg).await {
-                            self.ui.plainln(&format!(
-                                "warning: ntfy notification failed: {}",
-                                e.message
-                            ));
-                        }
-                        return Err(stall_err.mark_notified());
-                    }
-                    return Err(stall_err);
-                }
-                let untouched = progress_unchanged(&prog_path, &before);
-                write_retry_state(
-                    &retry_path,
-                    &RetryState {
-                        text: next.text.clone(),
-                        count: new_count,
-                        untouched,
-                    },
-                )
-                .map_err(|e| AgentError::new(format!("recording retry state: {}", e)))?;
-                return Ok(());
-            }
-        }
-        clear_retry_state(&retry_path);
-        let mut summary = format!(
-            "Completed: {:?}\n{}",
-            next.text,
-            progress_summary_line_local(&tasks_after)
-        );
-        let mut title = "jonnyq: /coding complete".to_string();
-        let (extra, kind) = completion_guide(&prog_path, phase_idx, &tasks_after);
-        if !extra.is_empty() {
-            summary.push_str("\n\n");
-            summary.push_str(&human::truncate_bytes(&extra, human::NOTIFY_GUIDE_LIMIT));
-            title = format!("jonnyq: /coding {} complete", kind);
-        }
-        notify_or_warn(
-            n,
-            &self.ui,
-            &title,
-            &with_timing(&summary, start, self.agent.last_usage.lock().unwrap().usage),
-        )
-        .await;
-        Ok(())
-    }
-}
-
-/// The human-verification text to include in a /coding completion
-/// notification, and a title word for it: the whole guide once every task is
-/// done ("all tasks"), or just the finished phase's check when that task
-/// completed phase `phase_idx` ("phase"). Empty when .progress carries no
-/// verification guide or neither applies.
-fn completion_guide(prog_path: &Path, phase_idx: i64, tasks_after: &[Task]) -> (String, String) {
-    let Ok(doc) = human::parse_progress_doc(prog_path) else {
-        return (String::new(), String::new());
-    };
-    if !doc.has_guide() {
-        return (String::new(), String::new());
-    }
-    if first_unfinished(tasks_after).is_none() {
-        return (doc.guide_text(), "all tasks".into());
-    }
-    if phase_idx >= 0 && (phase_idx as usize) < doc.phases.len() {
-        let p = &doc.phases[phase_idx as usize];
-        if p.complete() && !p.check.is_empty() {
-            return (doc.phase_guide_text(phase_idx as usize), "phase".into());
-        }
-    }
-    (String::new(), String::new())
-}
-
-// ---------------------------------------------------------------------------
-// /autocoding and the shared task loop
-// ---------------------------------------------------------------------------
-
-impl<'a> Coding<'a> {
-    /// /autocoding: plans (as /plan does) if needed, then works through every
-    /// unfinished task in .progress in one run instead of stopping after
-    /// each. Doesn't notify per task (its internal plan call disables
-    /// notifications, otherwise every task would ping). Sends one
-    /// notification when every task is done (with the human verification
-    /// guide, if .progress has one) and one when the run aborts with an
-    /// error, with the reason.
-    pub async fn auto_run(&self, cancel: &CancellationToken) -> R<()> {
-        let start = Instant::now();
-        let n = self.notifier();
-        let result = self.auto_run_body(cancel, &n, start).await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                Err(
-                    notify_failure(&n, &self.ui, "jonnyq: /autocoding failed", start, cancel, e)
-                        .await,
-                )
-            }
-        }
-    }
-
-    async fn auto_run_body(
-        &self,
-        cancel: &CancellationToken,
-        n: &Notifier,
-        start: Instant,
-    ) -> R<()> {
-        self.plan(cancel, false).await?;
-
-        let prog_path = self.path(&progress_file());
-
-        let _mode_guard = CodingModeGuard::on(&self.agent);
-        let loop_res = self
-            .run_task_loop(cancel, "autocoding", &|c: &Coding, _p: &Path| {
-                let tasks = parse_progress(&c.path(&progress_file())).map_err(|e| {
-                    AgentError::new(format!("reading {}: {}", progress_file(), e.message))
-                })?;
-                let next = first_unfinished(&tasks);
-                Ok((tasks, next))
-            })
-            .await;
-        let (ran_turn, ()) = loop_res?;
-
-        let tasks = parse_progress(&prog_path).unwrap_or_default();
-        self.ui.plainln(&format!(
-            "[autocoding] all tasks in {} are checked off",
-            progress_file()
-        ));
-        let mut summary = format!(
-            "All tasks complete: {}",
-            progress_summary_line_local(&tasks)
-        );
-        if let Ok(doc) = human::parse_progress_doc(&prog_path) {
-            let g = doc.guide_text();
-            if !g.is_empty() {
-                summary.push_str("\n\n");
-                summary.push_str(&human::truncate_bytes(&g, human::NOTIFY_GUIDE_LIMIT));
-            }
-        }
-        let u = if ran_turn {
-            self.agent.last_usage.lock().unwrap().usage
-        } else {
-            Usage::default()
-        };
-        notify_or_warn(
-            n,
-            &self.ui,
-            "jonnyq: /autocoding complete",
-            &with_timing(&summary, start, u),
-        )
-        .await;
-        Ok(())
-    }
-
-    /// The loop shared by /autocoding and /coding_phase: while `pick` reports
-    /// unfinished work, it clears history and runs one task turn, with the
-    /// same safety valves in both. Returns once pick reports nothing
-    /// remaining (ran_turn says whether any turn ran) or on error. `label`
-    /// only prefixes the progress lines printed to the terminal. The caller
-    /// owns coding mode and notifications.
-    pub async fn run_task_loop(
-        &self,
-        cancel: &CancellationToken,
-        label: &str,
-        pick: &(dyn Fn(&Coding, &Path) -> R<(Vec<Task>, Option<Task>)> + Send + Sync),
-    ) -> R<(bool, ())> {
-        let prog_path = self.path(&progress_file());
-
-        let mut ran_turn = false;
-        let mut last_text = String::new();
-        let mut stall = 0i64;
-        let mut untouched = false;
-        let mut last_done_count = -1i64;
-        let mut no_progress_rounds = 0i64;
-
-        loop {
-            if cancel.is_cancelled() {
-                return Err(AgentError::new("context canceled"));
-            }
-            let (tasks, next) = pick(self, &prog_path)?;
-            let Some(next) = next else {
-                return Ok((ran_turn, ()));
-            };
-
-            // Independent of the same-task check below: if the number of
-            // completed tasks in scope hasn't grown in a while, nothing is
-            // actually getting finished, no matter how "next" is drifting
-            // round to round.
-            let done_now = count_done(&tasks);
-            if last_done_count == -1 {
-                last_done_count = done_now;
-            }
-            if done_now > last_done_count {
-                last_done_count = done_now;
-                no_progress_rounds = 0;
-            } else {
-                no_progress_rounds += 1;
-                if no_progress_rounds >= MAX_NO_PROGRESS_ROUNDS {
-                    return Err(AgentError::new(format!(
-                        "no task in {} has been completed in the last {} rounds (currently on {:?}); aborting - check {} and requirements.md manually",
-                        progress_file(), MAX_NO_PROGRESS_ROUNDS, next.text, progress_file()
-                    )));
-                }
-            }
-
-            if next.text == last_text {
-                stall += 1;
-                if stall >= MAX_STALL_ROUNDS {
-                    return Err(AgentError::new(format!(
-                        "task {:?} made no progress after {} attempts; check {} and requirements.md manually",
-                        next.text, MAX_STALL_ROUNDS, progress_file()
-                    )));
-                }
-            } else {
-                last_text = next.text.clone();
-                stall = 0;
-                untouched = false;
-            }
-
-            self.ui
-                .plainln(&format!("[{}] working on: {}", label, next.text));
-            // Start each task with a clean slate: no memory of the planning
-            // step or any earlier task. The model re-discovers whatever it
-            // needs (via read_file/run_command) instead of relying on
-            // conversation history that keeps growing across the whole run.
-            self.agent.reset_history();
-            let before = std::fs::read(&prog_path).unwrap_or_default();
-            let doc_before = human::parse_progress_doc(&prog_path).ok();
-            ran_turn = true;
-            let prompt = build_task_prompt(&next.text, stall, untouched)
-                + &doc_before
-                    .map(|d| human::human_guide_note(&d))
-                    .unwrap_or_default();
-            if let Err(e) = self.agent.run_turn(cancel.child_token(), &prompt).await {
-                return Err(AgentError::new(format!(
-                    "working on {:?}: {}",
-                    next.text, e.message
-                )));
-            }
-            untouched = progress_unchanged(&prog_path, &before);
-        }
-    }
-}
-
-/// Guards coding mode back off on any early return path (Go uses defer;
-/// Rust callers call set_coding_mode explicitly around loops).
-pub struct CodingModeGuard<'c> {
-    agent: &'c Agent,
-}
-
-impl<'c> CodingModeGuard<'c> {
-    pub fn on(agent: &'c Agent) -> Self {
-        agent.set_coding_mode(true);
-        Self { agent }
-    }
-}
-
-impl Drop for CodingModeGuard<'_> {
-    fn drop(&mut self) {
-        self.agent.set_coding_mode(false);
-    }
-}
-
-#[allow(dead_code)]
-fn unused(_: Duration) {}
 
 #[cfg(test)]
 mod port_tests;

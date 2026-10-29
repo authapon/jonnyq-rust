@@ -838,8 +838,10 @@ impl CodingEnv {
 
     /// The command object under test, with notifications pointed at `ntfy`.
     pub fn coding(&self, ntfy_url: &str) -> crate::coding::Coding<'_> {
+        // One agent in every roster slot: the stub provider answers whoever
+        // speaks, so a test can drive the coder/reviewer pair as one voice.
         crate::coding::Coding::new(
-            self.agent.clone(),
+            Arc::new(crate::team::Team::solo(self.agent.clone())),
             self.agent.ui.clone(),
             &self.dir.str(),
             ntfy_url,

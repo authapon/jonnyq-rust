@@ -24,6 +24,14 @@ pub struct NtfyMessage {
     pub title: String,
 }
 
+/// The title prefix every publication jonnyq itself makes carries — a command's
+/// completion, a review verdict, an error, the `ask_user` question. The subscriber
+/// filters on it: a topic is shared by both directions, so a message jonnyq
+/// published must never be read back as an answer to its own question. A person's
+/// quick reply from the ntfy app or web UI sends no title at all, so nothing real
+/// is filtered away.
+pub const OWN_TITLE_PREFIX: &str = "jonnyq: ";
+
 /// Derives the subscription URL from a publish URL: ntfy's API puts both
 /// under the same topic path, so only the trailing `/json` is added (plus the
 /// query string by the caller). A URL that already points at an API endpoint

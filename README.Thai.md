@@ -6,7 +6,7 @@
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.1.1
+jonnyq v1.2.0
 qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
 
-**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.1.1`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.2.0`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
 
 ## เวอร์ชัน
 
-jonnyq อยู่ที่ **v1.1.1** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
+jonnyq อยู่ที่ **v1.2.0** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
 
 | ที่ไหน | สิ่งที่เห็น |
 |---|---|
-| terminal, ตอนเปิด session | `jonnyq v1.1.1` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
+| terminal, ตอนเปิด session | `jonnyq v1.2.0` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
 | `jonnyq -h` / `-help` | เวอร์ชันเป็นบรรทัดแรกของ usage (พิมพ์ออกมาหลัง error ของ flag ผิดด้วย) |
 | `/version` | บรรทัดเดียวกัน เรียกใช้กลาง session ได้ตลอด |
 | `/help`, `/?` | เวอร์ชันอยู่เหนือรายการ slash command |
-| web console | ใน title ของ tab (`jonnyq console v1.1.1`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
-| `GET /health` | `"version": "1.1.1"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
+| web console | ใน title ของ tab (`jonnyq console v1.2.0`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
+| `GET /health` | `"version": "1.2.0"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
 
 `-h` ยัง exit ด้วย code 1 เหมือนโปรแกรมที่ใช้ Go `flag` เพราะถือเป็นการขอ usage ไม่ใช่คำสั่งปกติ และไม่มี flag `-version` — ใช้ `-h`, `/version` หรือ `curl 127.0.0.1:<port>/health` ของ session ที่เปิด `-web` แทน
 
@@ -337,8 +337,20 @@ system prompt ของทุก agent มีรายชื่อทีมต�
 > Human check: รัน `cargo build` -> ต้องไม่มี error, เห็น binary ใน target/debug
 
 - [ ] Init Cargo.toml with tokio + serde dependencies (REQ-001)
-- [x] Implement the tool registry
+- [A] Implement the tool registry
 ```
+
+ตัวอักษรห้าแบบ คือห้ามือที่แตะ task นั้น และลำดับไม่ใช่เรื่องสุ่ม มันคือ pipeline:
+
+| Mark | ความหมาย | ใครเขียน |
+| --- | --- | --- |
+| `- [ ]` | สร้างแล้ว ยังไม่มีใครแตะ | JACKY (ตอนเขียน plan) |
+| `- [?]` | เขียนโค้ดแล้ว ยังไม่เคยถูก JOY ตรวจ | JOEY |
+| `- [F]` | JOY ตรวจแล้ว **ไม่ผ่าน** — findings อยู่ที่ `.context/progress.review` | jonnyq จาก verdict ของเธอ |
+| `- [+]` | แก้ตาม findings แล้ว รอถูกตรวจอีกครั้ง | JOEY |
+| `- [A]` | เขียนโค้ด ผ่านการตรวจ และ **APPROVED** โดย JOY | jonnyq จาก verdict ของเธอ |
+
+การแบ่งนี้คือหัวใจ: coder ติ๊กกล่องตัวเองได้ถึงแค่ `?`/`+` สองตัวอักษรสุดท้ายเป็นของผู้ตรวจเท่านั้น task จึงไม่มีทาง reaches `A` ด้วยการที่คนเขียนเคลมเอง ว่างานมันได้ผล และงานถูกทำทีละ task เคร่งครัด — JOY ตรวจจบทีละ task ก่อนที่ JOEY จะเริ่ม task ถัดไป checklist เก่าที่ mark ด้วย `[x]` ยังนับว่า approved เหมือนเดิม และเมื่อ `/verify off` ตัวที่จะไปได้ไกลสุดคือ `?`/`+` โดยผลลัพธ์ command ที่รันจริงคือตัวสรุปงาน
 
 ระหว่างเขียนโค้ด system prompt จะเข้าโหมด autonomous ซึ่งห้ามติ๊ก task ว่าเสร็จถ้ายังไม่ได้ตรวจงานของ task นั้นจริง ๆ ในรอบนั้น และการตรวจความคืบหน้าดูจากเนื้อหาจริงในไฟล์ ทำให้การอ้างสำเร็จแบบไม่แก้ไฟล์ถูกจับได้และจบด้วย error
 
@@ -389,9 +401,9 @@ jonnyq -model qwen3:14b -web 8080     # แล้วเปิด http://127.0.0.
 | **แถบบน** | `agent · model · ctx … · mode` ของ session — agent ที่ prompt กำลังถูกส่งไปให้จึงเปลี่ยนตาม `/jonny`-`/joey`, `/model`, `/context` และทุกครั้งที่ compact ค่าถูกอ่านซ้ำเป็นระยะ ไม่ freeze ตอน connect; เลขเวอร์ชันของ build ที่เสิร์ฟ page นี้ถัดจากคำว่า **jonnyq** พร้อม control เลือก font และขนาดตัวอักษรสองคู่ (ข้อความธรรมดา / code) ตามที่อธิบายด้านล่าง |
 | **แท็บ console** (กลาง) | สะท้อนทุกไบต์ที่ jonnyq พิมพ์ออก stdout แบบสด ๆ และ render สีแบบ gruvbox dark — ข้อความเดียวกับ สีเดียวกับ terminal |
 | **แท็บไฟล์** | เปิดได้หลายไฟล์ source ในแท็บถูก syntax highlight ด้วย palette gruvbox dark ชุดเดียวกับ console — คลิกแท็บเพื่อสลับดู console หรือไฟล์ไหนก็ได้ และหัวของทุกแท็บมีปุ่ม **Download** เพื่อบันทึกไฟล์นั้นลงเครื่อง |
-| **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — Enter ส่ง, Shift-Enter ขึ้นบรรทัดใหม่ ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
+| **ช่องพิมพ์ prompt** (ใต้ console) | พิมพ์ prompt หรือ `/command` — **Ctrl+Enter ส่ง** (Mac ใช้ Cmd+Enter) ส่วน Enter ธรรมดาขึ้นบรรทัดใหม่เท่านั้น กันไม่ให้เห็น prompt ครึ่ง ๆ ครึ่ง ๆ ตอนเผลอกด Enter กลางประโยค ปรับขนาดได้โดยลากแถบด้านบนหรือมุมของช่อง จะถูก disable เมื่อ session รับ prompt ไม่ได้ (ยังไม่มี model, มี turn กำลังรัน, หรือกำลัง exit) พร้อมแสดงสาเหตุไว้ข้าง ๆ |
 | **ปุ่ม Stop** (ข้างปุ่ม Send) | Ctrl-C ของเวบ: ยกเลิกรอบที่กำลังรัน และจะเปิดใช้เฉพาะตอนที่มีรอบให้หยุดเท่านั้น — เป็น token ตัวเดียวกับที่ Ctrl-C บน terminal กด จึงตัด stream ของ model, ฆ่า process group ของคำสั่งที่กำลังรัน, ถอนคำถาม `ask_user` ที่ค้างอยู่ และจบรอบด้วย `[cancelled]` โดย session ยังอยู่ต่อ popup มี Stop ของตัวเองด้วย เพราะกล่องคำถามบังช่องพิมพ์ prompt อยู่ |
-| **popup ของ `ask_user`** | เมื่อ model เรียก `ask_user` คำถามจะเด้งขึ้นมาทับหน้าเวบ พร้อมช่องพิมพ์คำตอบและปุ่ม **Send answer** — ดูด้านล่าง |
+| **popup ของ `ask_user`** | เมื่อ model เรียก `ask_user` คำถามจะเด้งขึ้นมาทับหน้าเวบ พร้อมช่องพิมพ์คำตอบและปุ่ม **Send answer (Ctrl+Enter)** — ใช้คีย์ชุดเดียวกับช่องพิมพ์ prompt และปรับขนาดได้เหมือนกัน — ดูด้านล่าง |
 | **tree** (ขวา) | รายการ working directory (folder ก่อนไฟล์) **ที่อัปเดตตัวเองได้** — ไฟล์ที่ถูกสร้าง/ลบ/เปลี่ยนชื่อ จะโผล่ใน panel เองโดยไม่ต้องคลิกอะไร และ folder ที่คุณขยายไว้ก็จะคงขยายอยู่เหมือนเดิม ขยาย folder เพื่อดูรายการข้างใน คลิกไฟล์ text เพื่อเปิดในแท็บใหม่ ส่วน PDF/image/binary จะขึ้น popup บอกว่าเปิดดูไม่ได้เพราะอะไร |
 
 **font และ size** แถบบนมี control สองคู่ เพราะหน้าเวบมีตัวอักษรสองชนิด `text` เลือก
@@ -502,8 +514,11 @@ turn จบแบบเดียวกันด้วยการพิมพ์
 จบแล้วจะบอกว่า *Nothing to stop* แทนที่จะแกล้งทำว่าหยุดอะไรสักอย่าง
 
 **ตอบ `ask_user` บนเวบ** คำถามที่ model ถามจะถูกแสดงเป็น popup ทับหน้าเวบ: ตัว
-คำถาม, ช่องพิมพ์คำตอบ และปุ่ม **Send answer** (Enter ส่ง, Shift-Enter ขึ้นบรรทัด
-ใหม่) terminal ก็พิมพ์คำถามเดียวกันไว้ด้วย จึงตอบที่ไหนก็ได้ — popup บนเวบ, keyboard
+คำถาม, ช่องพิมพ์คำตอบ และปุ่ม **Send answer (Ctrl+Enter)** — ช่องนี้ใช้คีย์ชุดเดียว
+กับช่องพิมพ์ prompt คือ **Ctrl+Enter ส่ง** ส่วน Enter ธรรมดาขึ้นบรรทัดใหม่เท่านั้น
+(กันคำตอบหลุดกลางประโยค) และปรับขนาดได้ด้วยแถบด้านบนหรือมุมของช่อง จึงพิมพ์คำตอบ
+ยาว ๆ ได้โดยไม่ต้องเดาข้อความที่เลื่อนหายไป terminal ก็พิมพ์คำถามเดียวกันไว้ด้วย
+จึงตอบที่ไหนก็ได้ — popup บนเวบ, keyboard
 หรือ ntfy เป็นสาม channel ที่แข่งกันตอบ และคำตอบที่มาก่อนชนะเสมอ เมื่อมีคำตอบแล้ว
 channel อื่นถูกรวบให้ทันที: popup จะปิดตัวเองพร้อมเขียนว่า *answered elsewhere*
 (จึงไม่มีกล่องหายไปเฉย ๆ โดยไม่มีเหตุผล) และคำตอบที่ส่งไปถึงคำถามที่ถูกตอบไปแล้วจะถูก
@@ -535,7 +550,7 @@ keyboard เท่านั้น (ของบนหน้าเวบมีไ
 
 ## การแจ้งเตือน (ntfy)
 
-ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจาก `.context/progress.md` โดยตรง (ไม่เรียก model เพิ่ม)
+ตั้ง topic URL เต็ม ๆ ด้วย `-ntfy-url` / `JONNYQ_NTFY_URL` / `/ntfy <url>` (ว่าง = ปิด) jonnyq จะ push ข้อความเมื่อ `/plan`, `/coding`, `/coding_phase` หรือ `/autocoding` จบ, เมื่อ **JOY ส่ง verdict** (หนึ่งครั้งต่องานที่ถูกตรวจ และหนึ่งครั้งต่อ task ที่ verify พร้อม findings ของเธอเป็น list แบบไล่เลข — คำว่าไม่ผ่านถูกส่งแบบ priority สูง ส่วน approved ส่งเป็นข้อความธรรมดา) และส่ง priority สูง + tag `warning` เมื่อ turn ล้มเหลวหรือ stall โดยเนื้อหา error มีบรรทัด `Reason:` บอกสาเหตุที่น่าจะเป็น สรุปงานคำนวณจาก `.context/progress.md` โดยตรง (ไม่เรียก model เพิ่ม)
 
 topic เดียวกันใช้เป็นขากลับได้ด้วย: `ask_user` จะ push คำถามออกไปแล้ว subscribe รอคำตอบ จึงตอบจากมือถือได้ (`answer: <ข้อความ>` หรือ quick reply) — ใครตอบก่อนได้ก่อน ไม่ว่าจะเป็น keyboard, popup บนเวบ (`-web`) หรือมือถือ และ channel ที่ตอบแพ้จะถูกปิดให้ (popup ปิด, prompt ที่ terminal ไม่ค้างอยู่)
 

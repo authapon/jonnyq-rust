@@ -346,6 +346,12 @@ pub struct Team {
     /// How many fix/re-review cycles one command may run
     /// (`/review_rounds`, `JONNYQ_REVIEW_ROUNDS`).
     review_rounds: std::sync::atomic::AtomicI64,
+    /// The ntfy topic JOY's verdicts are posted to (`/ntfy`,
+    /// `JONNYQ_NTFY_URL`). Kept here rather than read from the config per
+    /// review because the roster outlives `/ntfy` changes and `/ntfy off` must
+    /// silence the alerts immediately; it is the same URL the coding commands
+    /// build their own notifier from.
+    ntfy_url: std::sync::Mutex<String>,
 }
 
 impl Clone for Team {
@@ -357,6 +363,7 @@ impl Clone for Team {
             joy: self.joy.clone(),
             verify: std::sync::atomic::AtomicBool::new(self.verify()),
             review_rounds: std::sync::atomic::AtomicI64::new(self.review_rounds()),
+            ntfy_url: std::sync::Mutex::new(self.ntfy_url()),
         }
     }
 }
@@ -397,6 +404,7 @@ impl Team {
             joy: Arc::new(make(AgentName::Joy)),
             verify: std::sync::atomic::AtomicBool::new(cfg.verify),
             review_rounds: std::sync::atomic::AtomicI64::new(cfg.review_rounds.max(0)),
+            ntfy_url: std::sync::Mutex::new(cfg.ntfy_url.clone()),
         }
     }
 
@@ -419,6 +427,24 @@ impl Team {
             .store(n.max(0), std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The ntfy topic JOY notifies on ("" when notifications are off).
+    pub fn ntfy_url(&self) -> String {
+        self.ntfy_url.lock().unwrap().clone()
+    }
+
+    /// Points the review lane at a topic (`/ntfy`), so `/ntfy off` silences
+    /// JOY's verdict alerts with the same keystroke that silences the coding
+    /// commands' completion notifications.
+    pub fn set_ntfy_url(&self, url: &str) {
+        *self.ntfy_url.lock().unwrap() = url.to_string();
+    }
+
+    /// A notifier for the roster's own notifications. Disabled (a no-op) when no
+    /// topic is set, which is why every call site can call it unconditionally.
+    pub fn notifier(&self) -> crate::notify::Notifier {
+        crate::notify::Notifier::new(&self.ntfy_url())
+    }
+
     /// A note from the roster itself (a hand-off, an unresolved review), in the
     /// plain style the UI uses for its own announcements.
     pub(crate) fn ui_note(&self, text: &str) {
@@ -438,6 +464,7 @@ impl Team {
             joy: agent,
             verify: std::sync::atomic::AtomicBool::new(false),
             review_rounds: std::sync::atomic::AtomicI64::new(0),
+            ntfy_url: std::sync::Mutex::new(String::new()),
         }
     }
 

@@ -54,6 +54,9 @@ function node(name, cls, id) {
     },
     children: [],
     listeners: {},
+    /* A textarea's caret, as the page reads it when it inserts a newline. The
+       fake has no real selection, so a test sets these by hand. */
+    selectionStart: 0, selectionEnd: 0,
     clientWidth: 800, clientHeight: 480,
     offsetWidth: 800, offsetHeight: 480,
     scrollWidth: 640, scrollHeight: 128,     /* 80x8 by 8x16: a cell is 8x16 */
@@ -146,13 +149,33 @@ globalThis.document = {
 };
 globalThis.location = { protocol: "http:", host: "localhost:0" };
 globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
-globalThis.getComputedStyle = () => ({ paddingLeft: "0px", paddingRight: "0px", paddingTop: "0px", paddingBottom: "0px" });
+/* The geometry a resize drag reads: a 20px line box, so "a couple of lines" is
+   an exact 44px in a test rather than whatever the machine's font says. The
+   pane's own padding is zero for the same reason — a fit test wants the numbers
+   it asserts on to be the ones it chose. */
+globalThis.getComputedStyle = () => ({
+  paddingLeft: "0px", paddingRight: "0px", paddingTop: "0px", paddingBottom: "0px",
+  lineHeight: "20px",
+});
 globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
 globalThis.addEventListener = () => {};
 globalThis.getSelection = () => ({ toString: () => selection });
 globalThis.window = globalThis;
 globalThis.window.getSelection = globalThis.getSelection;
-globalThis.window.addEventListener = () => {};
+/* The window's own listeners are kept rather than dropped, because dragging a
+   textarea's resize bar lives on them: the bar gets the `mousedown` and the
+   window gets the `mousemove`s that follow (a real drag leaves the bar, and a
+   bar that stopped listening mid-drag would leave the box stuck at half a
+   resize). A test dispatches to them through `windowMove`/`windowUp` below. */
+const windowEvents = {};
+globalThis.window.addEventListener = (type, fn) => {
+  (windowEvents[type] = windowEvents[type] || []).push(fn);
+};
+const windowFire = (type, ev) => { for (const fn of windowEvents[type] || []) fn(ev); };
+/* Viewport and line box, faked to round numbers like the pane's geometry, so a
+   resize test can assert on an exact pixel height. */
+globalThis.window.innerWidth = 1000;
+globalThis.window.innerHeight = 800;
 globalThis.window.clipboardData = null;
 /* No ResizeObserver: the page then falls back to its own poll, which a test can
    call directly instead of waiting on one. */
@@ -808,5 +831,216 @@ function filePanel() {
   eq(seen.clicks.length, 0, "and there is nothing left to download");
 }
 
-console.log(pass + " passed, " + fail + " failed");
-process.exit(fail ? 1 : 0);
+/* ---- 5. the prompt box's Enter key ---------------------------------------
+   A bare Enter belongs to the textarea: the box is multi-line on purpose (a
+   Thai paragraph, a pasted trace, a multi-line /command), and a prompt sent
+   half-finished is worse than one not sent. Ctrl-Enter - and its Mac twin -
+   is what hands the text to jonnyq. Driven through the page's own shipped
+   handler, so what is checked is what the browser runs. */
+{
+  const panel = consoleTab.el;
+  const ta = panel.querySelector("#prompt");
+  const send = panel.querySelector("#send");
+  const promptKeys = (ev) => {
+    for (const fn of ta.listeners.keydown) fn(ev);
+  };
+  const frames = () => live().sent.map((s) => JSON.parse(s));
+  const prompts = () => frames().filter((m) => m.type === "prompt").map((m) => m.text);
+
+  setReady(true, "", false);
+  ok(ready, "the session takes a prompt in this fixture");
+
+  /* A bare Enter is a newline, in place, with the caret moved after it - and
+     nothing whatsoever goes out on the socket. */
+  live().sent.length = 0;
+  ta.value = "first line";
+  ta.selectionStart = ta.selectionEnd = 10;
+  promptKeys(key("Enter"));
+  eq(ta.value, "first line\n", "Enter inserted a newline instead of sending");
+  eq(ta.selectionStart, 11, "and put the caret after it");
+  eq(prompts().length, 0, "and sent nothing");
+
+  /* Shift-Enter, the explicit newline chord, inserts at the caret wherever it
+     sits — mid-text here, where a real selection would have been replaced. */
+  ta.value = "one\nthree";
+  ta.selectionStart = ta.selectionEnd = 4;
+  promptKeys(key("Enter", { shiftKey: true }));
+  eq(ta.value, "one\n\nthree", "Shift-Enter inserted a newline mid-text");
+
+  /* Ctrl-Enter sends what is in the box, once, and clears it. */
+  live().sent.length = 0;
+  ta.value = "fix the parser\nand run the tests";
+  ta.selectionStart = ta.selectionEnd = 28;
+  promptKeys(key("Enter", { ctrlKey: true }));
+  eq(prompts().length, 1, "Ctrl-Enter sent one prompt");
+  eq(prompts()[0], "fix the parser\nand run the tests", "the whole multi-line text");
+  eq(ta.value, "", "and the box is empty afterwards, so a second press cannot double-send");
+
+  /* Cmd-Enter on a Mac keyboard, and the Send button, are the same act. */
+  live().sent.length = 0;
+  ta.value = "via cmd";
+  promptKeys(key("Enter", { metaKey: true }));
+  eq(prompts()[0], "via cmd", "Cmd-Enter sends too");
+  live().sent.length = 0;
+  ta.value = "via button";
+  send.click();
+  eq(prompts()[0], "via button", "and the button sends");
+
+  /* The IME case, and the reason the guard is not decoration: with a Thai input
+     method, Enter commits a composition, and the text being composed is not in
+     `ta.value` yet — so an Enter taken here would send the prompt without its
+     last word. Every Enter is left to the IME while a composition is open. */
+  live().sent.length = 0;
+  ta.value = "สวัสดี";
+  ta.selectionStart = ta.selectionEnd = 8;
+  promptKeys(key("Enter", { isComposing: true }));
+  eq(prompts().length, 0, "a composing Enter sends nothing");
+  eq(ta.value, "สวัสดี", "nor does it touch the composed text");
+  promptKeys(key("Enter", { ctrlKey: true, isComposing: true }));
+  eq(prompts().length, 0, "not even Ctrl-Enter: the word being composed is not in the box yet");
+
+  /* A box with nothing in it is not a prompt: the page should not ask. */
+  live().sent.length = 0;
+  ta.value = "   \n  ";
+  promptKeys(key("Enter", { ctrlKey: true }));
+  eq(prompts().length, 0, "blank text is not sent");
+  ok(ta.value.length > 0, "and stays in the box");
+
+  /* A browser that can do the insertion itself gets asked to: a textarea whose
+     value was reassigned has lost its undo history, and Enter is now the normal
+     way to break a line, so Ctrl-Z has to keep working. */
+  const realExec = document.execCommand;
+  let execAsked = [];
+  document.execCommand = (cmd, ui, val) => { execAsked.push(cmd + ":" + val); ta.value += "\n"; return true; };
+  ta.value = "undo me"; ta.selectionStart = ta.selectionEnd = 7;
+  promptKeys(key("Enter"));
+  eq(execAsked.join(","), "insertText:\n", "the browser is asked to insert the newline itself");
+  document.execCommand = realExec;
+
+  /* The two places a person reads the rule from have to match the key that works. */
+  ok(consoleTab.el.innerHTML.includes("Send (Ctrl+Enter)"),
+     "the Send button names the chord");
+  setReady(true, "", false);
+  ok(ta.placeholder.includes("Ctrl+Enter sends"),
+     "the placeholder says Ctrl+Enter sends, got " + ta.placeholder);
+  ok(!/(^|[^+])Enter sends/.test(ta.placeholder),
+     "and never promises that a bare Enter sends: " + ta.placeholder);
+}
+
+/* ---- 6. the ask popup's keys and its answer field ------------------------
+   The popup that holds a question jonnyq is blocked on is the box a human
+   writes an answer in — so it gets the prompt box's rule (Ctrl-Enter sends, a
+   bare Enter breaks the line, an IME composition is never cut off) and its
+   resizability, through the very same code the prompt box runs.
+
+   Async, because sending an answer goes through the page's `rpc` promise and is
+   not "in flight" until the ack lands: each send is followed by the ack and the
+   `ask_close` the server would send with it, which is what frees the field for
+   the next answer. The run's summary waits for this block. */
+const askBlock = async () => {
+  const ta = $("ask-answer");
+  const askKeys = (ev) => { for (const fn of ta.listeners.keydown) fn(ev); };
+  const frames = () => live().sent.map((s) => JSON.parse(s));
+  const answers = () => frames().filter((m) => m.type === "answer");
+  /* What the server does with an accepted answer: ack the request, then take
+     the question back. The `await` is the point — the page's own `.then` runs as
+     a microtask, so without it the field would still be holding `askBusy` and
+     every later send in this block would be refused as a double send. */
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+  const answered = async () => {
+    const last = frames().pop();
+    if (last && last.id) onMessage({ data: JSON.stringify({ id: last.id, ok: true }) });
+    await settle();
+    onAskClose({ id: last.ask });
+  };
+  const ask = async (id, question) => {
+    live().sent.length = 0;
+    onAskMessage({ id, question });
+    await settle();
+  };
+
+  setReady(true, "", true);
+  await ask("q1", "Which parser?");
+  ok($("ask-mask").classList.contains("show"), "the question is on screen");
+
+  /* A bare Enter, Shift-Enter and a composing Enter do what they do in the
+     prompt box: a multi-sentence answer is written with Enter, and the answer
+     field is where a Thai composition is most likely to be open when the box is
+     the thing a session is waiting on. */
+  ta.value = "the recursive one";
+  ta.selectionStart = ta.selectionEnd = 17;
+  askKeys(key("Enter"));
+  eq(ta.value, "the recursive one\n", "Enter broke a line instead of sending");
+  eq(answers().length, 0, "and sent no answer");
+  askKeys(key("Enter", { shiftKey: true }));
+  eq(ta.value, "the recursive one\n\n", "Shift-Enter broke another");
+  askKeys(key("Enter", { isComposing: true }));
+  eq(answers().length, 0, "a composing Enter sends nothing");
+  askKeys(key("Enter", { ctrlKey: true, isComposing: true }));
+  eq(answers().length, 0, "nor Ctrl-Enter while a Thai word is still being composed");
+
+  /* Ctrl-Enter sends the whole multi-line answer, addressed to its question. */
+  ta.value = "the recursive one\nit handles the nesting";
+  askKeys(key("Enter", { ctrlKey: true }));
+  eq(answers().length, 1, "Ctrl-Enter sent one answer");
+  eq(answers()[0].text, "the recursive one\nit handles the nesting", "the whole text");
+  eq(answers()[0].ask, "q1", "addressed to the question on screen");
+  await answered();
+  eq($("ask-note").textContent, "sent", "and the note says so");
+
+  /* Cmd-Enter and the Send button are the same act, as they are below the
+     console. */
+  await ask("q2", "And tests?");
+  live().sent.length = 0;
+  ta.value = "via cmd";
+  askKeys(key("Enter", { metaKey: true }));
+  eq(answers()[0].text, "via cmd", "Cmd-Enter sends too");
+  await answered();
+  await ask("q3", "Anything else?");
+  live().sent.length = 0;
+  ta.value = "via button";
+  $("ask-send").click();
+  eq(answers()[0].text, "via button", "and the button sends");
+  await answered();
+  ok(!$("ask-mask").classList.contains("show"),
+     "the popup goes when the question is answered");
+
+  /* A person who has read the rule below the console must not be told a
+     different one up here: a placeholder promising a bare Enter would send half
+     an answer, which is the exact failure the chord exists to stop. */
+  ok(ta.placeholder.includes("Ctrl+Enter sends"),
+     "the placeholder says Ctrl+Enter sends, got " + ta.placeholder);
+  ok(!/(^|[^+])Enter sends/.test(ta.placeholder),
+     "and never promises that a bare Enter sends: " + ta.placeholder);
+
+  /* And the field drags to the size the answer needs by the bar over it — the
+     same drag as the prompt box's, through the same function — so a long answer
+     is not written into four visible lines. */
+  const bar = $("ask-resizer");
+  ta.offsetHeight = 72;
+  for (const fn of bar.listeners.mousedown || []) fn({ clientY: 300, preventDefault() {} });
+  /* The bar sits *above* the field, like the prompt box's, so the gesture that
+     makes the box bigger is a drag upwards. */
+  windowFire("mousemove", { clientY: 260 });
+  eq(ta.style.height, "112px", "dragging the bar up grows the field by the same amount");
+  windowFire("mousemove", { clientY: 5000 });
+  eq(ta.style.height, "44px", "clamped at a couple of lines, never to nothing");
+  windowFire("mousemove", { clientY: -500 });
+  eq(ta.style.height, "320px",
+     "and capped at 40% of the 800px viewport, so a stretched field cannot push\n" +
+     "the question or the Send button off the screen of a popup that cannot be hidden");
+  windowFire("mouseup", {});
+  windowFire("mousemove", { clientY: 400 });
+  eq(ta.style.height, "320px", "and letting go ends the drag");
+  ok(typeof makeResizable === "function",
+     "both boxes are sized by the one shared function");
+};
+
+askBlock().then(
+  () => { console.log(pass + " passed, " + fail + " failed"); process.exit(fail ? 1 : 0); },
+  (e) => {
+    console.log("FAIL the ask popup block threw\n  " + (e && e.stack ? e.stack : e));
+    console.log(pass + " passed, " + (fail + 1) + " failed");
+    process.exit(1);
+  }
+);
