@@ -362,6 +362,47 @@ fn activating_an_agent_labels_the_ui_and_its_banner() {
     assert!(text.contains("testing & verification"), "{text}");
 }
 
+/// A banner is the claim that *this* agent is the one working, so a hand-off
+/// prints it once per turn: not twice for an agent already on screen, and not
+/// at all for a lane that was claimed quietly and has not worked yet. This is
+/// what keeps `/autocoding` honest — the coder owns the session, the plan runs
+/// first, and his name must not lead.
+#[test]
+fn a_hand_off_announces_only_a_lane_that_is_not_already_shown() {
+    let log = TestLog::new("team-hand-off");
+    let t = team(&log, Vec::new());
+
+    // The plain case: the lane changes, so the new name goes up.
+    t.hand_over(AgentName::Jacky, "/plan");
+    assert!(
+        log.contents().contains("=== agent jacky |"),
+        "{}",
+        log.contents()
+    );
+    // Asked again with nobody in between: the screen already says jacky, and a
+    // second banner would read as a hand-off that never happened.
+    t.hand_over(AgentName::Jacky, "/plan");
+    assert_eq!(
+        log.contents().matches("=== agent jacky |").count(),
+        1,
+        "{}",
+        log.contents()
+    );
+
+    // A claimed lane is on screen but NOT announced: the next lane to work must
+    // still get its own banner, and the claimer gets his when his work starts.
+    let cut = log.contents().len();
+    t.claim(AgentName::Joey);
+    assert_eq!(log.contents().len(), cut, "a claim prints nothing");
+    assert_eq!(t.active_name(), AgentName::Joey);
+    t.hand_over(AgentName::Joey, "/autocoding");
+    assert!(
+        log.contents()[cut..].contains("=== agent joey |"),
+        "{}",
+        log.contents()
+    );
+}
+
 #[tokio::test]
 async fn headers_carry_the_active_agent_name() {
     let log = TestLog::new("team-header");

@@ -889,15 +889,22 @@ so it doesn't fire again.",
     /// ntfy target are the current config's), built fresh per command exactly
     /// like Go's `coding.Plan(ctx, ..., notify.New(cfg.NtfyURL))`.
     ///
-    /// Activating first is what puts the banner on screen and labels the
-    /// headers, and it is why `/coding` no longer spends the planning agent's
-    /// context: jacky's history stays jacky's.
-    async fn coding_for(&self, name: AgentName, note: &str) -> Coding<'static> {
+    /// `announce` is whether the agent's banner goes up now. It normally does:
+    /// putting the name on screen first is what labels the headers, and it is
+    /// why `/coding` no longer spends the planning agent's context - jacky's
+    /// history stays jacky's. A command whose work starts on another lane must
+    /// pass `false` and let the lane that works print its own name (see
+    /// [`Team::claim`] and [`Team::hand_over`]).
+    async fn coding_for(&self, name: AgentName, note: &str, announce: bool) -> Coding<'static> {
         let ntfy_url = self.cfg.lock().await.ntfy_url.clone();
         // Announce first, then hand the whole roster over: the coding commands
         // need the reviewer as well as the coder, and `Team::active` is the
         // agent that was just announced.
-        self.team.start(name, note);
+        if announce {
+            self.team.start(name, note);
+        } else {
+            self.team.claim(name);
+        }
         Coding::new(
             self.team.clone(),
             self.ui.clone(),
@@ -908,7 +915,16 @@ so it doesn't fire again.",
 
     /// The command `/plan` and friends run under: their owning agent, announced.
     async fn coding(&self, name: AgentName, note: &str) -> Coding<'static> {
-        self.coding_for(name, note).await
+        self.coding_for(name, note, true).await
+    }
+
+    /// The same handle with the owning agent NOT yet announced: he owns the
+    /// session from here on, but the first `=== agent` line belongs to whoever
+    /// actually works first. `/autocoding` is that command - it opens with
+    /// JACKY's plan and JOY's verdict, and naming the coder over them would
+    /// show an agent that has done nothing.
+    async fn coding_unannounced(&self, name: AgentName) -> Coding<'static> {
+        self.coding_for(name, "", false).await
     }
 
     /// Runs the coding command `cmd` on its owning agent and then has joy
@@ -923,7 +939,9 @@ so it doesn't fire again.",
     /// `/autocoding` is the exception: it runs the review loop *inside* the run
     /// (the plan gated before any task, then every task gated before the next),
     /// so there is no work left for a command-level review to find and a second
-    /// one would only re-read code joy already approved.
+    /// one would only re-read code joy already approved. It is also the reason
+    /// the run is not announced up front: the first name on screen must be
+    /// JACKY's, because the plan is the first thing that happens.
     async fn verified(
         &self,
         name: AgentName,
@@ -932,7 +950,11 @@ so it doesn't fire again.",
         arg: &str,
     ) -> R<()> {
         let what = format!("{cmd} on {}", crate::team::progress_file());
-        let coding = self.coding(name, cmd).await;
+        let coding = if cmd == "/autocoding" {
+            self.coding_unannounced(name).await
+        } else {
+            self.coding(name, cmd).await
+        };
         if cmd == "/autocoding" {
             return coding.auto_run(cancel).await;
         }
@@ -1583,12 +1605,14 @@ mod tests {
         }
     }
 
-    /// `/plan` is jacky's and `/coding` is joey's: the command names the
-    /// agent, and the banner says so before the turn runs.
+    /// `/plan` is jacky's and `/coding` is joey's: the command names the agent,
+    /// and the banner says so before the turn runs.
     ///
-    /// `/autocoding` is owned by joey but runs the whole pipeline, so it may
-    /// legitimately end on another lane (the plan is jacky's, a verdict is
-    /// joy's) — hence the weaker "who did it start with, and who is left" split.
+    /// `/autocoding` is the odd one: it is joey's command, but the run opens
+    /// with the plan, so it names nobody until a lane actually works — here
+    /// there is no requirements.md, so nothing works and no name may go up.
+    /// The run that does plan is covered by
+    /// [`autocoding_shows_no_coder_banner_before_his_turn`].
     #[tokio::test]
     async fn the_coding_commands_name_the_agent_that_owns_them() {
         for (cmd, who) in [
@@ -1596,39 +1620,71 @@ mod tests {
             ("/plan_for_human", "jacky"),
             ("/coding", "joey"),
             ("/coding_phase", "joey"),
-            ("/autocoding", "joey"),
+            // No work is possible in this fixture, so no banner is owed one.
+            ("/autocoding", ""),
         ] {
             let t = new_test_team().await;
             let (exit, res) = t.repl.handle_slash(CancellationToken::new(), cmd).await;
             assert!(!exit);
             // The command may fail for want of a requirements.md - the point
-            // here is who it handed the turn to, which happened first.
+            // here is whose name it put on screen, and in what order.
             let _ = res;
             let text = t.log_contents();
-            assert!(
-                text.contains(&format!("=== agent {who} |")),
-                "{cmd} did not announce {who}: {text}"
-            );
-            if cmd == "/autocoding" {
-                // The run visited the planner (its first step is the plan) and
-                // left the session on one of the lanes the pipeline works on.
-                let left = t.repl.team.active_name().key();
+            let banners: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("=== agent "))
+                .collect();
+            if who.is_empty() {
                 assert!(
-                    text.contains("=== agent jacky |"),
-                    "{cmd} did not hand the plan to jacky: {text}"
-                );
-                assert!(
-                    ["joey", "jacky", "joy"].contains(&left),
-                    "{cmd} left the session on an unexpected lane: {left}"
+                    banners.is_empty(),
+                    "{cmd} announced an agent that did no work: {text}"
                 );
                 continue;
             }
+            let first = banners
+                .first()
+                .unwrap_or_else(|| panic!("{cmd} announced no agent: {text}"));
+            assert!(
+                first.contains(&format!("=== agent {who} |")),
+                "{cmd} opened on the wrong lane (expected {who} first): {first}"
+            );
+            assert_eq!(
+                text.matches(&format!("=== agent {who} |")).count(),
+                1,
+                "{cmd} printed {who}'s banner more than once: {text}"
+            );
             assert_eq!(
                 t.repl.team.active_name().key(),
                 who,
                 "{cmd} left a different agent active"
             );
         }
+    }
+
+    /// The pipeline itself, in order: `/autocoding` with something to plan
+    /// shows JACKY first (the plan is the first work) and never shows JOEY
+    /// before his own turn starts.
+    #[tokio::test]
+    async fn autocoding_shows_no_coder_banner_before_his_turn() {
+        let t = new_test_team().await;
+        let dir = t.repl.run_command.work_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{dir}/requirements.md"), "build a thing").unwrap();
+        let (_exit, res) = t
+            .repl
+            .handle_slash(CancellationToken::new(), "/autocoding")
+            .await;
+        let _ = res;
+        let text = t.log_contents();
+        let first = text
+            .lines()
+            .find(|l| l.starts_with("=== agent "))
+            .unwrap_or_else(|| panic!("no banner was printed: {text}"));
+        assert!(first.contains("agent jacky |"), "first banner: {first}");
+        assert!(
+            !text.contains("=== agent joey |"),
+            "joey was named before his turn: {text}"
+        );
     }
 
     /// A plain prompt goes to whoever was last activated, and `/joy` switches

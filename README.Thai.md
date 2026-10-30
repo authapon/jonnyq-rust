@@ -6,7 +6,7 @@
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.2.2
+jonnyq v1.2.3
 qwen3:14b (32768 token) > ช่วยแก้บั๊กตอนอ่านไฟล์ไม่เจอใน main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **ตัวกันเกินขอบเขต** — ผล tool ถูก cap ก่อนเข้า history (default 64,000 ตัวอักษร เก็บ head 70% + tail 30%), จำกัด tool call ต่อ turn (default 50), มีตัวตรวจการพิมพ์วนซ้ำเพื่อยกเลิกรอบที่ติด loop และ workflow การเขียนโค้ดจะหยุดเมื่อ task เดิมค้างครบ 5 รอบ หรือ 15 รอบติดที่ไม่มี task ไหนถูกติ๊ก
 
-**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.2.2`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
+**การแสดงผล** — ทุก section มี timestamp, สถานะ context และสถิติของ request กำกับ และถูก mirror ลง transcript log แบบข้อความล้วน (default `.context/transcript.md`) และทุกบรรทัดระบุด้วยว่า agent ไหนเป็นคนพิมพ์ (`[joey] Thinking …`) REPL จะพิมพ์เวอร์ชันของโปรแกรม (`jonnyq v1.2.3`) เหนือ prompt บรรทัดแรก ทำให้ transcript หรือภาพหน้าจอแต่ละชิ้นระบุได้ว่ามาจาก build ไหน
 
 ## เวอร์ชัน
 
-jonnyq อยู่ที่ **v1.2.2** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
+jonnyq อยู่ที่ **v1.2.3** เลขเวอร์ชันถูกเก็บไว้ที่เดียวคือ field `version` ใน `Cargo.toml` และทุกที่ที่รายงานเวอร์ชันจะอ่านค่านี้ตอน compile จึงไม่มีการที่เลขเวอร์ชันบนจอไม่ตรงกับ binary ที่รันอยู่ ตำแหน่งที่แสดง:
 
 | ที่ไหน | สิ่งที่เห็น |
 |---|---|
-| terminal, ตอนเปิด session | `jonnyq v1.2.2` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
+| terminal, ตอนเปิด session | `jonnyq v1.2.3` เหนือ prompt บรรทัดแรก และอยู่ใน transcript log ด้วย |
 | `jonnyq -h` / `-help` | เวอร์ชันเป็นบรรทัดแรกของ usage (พิมพ์ออกมาหลัง error ของ flag ผิดด้วย) |
 | `/version` | บรรทัดเดียวกัน เรียกใช้กลาง session ได้ตลอด |
 | `/help`, `/?` | เวอร์ชันอยู่เหนือรายการ slash command |
-| web console | ใน title ของ tab (`jonnyq console v1.2.2`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
-| `GET /health` | `"version": "1.2.2"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
+| web console | ใน title ของ tab (`jonnyq console v1.2.3`) และบนแถบด้านบนถัดจากคำว่า **jonnyq**; terminal emulator ใน terminal tab ก็ตอบ query XTVERSION ด้วยเลขเวอร์ชันนี้ |
+| `GET /health` | `"version": "1.2.3"` ใน JSON ให้ script ระบุ session ที่กำลังรันอยู่ได้ |
 
 `-h` ยัง exit ด้วย code 1 เหมือนโปรแกรมที่ใช้ Go `flag` เพราะถือเป็นการขอ usage ไม่ใช่คำสั่งปกติ และไม่มี flag `-version` — ใช้ `-h`, `/version` หรือ `curl 127.0.0.1:<port>/health` ของ session ที่เปิด `-web` แทน
 
@@ -369,6 +369,8 @@ brief การตรวจงานของ JOY ต่างกันตาม
 4. **รายงานเดียว** ตอนจบ — สรุปงานทั้ง run push ไป ntfy ไม่ว่าจะจบครบหรือหยุดก่อน
 
 เปิด `/verify off` แล้วข้อ 2 และการตรวจต่อ task ถูกข้าม เหลือแค่ plan-then-code แบบเดิม ส่วน `/plan` กับ `/coding` ไม่เปลี่ยน: ทำ lane ของตัวเองแล้วส่งงานให้ JOY เมื่อ `/verify on`
+
+บรรทัด `=== agent …` บนจอเรียงตามลำดับนี้ ไม่ใช่ตามเจ้าของคำสั่ง: run จะพิมพ์ชื่อ JACKY ตอน turn วางแผนเริ่มทำงาน พิมพ์ชื่อ JOY ตอนเธอตรวจ plan และพิมพ์ชื่อ JOEY เฉพาะตอน turn เขียนโค้ด turn แรกของเขาเริ่ม — แม้ `/autocoding` จะเป็นคำสั่งของ JOEY ก็ตาม lane ที่ยังไม่ได้ทำงานจะไม่ถูกเรียกชื่อก่อน และชื่อหนึ่งจะปรากฏเพียงครั้งเดียวต่อ turn
 
 `/watchfile` คือ pair programming โดยไม่ต้องออกจาก editor — เริ่มด้วย `/watchfile` แล้วพิมพ์ magic word ลงในโค้ด:
 

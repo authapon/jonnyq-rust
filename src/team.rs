@@ -360,6 +360,13 @@ pub struct Team {
     /// review, and off at every other moment, so a command that no review is
     /// waiting on never holds its news for a reviewer who is not coming.
     defer: std::sync::atomic::AtomicBool,
+    /// Which agent last had its banner printed, as the address of its
+    /// [`Agent`]; `0` when the lane on screen was claimed without a banner
+    /// (see [`Team::claim`]) or nothing has been announced yet. This is what
+    /// [`Team::hand_over`] asks before printing a name: the banner is the claim
+    /// that *this* agent is the one working, so it must not be printed twice
+    /// for one turn, nor for an agent that has not started.
+    shown: std::sync::atomic::AtomicUsize,
 }
 
 impl Clone for Team {
@@ -374,6 +381,9 @@ impl Clone for Team {
             ntfy_url: std::sync::Mutex::new(self.ntfy_url()),
             notice: self.notice.clone(),
             defer: std::sync::atomic::AtomicBool::new(self.defer_notices()),
+            shown: std::sync::atomic::AtomicUsize::new(
+                self.shown.load(std::sync::atomic::Ordering::SeqCst),
+            ),
         }
     }
 }
@@ -417,6 +427,7 @@ impl Team {
             ntfy_url: std::sync::Mutex::new(cfg.ntfy_url.clone()),
             notice: crate::coding::NoticeSlot::default(),
             defer: std::sync::atomic::AtomicBool::new(false),
+            shown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -479,6 +490,7 @@ impl Team {
             ntfy_url: std::sync::Mutex::new(String::new()),
             notice: crate::coding::NoticeSlot::default(),
             defer: std::sync::atomic::AtomicBool::new(false),
+            shown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -552,6 +564,59 @@ impl Team {
     pub fn start(&self, name: AgentName, note: &str) -> Arc<Agent> {
         let agent = self.activate(name);
         agent.announce(note);
+        self.set_shown(&agent);
+        agent
+    }
+
+    /// Whether `name`'s banner is the one already on screen.
+    fn is_shown(&self, agent: &Arc<Agent>) -> bool {
+        self.shown.load(std::sync::atomic::Ordering::SeqCst) == Arc::as_ptr(agent) as usize
+    }
+
+    fn set_shown(&self, agent: &Arc<Agent>) {
+        self.shown.store(
+            Arc::as_ptr(agent) as usize,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// [`Team::start`] for a **hand-off**: announces `name` only when his
+    /// banner is not already the one on screen, and otherwise stays silent and
+    /// returns the agent the screen already shows.
+    ///
+    /// The point is the banner's truth. A command announces its owning agent
+    /// before it runs, so when that same agent's turn then begins a second
+    /// banner would claim a hand-off that never happened; and a run whose work
+    /// starts on a *different* lane (`/autocoding` opens with JACKY's plan) must
+    /// not name an agent that has done nothing yet. Asking at the moment work
+    /// starts - rather than up front - is what keeps the order of the names on
+    /// screen the order the work really happens in.
+    ///
+    /// Agents are compared by conversation, not by name: a one-agent roster
+    /// ([`Team::solo`]) has one agent in all four slots, and nothing is handed
+    /// over inside it.
+    pub fn hand_over(&self, name: AgentName, note: &str) -> Arc<Agent> {
+        let agent = self.get(name);
+        if self.is_shown(&agent) {
+            return agent;
+        }
+        self.start(name, note)
+    }
+
+    /// Puts `name` on screen as the agent this session belongs to **without**
+    /// printing its banner: the name stays unannounced until that lane's own
+    /// work begins ([`Team::hand_over`]).
+    ///
+    /// `/autocoding` is why this exists - it is JOEY's command but opens with
+    /// JACKY's plan and JOY's verdict, so printing the coder first would show an
+    /// agent that has done nothing, which is the misordering this replaces.
+    /// Everything else about the session still moves to him: `/team`, the web
+    /// status bar, and the agent a plain prompt goes to.
+    pub fn claim(&self, name: AgentName) -> Arc<Agent> {
+        let agent = self.activate(name);
+        // No banner went up, so no name may be treated as already shown: the
+        // first lane that works must still get its own.
+        self.shown.store(0, std::sync::atomic::Ordering::SeqCst);
         agent
     }
 

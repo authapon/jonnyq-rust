@@ -409,6 +409,12 @@ impl<'a> Coding<'a> {
                     let findings = load_task_reviews(&files.review)
                         .findings_for(&task.text)
                         .map(|s| s.to_string());
+                    // The coder's name goes up when his turn actually starts:
+                    // `/autocoding` reached here from the plan gate, with JOY
+                    // on screen, and a run that never printed JOEY would leave
+                    // the person reading a coder's work under someone else's
+                    // name. Silent when his own banner already went up (`/coding`).
+                    self.team.hand_over(AgentName::Joey, what);
                     self.ui
                         .plainln(&format!("[{label}] working on: {}", task.text));
                     // A clean slate per task: the model re-discovers what it

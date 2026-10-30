@@ -6,7 +6,7 @@ Language: **English** · [ไทย](README.Thai.md)
 
 ```
 ~/dev/my-project$ jonnyq -model qwen3:14b
-jonnyq v1.2.2
+jonnyq v1.2.3
 qwen3:14b (32768 token) > fix the file-not-found bug in main.rs
 Thinking (2026-10-24 10:23:41) | ctx ~1,910/32,768 (~5%) left ~30,858 | +0.4s | last req 1,120 in/380 out, 22.4 tok/s, 17.0s
 ...
@@ -71,20 +71,20 @@ Answer (2026-10-24 10:23:52) | ctx ~3,020/32,768 (~9%) left ~29,748 | +11.2s | l
 
 **Guard rails.** Tool results are capped before entering history (default 64,000 chars, head 70% + tail 30%), tool calls per turn are limited (default 50), a repeated-output detector aborts loops, and the coding workflow stops after 5 stalled rounds on the same task or 15 rounds with no progress at all.
 
-**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.2`) above the first prompt, so a transcript and a screenshot carry the build they came from.
+**Output.** Every section is printed with a timestamp, context usage and per-request timing, and mirrored to a plain-text transcript log (`.context/transcript.md` by default). Each line is labelled with the agent that produced it (`[joey] Thinking …`). The REPL prints its version (`jonnyq v1.2.3`) above the first prompt, so a transcript and a screenshot carry the build they came from.
 
 ## Version
 
-jonnyq is at **v1.2.2**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
+jonnyq is at **v1.2.3**. The version lives in exactly one place — the `version` field of `Cargo.toml` — and everything that reports it reads it from there at compile time, so the number cannot drift from the binary you built. Where it shows up:
 
 | Where | What you see |
 |---|---|
-| Terminal, at startup | `jonnyq v1.2.2` above the first prompt, and in the transcript log |
+| Terminal, at startup | `jonnyq v1.2.3` above the first prompt, and in the transcript log |
 | `jonnyq -h` / `-help` | The version as the first line of the usage output (also printed after a bad flag) |
 | `/version` | The same line, any time during a session |
 | `/help`, `/?` | The version above the slash command list |
-| Web console | In the browser tab's title (`jonnyq console v1.2.2`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
-| `GET /health` | `"version": "1.2.2"` in the JSON, so a script can identify a running session |
+| Web console | In the browser tab's title (`jonnyq console v1.2.3`) and in the top bar beside the **jonnyq** brand; the terminal emulator in a terminal tab answers an XTVERSION query with it too |
+| `GET /health` | `"version": "1.2.3"` in the JSON, so a script can identify a running session |
 
 `-h` still exits with code 1, like a Go `flag` program: it is a usage request, not a command. There is no `-version` flag — use `-h`, `/version`, or `curl 127.0.0.1:<port>/health` for a `-web` session.
 
@@ -370,6 +370,8 @@ Joy's review briefs differ by author, for the same reason: a plan has no build t
 4. **One report** at the end — the summary of the run pushed to ntfy, whether it finished or stopped early.
 
 With `/verify off`, steps 2 and the per-task review are skipped and the run is the plain plan-then-code it always was. `/plan` and `/coding` are unchanged: each does its own lane and hands its output to JOY when `/verify` is on.
+
+The `=== agent …` banners follow that order rather than the command's owner: the run prints JACKY's name when the planning turn starts, JOY's when she reviews the plan, and JOEY's only when his first coding turn starts — even though `/autocoding` is his command. A lane is never named before it works, and never named twice for one turn.
 
 `/watchfile` is pair programming without leaving the editor: start it with `/watchfile`, then drop a magic word into the code —
 

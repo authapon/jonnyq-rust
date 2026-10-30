@@ -862,4 +862,140 @@ mod tests {
             "nothing happened, so nothing to report"
         );
     }
+
+    /// The other half of the same rule: when there is nothing to plan (the
+    /// requirements have not moved), JACKY runs no turn and must not be named
+    /// at all — the first banner belongs to the lane that actually works.
+    #[tokio::test]
+    async fn autocoding_names_no_planner_when_nothing_is_planned() {
+        let dir = crate::testsupport::TempDir::new("auto-banner-noplan");
+        let log = crate::testsupport::TestLog::new("auto-banner-noplan");
+        let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
+        let mut reg = crate::tools::Registry::new();
+        reg.register(Arc::new(crate::tools::file::WriteFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::ReadFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::EditFileTool {
+            work_dir: dir.str(),
+        }));
+        let provider = crate::testsupport::SequenceProvider::strict(vec![
+            write_progress_step("- [?] task one\n"),
+            content_step("coded it"),
+            content_step("APPROVE"),
+        ]);
+        let cfg = crate::config::Config {
+            model: "test-model".into(),
+            output_file: log.file.clone(),
+            ..Default::default()
+        };
+        let team = Arc::new(crate::team::Team::build(
+            &cfg,
+            provider.clone(),
+            &reg,
+            ui.clone(),
+        ));
+        team.set_work_dir(&dir.str());
+        team.set_verify(true);
+        team.set_review_rounds(1);
+        dir.write(REQUIREMENTS_FILE, "build a thing");
+        dir.write(&progress_file(), "- [ ] task one\n");
+        let hash = file_hash(dir.read(REQUIREMENTS_FILE).as_bytes());
+        dir.write(&hash_file(), &hash);
+        team.claim(crate::team::AgentName::Joey);
+
+        let c = crate::coding::Coding::new(team.clone(), ui.clone(), &dir.str(), "");
+        c.auto_run(&CancellationToken::new()).await.unwrap();
+
+        let text = std::fs::read_to_string(&log.file).unwrap();
+        assert!(
+            !text.contains("=== agent jacky |"),
+            "the planner was named for a pass that never ran: {text}"
+        );
+        let names: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("=== agent "))
+            .map(|l| l.trim_start_matches("=== agent ").split('|').next().unwrap().trim())
+            .collect();
+        assert_eq!(names, vec!["joey", "joy"], "{names:?}\n{text}");
+    }
+
+    /// The pipeline's own banner order, on a roster with four real agents (a
+    /// solo roster has one voice in every slot and cannot show a hand-off):
+    /// `/autocoding` is JOEY's command, but the run opens with JACKY's plan, then
+    /// JOY's verdict, and only then the coder. A name must never appear before its
+    /// lane works, nor twice for one turn.
+    #[tokio::test]
+    async fn autocoding_names_each_lane_when_its_work_starts() {
+        let dir = crate::testsupport::TempDir::new("auto-banner-order");
+        let log = crate::testsupport::TestLog::new("auto-banner-order");
+        let ui = Arc::new(crate::ui::Writer::new(&log.file).unwrap());
+        let mut reg = crate::tools::Registry::new();
+        reg.register(Arc::new(crate::tools::file::WriteFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::ReadFileTool {
+            work_dir: dir.str(),
+        }));
+        reg.register(Arc::new(crate::tools::file::EditFileTool {
+            work_dir: dir.str(),
+        }));
+        let provider = crate::testsupport::SequenceProvider::strict(vec![
+            // jacky writes the plan, joy approves it, joey codes the one task,
+            // joy approves that too.
+            write_progress_step("- [ ] task one\n"),
+            content_step("planned it"),
+            content_step("APPROVE\nthe checklist covers every requirement"),
+            write_progress_step("- [?] task one\n"),
+            content_step("coded it"),
+            content_step("APPROVE"),
+        ]);
+        let cfg = crate::config::Config {
+            model: "test-model".into(),
+            output_file: log.file.clone(),
+            ..Default::default()
+        };
+        let team = Arc::new(crate::team::Team::build(
+            &cfg,
+            provider.clone(),
+            &reg,
+            ui.clone(),
+        ));
+        team.set_work_dir(&dir.str());
+        team.set_verify(true);
+        team.set_review_rounds(1);
+        dir.write(REQUIREMENTS_FILE, "build a thing");
+        // The coder owns the session before the run starts, exactly as the REPL
+        // leaves it: the first banner must still be the planner's.
+        team.claim(crate::team::AgentName::Joey);
+
+        let c = crate::coding::Coding::new(team.clone(), ui.clone(), &dir.str(), "");
+        c.auto_run(&CancellationToken::new()).await.unwrap();
+
+        let text = std::fs::read_to_string(&log.file).unwrap();
+        let names: Vec<String> = text
+            .lines()
+            .filter(|l| l.starts_with("=== agent "))
+            .map(|l| {
+                l.trim_start_matches("=== agent ")
+                    .split('|')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["jacky", "joy", "joey", "joy"],
+            "the banners do not follow the work: {names:?}\n{text}"
+        );
+        assert_eq!(
+            dir.read(&progress_file()),
+            "- [A] task one\n",
+            "the run itself still works"
+        );
+    }
 }

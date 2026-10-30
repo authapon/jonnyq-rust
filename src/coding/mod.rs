@@ -1208,10 +1208,13 @@ impl<'a> Coding<'a> {
         note: &str,
     ) -> R<(PlanChange, String)> {
         let cmd = if human { "/plan_for_human" } else { "/plan" };
-        // Announced, because with `/autocoding` the coder is the agent on screen
-        // when the plan pass starts, and a silent hand-off to the planner reads
-        // as the coder designing his own checklist.
-        let planner = self.team.start(crate::team::AgentName::Jacky, note);
+        // The planner's conversation, taken WITHOUT a banner: his name goes up
+        // inside `run_turn!`, at the moment a planning turn really starts.
+        // Printed up front it would be wrong twice over - with `/autocoding`
+        // the coder owns the session, and a silent hand-off to the planner
+        // would read as the coder designing his own checklist; and a pass that
+        // finds the checklist already up to date does no work to be named for.
+        let planner = self.planner();
         let req_path = self.path(REQUIREMENTS_FILE);
         let Ok(req_data) = std::fs::read(&req_path) else {
             return Err(AgentError::new(format!(
@@ -1227,14 +1230,29 @@ impl<'a> Coding<'a> {
         // Whether any model turn happened, so a notification reports real
         // usage figures (of the last turn) or n/a, never stale ones.
         let mut turn_ran = false;
+        // Puts the planner on screen, with his banner, for the pass that is
+        // about to happen. Idempotent: when the session already shows him (a
+        // plain `/plan`, whose own command banner just went up) nothing prints,
+        // so his name is shown once rather than twice.
+        macro_rules! take_lane {
+            () => {
+                self.team.hand_over(crate::team::AgentName::Jacky, note)
+            };
+        }
         macro_rules! run_turn {
             ($prompt:expr) => {{
                 turn_ran = true;
+                // Belt and braces: every branch that reaches a model turn has
+                // taken the lane first, so this prints nothing in practice - it
+                // only stops a future branch from running a planning turn
+                // under somebody else's name.
+                take_lane!();
                 planner.run_turn(cancel.child_token(), &$prompt).await
             }};
         }
 
         let outcome: R<(PlanChange, String)> = if !prog_path.exists() {
+            take_lane!();
             self.ui.plainln(&format!(
                 "[plan] no {} found, generating task list from {}",
                 progress_file(),
@@ -1346,6 +1364,7 @@ impl<'a> Coding<'a> {
             ))
         } else {
             let tasks_before = parse_progress(&prog_path).unwrap_or_default();
+            take_lane!();
             self.ui.plainln(&format!(
                 "[plan] {} changed since {} was last updated; reconciling",
                 REQUIREMENTS_FILE,
